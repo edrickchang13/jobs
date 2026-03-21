@@ -1,0 +1,8 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+auto_apply.db
+resumes/
+screenshots/
+.DS_Store
