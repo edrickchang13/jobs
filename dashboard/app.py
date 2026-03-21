@@ -906,6 +906,19 @@ async def run_pipeline(request: Request):
 async def _run_application(url: str, company: str, role: str):
     global pipeline_running, latest_screenshot_b64, browser_instance
 
+    # Close any previous browser before starting a new one
+    if browser_instance:
+        try:
+            await browser_instance.close()
+        except Exception:
+            pass
+        browser_instance = None
+    try:
+        from applicator.form_filler import close_browser as cb
+        await cb()
+    except Exception:
+        pass
+
     resume_path = uploaded_resume or r"C:\Users\Owner\Downloads\EdrickChang.pdf"
 
     try:
@@ -981,20 +994,8 @@ async def _run_application(url: str, company: str, role: str):
         from database.tracker import mark_applied
         mark_applied(url, company, role)
 
-        # Close browser after 5 seconds
-        await asyncio.sleep(5)
-        if browser_instance:
-            try:
-                await browser_instance.close()
-            except Exception:
-                pass
-            browser_instance = None
-        try:
-            from applicator.form_filler import close_browser as cb
-            await cb()
-        except Exception:
-            pass
-        add_event("Pipeline Complete", "info", "Browser closed.")
+        # Keep browser open so user can review and manually submit
+        add_event("Pipeline Complete", "info", "Browser stays open for review. Click Stop or start a new job to close it.")
 
     except Exception as e:
         import traceback
