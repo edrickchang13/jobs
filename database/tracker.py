@@ -88,3 +88,41 @@ def update_posting_status(posting_id, status):
     c.execute("UPDATE seen_postings SET status = ? WHERE id = ?", (status, posting_id))
     conn.commit()
     conn.close()
+
+
+def mark_applied(url: str, company: str = "", role: str = ""):
+    """Mark a job URL as applied."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS applied_jobs (
+            url TEXT PRIMARY KEY,
+            company TEXT,
+            role TEXT,
+            applied_at TEXT NOT NULL
+        )
+    """)
+    c.execute(
+        "INSERT OR REPLACE INTO applied_jobs (url, company, role, applied_at) VALUES (?, ?, ?, ?)",
+        (url, company, role, datetime.now().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_applied_urls() -> set:
+    """Return set of all applied job URLs."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS applied_jobs (
+            url TEXT PRIMARY KEY,
+            company TEXT,
+            role TEXT,
+            applied_at TEXT NOT NULL
+        )
+    """)
+    c.execute("SELECT url FROM applied_jobs")
+    urls = {row[0] for row in c.fetchall()}
+    conn.close()
+    return urls

@@ -6,3 +6,6 @@ auto_apply.db
 resumes/
 screenshots/
 .DS_Store
+uploads/
+personal_info.yaml
+credentials.yaml

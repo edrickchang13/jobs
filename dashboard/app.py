@@ -6,7 +6,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, UploadFile, File
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 
 from dotenv import load_dotenv
@@ -17,7 +17,22 @@ pipeline_events: list[dict] = []
 pipeline_running = False
 pipeline_stop_requested = False
 latest_screenshot_b64: str = ""  # base64 encoded PNG of latest browser state
+screenshot_version: int = 0  # incremented each time screenshot changes
 browser_instance = None  # Keep browser ref for screenshots
+
+# File uploads directory
+UPLOADS_DIR = Path(__file__).parent.parent / "uploads"
+UPLOADS_DIR.mkdir(exist_ok=True)
+uploaded_resume: str = ""  # path to uploaded resume
+uploaded_transcript: str = ""  # path to uploaded transcript
+
+# Check for existing files on startup
+_default_resume = UPLOADS_DIR / "EdrickChang_Resume.pdf"
+_default_transcript = UPLOADS_DIR / "Transcript.pdf"
+if _default_resume.exists():
+    uploaded_resume = str(_default_resume)
+if _default_transcript.exists():
+    uploaded_transcript = str(_default_transcript)
 
 
 def add_event(step: str, status: str, detail: str = ""):
@@ -58,6 +73,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             justify-content: space-between;
         }
         .header h1 { font-size: 18px; color: #fff; }
+        .header-right { display: flex; align-items: center; gap: 12px; }
         .status-badge {
             padding: 4px 12px;
             border-radius: 12px;
@@ -68,9 +84,128 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         .status-running { background: #1a3a1a; color: #4ade80; animation: pulse 2s infinite; }
         @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.7; } }
 
-        .container { display: flex; height: calc(100vh - 48px); }
+        /* Tab navigation */
+        .tab-nav {
+            display: flex;
+            gap: 0;
+            background: #111;
+            border-bottom: 1px solid #222;
+        }
+        .tab-btn {
+            padding: 10px 24px;
+            background: transparent;
+            border: none;
+            color: #666;
+            font-size: 13px;
+            font-weight: 500;
+            cursor: pointer;
+            border-bottom: 2px solid transparent;
+            transition: all 0.2s;
+        }
+        .tab-btn:hover { color: #aaa; }
+        .tab-btn.active { color: #60a5fa; border-bottom-color: #60a5fa; }
+        .tab-content { display: none; height: calc(100vh - 90px); }
+        .tab-content.active { display: flex; }
 
-        /* Left panel - controls + event log */
+        /* ===== JOBS TAB ===== */
+        .jobs-container { display: flex; width: 100%; height: 100%; }
+        .jobs-sidebar {
+            width: 280px;
+            border-right: 1px solid #222;
+            background: #0d0d0d;
+            display: flex;
+            flex-direction: column;
+            padding: 12px;
+            gap: 10px;
+            flex-shrink: 0;
+        }
+        .jobs-sidebar h3 { font-size: 13px; color: #888; text-transform: uppercase; letter-spacing: 0.5px; }
+        .filter-group { display: flex; flex-direction: column; gap: 4px; }
+        .filter-group label { font-size: 11px; color: #555; text-transform: uppercase; letter-spacing: 0.5px; }
+        .filter-group input, .filter-group select {
+            background: #1a1a1a; border: 1px solid #333; color: #e0e0e0;
+            padding: 7px 10px; border-radius: 5px; font-size: 13px; width: 100%;
+        }
+        .filter-toggle {
+            display: flex; align-items: center; gap: 8px; cursor: pointer;
+            padding: 6px 0; font-size: 13px; color: #ccc;
+        }
+        .filter-toggle input[type="checkbox"] {
+            width: 16px; height: 16px; accent-color: #2563eb;
+        }
+        .filter-btn {
+            background: #2563eb; color: #fff; border: none;
+            padding: 8px 14px; border-radius: 5px; font-size: 13px;
+            cursor: pointer; font-weight: 500;
+        }
+        .filter-btn:hover { background: #1d4ed8; }
+        .filter-btn.secondary { background: #333; }
+        .filter-btn.secondary:hover { background: #444; }
+        .jobs-count {
+            font-size: 12px; color: #666; padding: 4px 0;
+        }
+
+        .jobs-list-panel {
+            flex: 1;
+            overflow-y: auto;
+            padding: 0;
+        }
+        .jobs-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 13px;
+        }
+        .jobs-table thead {
+            position: sticky; top: 0; z-index: 1;
+            background: #111;
+        }
+        .jobs-table th {
+            padding: 10px 12px;
+            text-align: left;
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: #555;
+            border-bottom: 1px solid #222;
+            font-weight: 600;
+        }
+        .jobs-table td {
+            padding: 8px 12px;
+            border-bottom: 1px solid #1a1a1a;
+            vertical-align: middle;
+        }
+        .jobs-table tr:hover { background: #141414; }
+        .jobs-table .company-name { color: #e0e0e0; font-weight: 500; }
+        .jobs-table .role-name { color: #bbb; }
+        .jobs-table .location { color: #888; font-size: 12px; }
+        .jobs-table .age { color: #666; font-size: 12px; text-align: center; }
+        .apply-btn {
+            background: #16a34a; color: #fff; border: none;
+            padding: 4px 12px; border-radius: 4px; font-size: 11px;
+            cursor: pointer; font-weight: 500;
+        }
+        .apply-btn:hover { background: #15803d; }
+        .bay-area-badge {
+            display: inline-block; padding: 1px 6px; border-radius: 3px;
+            font-size: 10px; background: #1a2a3a; color: #60a5fa;
+            margin-left: 4px;
+        }
+        .applied-badge {
+            display: inline-block; padding: 1px 6px; border-radius: 3px;
+            font-size: 10px; background: #1a3a1a; color: #4ade80;
+            font-weight: 600;
+        }
+        .applied-row { opacity: 0.6; }
+        .mark-applied-btn {
+            background: #2563eb; color: #fff; border: none;
+            padding: 4px 12px; border-radius: 4px; font-size: 11px;
+            cursor: pointer; font-weight: 500; margin-top: 4px; width: 100%;
+        }
+        .mark-applied-btn:hover { background: #1d4ed8; }
+        .loading-msg { padding: 40px; text-align: center; color: #555; }
+
+        /* ===== APPLY TAB ===== */
+        .apply-container { display: flex; width: 100%; height: 100%; }
         .left-panel {
             width: 380px;
             border-right: 1px solid #222;
@@ -83,65 +218,29 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             border-bottom: 1px solid #222;
         }
         .controls input {
-            background: #1a1a1a;
-            border: 1px solid #333;
-            color: #e0e0e0;
-            padding: 7px 10px;
-            border-radius: 5px;
-            font-size: 13px;
-            width: 100%;
-            margin-bottom: 6px;
+            background: #1a1a1a; border: 1px solid #333; color: #e0e0e0;
+            padding: 7px 10px; border-radius: 5px; font-size: 13px;
+            width: 100%; margin-bottom: 6px;
         }
         .controls label {
-            font-size: 11px;
-            color: #555;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-            display: block;
-            margin-bottom: 2px;
+            font-size: 11px; color: #555; text-transform: uppercase;
+            letter-spacing: 0.5px; display: block; margin-bottom: 2px;
         }
         .controls button {
-            background: #2563eb;
-            color: #fff;
-            border: none;
-            padding: 9px 14px;
-            border-radius: 5px;
-            font-size: 13px;
-            cursor: pointer;
-            width: 100%;
-            font-weight: 500;
-            margin-top: 4px;
+            background: #2563eb; color: #fff; border: none;
+            padding: 9px 14px; border-radius: 5px; font-size: 13px;
+            cursor: pointer; width: 100%; font-weight: 500; margin-top: 4px;
         }
         .controls button:hover { background: #1d4ed8; }
         .controls button:disabled { background: #333; cursor: not-allowed; }
-
-        .event-log-container {
-            flex: 1;
-            overflow-y: auto;
-            padding: 8px;
-        }
+        .event-log-container { flex: 1; overflow-y: auto; padding: 8px; }
         .event-log { list-style: none; }
         .event-item {
-            padding: 6px 8px;
-            border-radius: 4px;
-            margin-bottom: 2px;
-            font-size: 12px;
-            display: flex;
-            gap: 6px;
-            align-items: flex-start;
+            padding: 6px 8px; border-radius: 4px; margin-bottom: 2px;
+            font-size: 12px; display: flex; gap: 6px; align-items: flex-start;
         }
-        .event-time {
-            color: #444;
-            font-family: monospace;
-            flex-shrink: 0;
-            font-size: 11px;
-        }
-        .event-dot {
-            width: 6px; height: 6px;
-            border-radius: 50%;
-            margin-top: 4px;
-            flex-shrink: 0;
-        }
+        .event-time { color: #444; font-family: monospace; flex-shrink: 0; font-size: 11px; }
+        .event-dot { width: 6px; height: 6px; border-radius: 50%; margin-top: 4px; flex-shrink: 0; }
         .event-start .event-dot { background: #3b82f6; }
         .event-success .event-dot { background: #4ade80; }
         .event-error .event-dot { background: #ef4444; }
@@ -150,132 +249,346 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         .event-step { font-weight: 500; color: #ddd; font-size: 12px; }
         .event-detail { color: #666; font-size: 11px; word-break: break-word; }
 
-        /* Right panel - live browser view */
-        .right-panel {
-            flex: 1;
-            display: flex;
-            flex-direction: column;
-            background: #080808;
-        }
+        .right-panel { flex: 1; display: flex; flex-direction: column; background: #080808; }
         .browser-header {
-            padding: 8px 16px;
-            background: #111;
-            border-bottom: 1px solid #222;
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
+            padding: 8px 16px; background: #111; border-bottom: 1px solid #222;
+            display: flex; align-items: center; justify-content: space-between;
         }
         .browser-header span { font-size: 13px; color: #888; }
-        .browser-dots {
-            display: flex; gap: 6px;
-        }
-        .browser-dots span {
-            width: 10px; height: 10px; border-radius: 50%;
-        }
+        .browser-dots { display: flex; gap: 6px; }
+        .browser-dots span { width: 10px; height: 10px; border-radius: 50%; }
         .browser-dots .red { background: #ff5f57; }
         .browser-dots .yellow { background: #febc2e; }
         .browser-dots .green { background: #28c840; }
         .browser-view {
-            flex: 1;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            overflow: auto;
-            padding: 8px;
+            flex: 1; display: flex; align-items: center; justify-content: center;
+            overflow: auto; padding: 8px;
         }
         .browser-view img {
-            max-width: 100%;
-            max-height: 100%;
-            border-radius: 4px;
-            object-fit: contain;
+            max-width: 100%; max-height: 100%; border-radius: 4px; object-fit: contain;
+            image-rendering: auto;
         }
-        .browser-placeholder {
-            color: #333;
-            font-size: 14px;
-            text-align: center;
-        }
+        .browser-placeholder { color: #333; font-size: 14px; text-align: center; }
         .step-pills {
-            display: flex;
-            gap: 4px;
-            padding: 8px 12px;
-            background: #0d0d0d;
-            border-bottom: 1px solid #222;
-            flex-wrap: wrap;
+            display: flex; gap: 4px; padding: 8px 12px;
+            background: #0d0d0d; border-bottom: 1px solid #222; flex-wrap: wrap;
         }
         .step-pill {
-            padding: 3px 10px;
-            border-radius: 12px;
-            font-size: 11px;
-            background: #1a1a1a;
-            color: #555;
-            border: 1px solid #222;
+            padding: 3px 10px; border-radius: 12px; font-size: 11px;
+            background: #1a1a1a; color: #555; border: 1px solid #222;
         }
         .step-pill.active { background: #1a3a1a; color: #4ade80; border-color: #2a4a2a; }
         .step-pill.done { background: #1a2a3a; color: #60a5fa; border-color: #2a3a4a; }
         .step-pill.failed { background: #3a1a1a; color: #f87171; border-color: #4a2a2a; }
+
+        /* Upload section */
+        .upload-section {
+            padding: 12px;
+            border-bottom: 1px solid #222;
+        }
+        .upload-section h4 {
+            font-size: 11px; color: #555; text-transform: uppercase;
+            letter-spacing: 0.5px; margin-bottom: 8px;
+        }
+        .upload-row {
+            display: flex; align-items: center; gap: 8px; margin-bottom: 6px;
+        }
+        .upload-row label.upload-label {
+            font-size: 12px; color: #999; width: 70px; flex-shrink: 0;
+            text-transform: none; letter-spacing: 0;
+        }
+        .upload-status {
+            font-size: 11px; flex: 1; min-width: 0;
+            overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+        }
+        .upload-status.uploaded { color: #4ade80; }
+        .upload-status.missing { color: #666; }
+        .upload-input { display: none; }
+        .upload-btn {
+            background: #333; color: #ccc; border: none;
+            padding: 4px 10px; border-radius: 4px; font-size: 11px;
+            cursor: pointer; flex-shrink: 0;
+        }
+        .upload-btn:hover { background: #444; }
     </style>
 </head>
 <body>
     <div class="header">
         <h1>Auto-Apply Dashboard</h1>
-        <span class="status-badge status-idle" id="globalStatus">Idle</span>
+        <div class="header-right">
+            <span class="status-badge status-idle" id="globalStatus">Idle</span>
+        </div>
     </div>
-    <div class="container">
-        <div class="left-panel">
-            <div class="controls">
-                <label>Application URL</label>
-                <input type="text" id="jobUrl"
-                       value="https://jobs.lever.co/aofl/4b91076d-8937-4dbc-a502-a7d6a66e2e19/apply?utm_source=Simplify&ref=Simplify">
-                <label>Company</label>
-                <input type="text" id="company" value="Age of Learning">
-                <label>Role</label>
-                <input type="text" id="role" value="Software Engineer Intern">
-                <div style="display:flex;gap:6px;">
-                    <button id="startBtn" onclick="startApplication()" style="flex:1">Start Application Test</button>
-                    <button id="stopBtn" onclick="stopApplication()" style="flex:0 0 70px;background:#dc2626;display:none">Stop</button>
+
+    <!-- Tab Navigation -->
+    <div class="tab-nav">
+        <button class="tab-btn active" onclick="switchTab('jobs')">Jobs List</button>
+        <button class="tab-btn" onclick="switchTab('apply')">Apply</button>
+    </div>
+
+    <!-- ===== JOBS TAB ===== -->
+    <div class="tab-content active" id="tab-jobs">
+        <div class="jobs-container">
+            <div class="jobs-sidebar">
+                <h3>Filters</h3>
+
+                <div class="filter-group">
+                    <label>Search</label>
+                    <input type="text" id="filterSearch" placeholder="Company or role..." value="software engineer intern" oninput="applyFilters()">
                 </div>
+
+                <div class="filter-group">
+                    <label>Location</label>
+                    <select id="filterLocation" onchange="applyFilters()">
+                        <option value="all">All Locations</option>
+                        <option value="bayarea" selected>Bay Area Only</option>
+                        <option value="california">All California</option>
+                        <option value="remote">Remote</option>
+                    </select>
+                </div>
+
+                <div class="filter-group">
+                    <label>Posted Within</label>
+                    <select id="filterAge" onchange="applyFilters()">
+                        <option value="all">Any Time</option>
+                        <option value="1">Last 1 day</option>
+                        <option value="3">Last 3 days</option>
+                        <option value="7" selected>Last 7 days</option>
+                        <option value="14">Last 14 days</option>
+                        <option value="30">Last 30 days</option>
+                    </select>
+                </div>
+
+                <div style="border-top: 1px solid #222; padding-top: 8px;">
+                    <button class="filter-btn" onclick="loadJobs()" style="width:100%; margin-bottom: 6px;">Refresh Jobs</button>
+                    <button class="filter-btn secondary" onclick="resetFilters()" style="width:100%;">Reset Filters</button>
+                </div>
+
+                <div class="jobs-count" id="jobsCount">Loading...</div>
             </div>
-            <div class="step-pills" id="stepPills">
-                <span class="step-pill" id="pill-jd">1. Extract JD</span>
-                <span class="step-pill" id="pill-answers">2. Gen Answers</span>
-                <span class="step-pill" id="pill-nav">3. Navigate</span>
-                <span class="step-pill" id="pill-fill">4. Fill Form</span>
-                <span class="step-pill" id="pill-review">5. Review</span>
-            </div>
-            <div class="event-log-container">
-                <ul class="event-log" id="eventLog">
-                    <li class="event-item event-info">
-                        <span class="event-dot"></span>
-                        <span class="event-time">--:--</span>
-                        <div class="event-content">
-                            <div class="event-step">Ready</div>
-                            <div class="event-detail">Click Start to begin</div>
-                        </div>
-                    </li>
-                </ul>
+
+            <div class="jobs-list-panel">
+                <table class="jobs-table">
+                    <thead>
+                        <tr>
+                            <th>Company</th>
+                            <th>Role</th>
+                            <th>Location</th>
+                            <th style="text-align:center">Age</th>
+                            <th style="text-align:center">Action</th>
+                        </tr>
+                    </thead>
+                    <tbody id="jobsBody">
+                        <tr><td colspan="5" class="loading-msg">Loading jobs...</td></tr>
+                    </tbody>
+                </table>
             </div>
         </div>
-        <div class="right-panel">
-            <div class="browser-header">
-                <div class="browser-dots">
-                    <span class="red"></span>
-                    <span class="yellow"></span>
-                    <span class="green"></span>
+    </div>
+
+    <!-- ===== APPLY TAB ===== -->
+    <div class="tab-content" id="tab-apply">
+        <div class="apply-container">
+            <div class="left-panel">
+                <div class="upload-section">
+                    <h4>Documents</h4>
+                    <div class="upload-row">
+                        <label class="upload-label">Resume</label>
+                        <span class="upload-status missing" id="resumeStatus">Loading...</span>
+                        <input type="file" class="upload-input" id="resumeFile" accept=".pdf" onchange="uploadFile('resume')">
+                        <button class="upload-btn" onclick="document.getElementById('resumeFile').click()">Upload</button>
+                    </div>
+                    <div class="upload-row">
+                        <label class="upload-label">Transcript</label>
+                        <span class="upload-status missing" id="transcriptStatus">Not uploaded</span>
+                        <input type="file" class="upload-input" id="transcriptFile" accept=".pdf" onchange="uploadFile('transcript')">
+                        <button class="upload-btn" onclick="document.getElementById('transcriptFile').click()">Upload</button>
+                    </div>
                 </div>
-                <span id="browserUrl">No browser active</span>
+                <div class="controls">
+                    <label>Application URL</label>
+                    <input type="text" id="jobUrl" value="">
+                    <label>Company</label>
+                    <input type="text" id="company" value="">
+                    <label>Role</label>
+                    <input type="text" id="role" value="">
+                    <div style="display:flex;gap:6px;">
+                        <button id="startBtn" onclick="startApplication()" style="flex:1">Start Application</button>
+                        <button id="stopBtn" onclick="stopApplication()" style="flex:0 0 70px;background:#dc2626;display:none">Stop</button>
+                    </div>
+                    <button class="mark-applied-btn" onclick="markAsApplied()">Mark as Applied</button>
+                </div>
+                <div class="step-pills" id="stepPills">
+                    <span class="step-pill" id="pill-jd">1. Extract JD</span>
+                    <span class="step-pill" id="pill-answers">2. Gen Answers</span>
+                    <span class="step-pill" id="pill-nav">3. Navigate</span>
+                    <span class="step-pill" id="pill-fill">4. Fill Form</span>
+                    <span class="step-pill" id="pill-review">5. Review</span>
+                </div>
+                <div class="event-log-container">
+                    <ul class="event-log" id="eventLog">
+                        <li class="event-item event-info">
+                            <span class="event-dot"></span>
+                            <span class="event-time">--:--</span>
+                            <div class="event-content">
+                                <div class="event-step">Ready</div>
+                                <div class="event-detail">Select a job from the Jobs tab or enter a URL</div>
+                            </div>
+                        </li>
+                    </ul>
+                </div>
             </div>
-            <div class="browser-view" id="browserView">
-                <div class="browser-placeholder">
-                    Browser view will appear here when the agent starts
+            <div class="right-panel">
+                <div class="browser-header">
+                    <div class="browser-dots">
+                        <span class="red"></span>
+                        <span class="yellow"></span>
+                        <span class="green"></span>
+                    </div>
+                    <span id="browserUrl">No browser active</span>
+                </div>
+                <div class="browser-view" id="browserView">
+                    <div class="browser-placeholder">
+                        Browser view will appear here when the agent starts
+                    </div>
                 </div>
             </div>
         </div>
     </div>
 
     <script>
+        let allJobs = [];
+        let appliedUrls = new Set();
         let eventSource = null;
-        let screenshotInterval = null;
 
+        const BAY_AREA_CITIES = [
+            'san francisco', 'sf', 'san jose', 'palo alto', 'mountain view',
+            'sunnyvale', 'cupertino', 'santa clara', 'redwood city', 'menlo park',
+            'san mateo', 'oakland', 'berkeley', 'fremont', 'milpitas', 'foster city',
+            'south san francisco', 'san bruno', 'burlingame', 'daly city',
+            'pleasanton', 'livermore', 'hayward', 'union city', 'newark',
+            'san ramon', 'walnut creek', 'concord', 'dublin', 'campbell',
+            'los gatos', 'saratoga', 'morgan hill', 'gilroy', 'alameda',
+            'san leandro', 'richmond', 'emeryville', 'half moon bay',
+            'woodside', 'portola valley', 'atherton', 'belmont', 'san carlos',
+            'redwood shores', 'east palo alto', 'los altos', 'stanford',
+            'bay area', 'silicon valley'
+        ];
+
+        const CA_KEYWORDS = ['california', ', ca', 'ca,'];
+
+        // ===== TAB SWITCHING =====
+        function switchTab(tab) {
+            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+            document.querySelector(`.tab-btn[onclick="switchTab('${tab}')"]`).classList.add('active');
+            document.getElementById('tab-' + tab).classList.add('active');
+        }
+
+        // ===== JOBS LIST =====
+        function loadJobs() {
+            document.getElementById('jobsBody').innerHTML = '<tr><td colspan="5" class="loading-msg">Loading jobs from GitHub...</td></tr>';
+            document.getElementById('jobsCount').textContent = 'Loading...';
+            // Load applied URLs first, then jobs
+            fetch('/api/applied').then(r => r.json()).then(data => {
+                appliedUrls = new Set(data.urls || []);
+            }).catch(() => {}).finally(() => {
+                fetch('/api/jobs').then(r => r.json()).then(data => {
+                    allJobs = data.jobs || [];
+                    applyFilters();
+                }).catch(err => {
+                    document.getElementById('jobsBody').innerHTML = '<tr><td colspan="5" class="loading-msg">Failed to load jobs: ' + err + '</td></tr>';
+                });
+            });
+        }
+
+        function isBayArea(location) {
+            const loc = location.toLowerCase();
+            return BAY_AREA_CITIES.some(city => loc.includes(city));
+        }
+
+        function isCalifornia(location) {
+            const loc = location.toLowerCase();
+            return CA_KEYWORDS.some(kw => loc.includes(kw)) || isBayArea(loc);
+        }
+
+        function isUSRemote(location) {
+            const loc = location.toLowerCase();
+            // Must be remote but NOT in a foreign country
+            const foreignCountries = ['canada', 'uk', 'india', 'germany', 'france', 'japan', 'australia', 'brazil', 'mexico', 'ireland', 'singapore', 'israel', 'netherlands', 'sweden', 'spain', 'italy', 'poland', 'china', 'korea', 'taiwan'];
+            const hasForeign = foreignCountries.some(c => loc.includes(c));
+            if (hasForeign && !loc.includes('usa') && !loc.includes('united states')) return false;
+            return loc.includes('remote') || loc === 'united states';
+        }
+
+        function applyFilters() {
+            const search = document.getElementById('filterSearch').value.toLowerCase();
+            const locFilter = document.getElementById('filterLocation').value;
+            const ageFilter = parseInt(document.getElementById('filterAge').value) || 0;
+
+            let filtered = allJobs.filter(job => {
+                // Search filter
+                if (search && !job.company.toLowerCase().includes(search) && !job.role.toLowerCase().includes(search)) {
+                    return false;
+                }
+                // Location filter
+                if (locFilter === 'bayarea' && !isBayArea(job.location)) return false;
+                if (locFilter === 'california' && !isCalifornia(job.location) && !isUSRemote(job.location)) return false;
+                if (locFilter === 'remote' && !isUSRemote(job.location)) return false;
+                // Age filter
+                if (ageFilter > 0) {
+                    const days = parseInt(job.date) || 999;
+                    if (days > ageFilter) return false;
+                }
+                return true;
+            });
+
+            renderJobs(filtered);
+            document.getElementById('jobsCount').textContent = filtered.length + ' of ' + allJobs.length + ' jobs shown';
+        }
+
+        function renderJobs(jobs) {
+            const tbody = document.getElementById('jobsBody');
+            if (jobs.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="5" class="loading-msg">No jobs match your filters</td></tr>';
+                return;
+            }
+            tbody.innerHTML = jobs.map((job, i) => {
+                const locBadge = isBayArea(job.location) ? '<span class="bay-area-badge">Bay Area</span>' : '';
+                const isApplied = appliedUrls.has(job.url);
+                const appliedBadge = isApplied ? ' <span class="applied-badge">Applied</span>' : '';
+                const rowClass = isApplied ? 'applied-row' : '';
+                const escapedUrl = job.url.replace(/'/g, "\\\\'");
+                const escapedCompany = job.company.replace(/'/g, "\\\\'");
+                const escapedRole = job.role.replace(/'/g, "\\\\'");
+                const actionBtn = isApplied
+                    ? '<span class="applied-badge">Applied</span>'
+                    : '<button class="apply-btn" onclick="selectJob(\\'' + escapedUrl + '\\', \\'' + escapedCompany + '\\', \\'' + escapedRole + '\\')">Apply</button>';
+                return '<tr class="' + rowClass + '">' +
+                    '<td class="company-name">' + job.company + appliedBadge + '</td>' +
+                    '<td class="role-name">' + job.role + '</td>' +
+                    '<td class="location">' + job.location + locBadge + '</td>' +
+                    '<td class="age">' + job.date + '</td>' +
+                    '<td style="text-align:center">' + actionBtn + '</td>' +
+                    '</tr>';
+            }).join('');
+        }
+
+        function selectJob(url, company, role) {
+            document.getElementById('jobUrl').value = url;
+            document.getElementById('company').value = company;
+            document.getElementById('role').value = role;
+            switchTab('apply');
+        }
+
+        function resetFilters() {
+            document.getElementById('filterSearch').value = '';
+            document.getElementById('filterLocation').value = 'all';
+            document.getElementById('filterAge').value = 'all';
+            applyFilters();
+        }
+
+        // ===== APPLY TAB =====
         function startApplication() {
             const url = document.getElementById('jobUrl').value;
             const company = document.getElementById('company').value;
@@ -290,10 +603,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             document.getElementById('eventLog').innerHTML = '';
             document.getElementById('browserUrl').textContent = url.substring(0, 60) + '...';
 
-            // Reset pills
             document.querySelectorAll('.step-pill').forEach(p => p.className = 'step-pill');
 
-            // SSE for events
             if (eventSource) eventSource.close();
             eventSource = new EventSource('/events');
             eventSource.onmessage = function(e) {
@@ -302,9 +613,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 updatePills(event);
             };
 
-            // Poll for screenshots every 2 seconds
-            if (screenshotInterval) clearInterval(screenshotInterval);
-            screenshotInterval = setInterval(fetchScreenshot, 2000);
+            // Start screenshot SSE stream
+            startScreenshotStream();
 
             fetch('/run', {
                 method: 'POST',
@@ -316,29 +626,45 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         function stopApplication() {
             fetch('/stop', {method: 'POST'});
             document.getElementById('startBtn').disabled = false;
-            document.getElementById('startBtn').textContent = 'Start Application Test';
+            document.getElementById('startBtn').textContent = 'Start Application';
             document.getElementById('stopBtn').style.display = 'none';
             document.getElementById('globalStatus').className = 'status-badge status-idle';
             document.getElementById('globalStatus').textContent = 'Stopped';
-            if (screenshotInterval) clearInterval(screenshotInterval);
+            if (screenshotSource) { screenshotSource.close(); screenshotSource = null; }
             addEvent({timestamp: new Date().toLocaleTimeString().slice(0,8), step: 'Stopped', status: 'error', detail: 'Stopped by user'});
         }
 
-        function fetchScreenshot() {
-            fetch('/screenshot').then(r => r.json()).then(data => {
+        let screenshotSource = null;
+        function startScreenshotStream() {
+            if (screenshotSource) screenshotSource.close();
+            screenshotSource = new EventSource('/screenshot-stream');
+            screenshotSource.onmessage = function(e) {
+                const data = JSON.parse(e.data);
                 if (data.image) {
-                    document.getElementById('browserView').innerHTML =
-                        '<img src="data:image/png;base64,' + data.image + '">';
+                    const view = document.getElementById('browserView');
+                    const existing = view.querySelector('img');
+                    if (existing) {
+                        existing.src = 'data:image/png;base64,' + data.image;
+                    } else {
+                        view.innerHTML = '<img src="data:image/png;base64,' + data.image + '">';
+                    }
                 }
                 if (data.done) {
-                    clearInterval(screenshotInterval);
+                    screenshotSource.close();
+                    screenshotSource = null;
                     document.getElementById('startBtn').disabled = false;
-                    document.getElementById('startBtn').textContent = 'Start Application Test';
+                    document.getElementById('startBtn').textContent = 'Start Application';
                     document.getElementById('stopBtn').style.display = 'none';
                     document.getElementById('globalStatus').className = 'status-badge status-idle';
                     document.getElementById('globalStatus').textContent = 'Done';
                 }
-            }).catch(() => {});
+            };
+            screenshotSource.onerror = function() {
+                // Reconnect on error
+                setTimeout(() => {
+                    if (screenshotSource) startScreenshotStream();
+                }, 1000);
+            };
         }
 
         function addEvent(event) {
@@ -372,6 +698,65 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 }
             }
         }
+
+        // ===== MARK AS APPLIED =====
+        function markAsApplied() {
+            const url = document.getElementById('jobUrl').value;
+            const company = document.getElementById('company').value;
+            const role = document.getElementById('role').value;
+            if (!url) return;
+            fetch('/api/applied', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({url, company, role})
+            }).then(r => r.json()).then(() => {
+                appliedUrls.add(url);
+                applyFilters();
+                addEvent({timestamp: new Date().toLocaleTimeString().slice(0,8), step: 'Applied', status: 'success', detail: 'Marked as applied: ' + company + ' - ' + role});
+            });
+        }
+
+        // ===== FILE UPLOADS =====
+        function uploadFile(type) {
+            const input = document.getElementById(type + 'File');
+            if (!input.files.length) return;
+            const formData = new FormData();
+            formData.append('file', input.files[0]);
+            const statusEl = document.getElementById(type + 'Status');
+            statusEl.textContent = 'Uploading...';
+            statusEl.className = 'upload-status missing';
+            fetch('/api/upload/' + type, { method: 'POST', body: formData })
+                .then(r => r.json())
+                .then(data => {
+                    if (data.filename) {
+                        statusEl.textContent = data.filename;
+                        statusEl.className = 'upload-status uploaded';
+                    } else {
+                        statusEl.textContent = 'Upload failed';
+                    }
+                })
+                .catch(() => { statusEl.textContent = 'Upload failed'; });
+        }
+
+        function checkUploads() {
+            fetch('/api/uploads').then(r => r.json()).then(data => {
+                const rEl = document.getElementById('resumeStatus');
+                const tEl = document.getElementById('transcriptStatus');
+                if (data.resume) { rEl.textContent = data.resume_name; rEl.className = 'upload-status uploaded'; }
+                else { rEl.textContent = 'Not uploaded'; rEl.className = 'upload-status missing'; }
+                if (data.transcript) { tEl.textContent = data.transcript_name; tEl.className = 'upload-status uploaded'; }
+                else { tEl.textContent = 'Not uploaded'; tEl.className = 'upload-status missing'; }
+            });
+        }
+
+        // Load jobs and check uploads on page load
+        loadJobs();
+        checkUploads();
+
+        // Auto-refresh jobs every 15 minutes
+        setInterval(() => {
+            loadJobs();
+        }, 15 * 60 * 1000);
     </script>
 </body>
 </html>"""
@@ -380,6 +765,66 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return DASHBOARD_HTML
+
+
+@app.get("/api/jobs")
+async def get_jobs():
+    """Fetch and parse internship listings from SimplifyJobs GitHub repo."""
+    try:
+        from scraper.github_scraper import fetch_readme, parse_internship_table
+        readme = fetch_readme()
+        postings = parse_internship_table(readme)
+        return JSONResponse({"jobs": postings, "total": len(postings)})
+    except Exception as e:
+        return JSONResponse({"jobs": [], "total": 0, "error": str(e)}, status_code=500)
+
+
+@app.get("/api/applied")
+async def get_applied():
+    """Return list of applied job URLs."""
+    from database.tracker import get_applied_urls
+    return JSONResponse({"urls": list(get_applied_urls())})
+
+
+@app.post("/api/applied")
+async def mark_as_applied(request: Request):
+    """Mark a job as applied."""
+    from database.tracker import mark_applied
+    data = await request.json()
+    mark_applied(data.get("url", ""), data.get("company", ""), data.get("role", ""))
+    return JSONResponse({"status": "ok"})
+
+
+@app.get("/api/uploads")
+async def get_uploads():
+    """Return current upload status."""
+    return JSONResponse({
+        "resume": bool(uploaded_resume),
+        "resume_name": Path(uploaded_resume).name if uploaded_resume else "",
+        "transcript": bool(uploaded_transcript),
+        "transcript_name": Path(uploaded_transcript).name if uploaded_transcript else "",
+    })
+
+
+@app.post("/api/upload/{doc_type}")
+async def upload_document(doc_type: str, file: UploadFile = File(...)):
+    """Upload resume or transcript PDF."""
+    global uploaded_resume, uploaded_transcript
+
+    if doc_type not in ("resume", "transcript"):
+        return JSONResponse({"error": "Invalid doc type"}, status_code=400)
+
+    filename = file.filename or f"{doc_type}.pdf"
+    save_path = UPLOADS_DIR / filename
+    content = await file.read()
+    save_path.write_bytes(content)
+
+    if doc_type == "resume":
+        uploaded_resume = str(save_path)
+    else:
+        uploaded_transcript = str(save_path)
+
+    return JSONResponse({"filename": filename, "path": str(save_path)})
 
 
 @app.get("/events")
@@ -403,6 +848,22 @@ async def get_screenshot():
     })
 
 
+@app.get("/screenshot-stream")
+async def screenshot_stream():
+    """SSE stream that pushes screenshots as they change."""
+    async def stream():
+        last_version = -1
+        while True:
+            if screenshot_version != last_version and latest_screenshot_b64:
+                last_version = screenshot_version
+                yield f"data: {json.dumps({'image': latest_screenshot_b64, 'done': not pipeline_running, 'v': screenshot_version})}\n\n"
+            if not pipeline_running and last_version > 0:
+                yield f"data: {json.dumps({'done': True, 'v': screenshot_version})}\n\n"
+                break
+            await asyncio.sleep(0.15)
+    return StreamingResponse(stream(), media_type="text/event-stream")
+
+
 @app.post("/stop")
 async def stop_pipeline():
     global pipeline_stop_requested, pipeline_running, browser_instance
@@ -415,6 +876,11 @@ async def stop_pipeline():
         except Exception:
             pass
         browser_instance = None
+    try:
+        from applicator.form_filler import close_browser
+        await close_browser()
+    except Exception:
+        pass
     return JSONResponse({"status": "stopped"})
 
 
@@ -437,26 +903,10 @@ async def run_pipeline(request: Request):
     return JSONResponse({"status": "started"})
 
 
-async def _capture_screenshot(agent: "Agent"):
-    """Callback for on_step_end - captures screenshot after each agent step.
-
-    Signature must be: async def callback(agent: Agent) -> None
-    The agent has a .browser_session attribute with .take_screenshot() method.
-    """
-    global latest_screenshot_b64
-    try:
-        if agent.browser_session:
-            screenshot_bytes = await agent.browser_session.take_screenshot()
-            if screenshot_bytes:
-                latest_screenshot_b64 = base64.b64encode(screenshot_bytes).decode("utf-8")
-    except Exception as e:
-        # Silently fail - screenshot is best-effort
-        pass
-
-
 async def _run_application(url: str, company: str, role: str):
     global pipeline_running, latest_screenshot_b64, browser_instance
-    resume_path = "/Users/edrickchang/Downloads/EdrickChang_Resume.pdf"
+
+    resume_path = uploaded_resume or r"C:\Users\Owner\Downloads\EdrickChang.pdf"
 
     try:
         # Step 1: Extract JD
@@ -472,174 +922,85 @@ async def _run_application(url: str, company: str, role: str):
         if pipeline_stop_requested:
             return
 
-        # Step 2: Generate answers
-        add_event("Generate Answers", "start", "Creating answers for common questions...")
-        answers = {}
-        try:
-            from applicator.field_generator import generate_field_answer
-            for q in ["Why do you want to work at this company?", "Why are you interested in this role?"]:
-                if pipeline_stop_requested:
-                    return
-                answer = generate_field_answer(q, company, role, jd)
-                answers[q] = answer
-                add_event("Generate Answers", "info", f"Done: {q[:40]}...")
-            add_event("Generate Answers", "success", f"Generated {len(answers)} answers")
-        except Exception as e:
-            add_event("Generate Answers", "error", f"Answer generation failed: {e}")
-            # Continue anyway - we can still fill the form without pre-generated answers
+        # Steps 2-4: Hybrid Playwright + LLM approach
+        from applicator.form_filler import fill_application, close_browser
 
-        if pipeline_stop_requested:
-            return
+        async def on_event(step, status, detail=""):
+            add_event(step, status, detail)
 
-        # Step 3: Launch browser and navigate
-        add_event("Navigate", "start", "Launching browser...")
-        try:
-            from browser_use import Agent, Browser
-            from browser_use.llm import ChatCerebras
+        async def on_screenshot(screenshot_bytes):
+            global latest_screenshot_b64, screenshot_version
+            if screenshot_bytes:
+                latest_screenshot_b64 = base64.b64encode(screenshot_bytes).decode("utf-8")
+                screenshot_version += 1
 
-            # Create browser - headless=False so it opens a visible window
-            browser_instance = Browser(headless=False, keep_alive=True)
+        result = await fill_application(
+            url=url,
+            company=company,
+            role=role,
+            resume_path=resume_path,
+            job_description=jd,
+            event_callback=on_event,
+            screenshot_callback=on_screenshot,
+            transcript_path=uploaded_transcript,
+        )
 
-            # Use browser-use's native ChatCerebras wrapper
-            # This handles JSON output by injecting schema into prompt (Cerebras doesn't support response_format)
-            cerebras_key = os.getenv("CEREBRAS_API_KEY")
-            if not cerebras_key:
-                raise ValueError("CEREBRAS_API_KEY not set in .env")
+        browser_instance = result.get("browser")
+        page = result.get("page")
 
-            llm = ChatCerebras(
-                model="qwen-3-235b-a22b-instruct-2507",
-                api_key=cerebras_key,
-            )
+        # Step 5: Final screenshot for review
+        add_event("Screenshot & Review", "start", "Capturing final state...")
 
-            add_event("Navigate", "info", "Browser launched, navigating to application page...")
-
-            # Phase 1: Just navigate to the page and observe the form
-            agent = Agent(
-                task=f"""Navigate to this URL: {url}
-
-Your ONLY job is to navigate to the page and observe what form fields exist.
-
-Steps:
-1. Go to the URL
-2. Wait for the page to fully load
-3. Scroll down to see all form fields
-4. Report what form fields you see (text inputs, file uploads, dropdowns, checkboxes)
-
-CRITICAL RULES:
-- Do NOT click "Apply with LinkedIn" button
-- Do NOT click any Submit button
-- Do NOT fill in any fields yet
-- Just observe and report the form structure""",
-                llm=llm,
-                browser=browser_instance,
-                use_vision=False,
-                max_actions_per_step=3,
-            )
-
-            result = await agent.run(max_steps=10, on_step_end=_capture_screenshot)
-            add_event("Navigate", "success", "Application form loaded and observed")
-
-            if pipeline_stop_requested:
-                return
-
-            # Step 4: Fill form fields
-            add_event("Fill Form", "start", "Filling form fields...")
-
-            answers_text = "\n".join(f'Q: "{q}"\nA: "{a}"' for q, a in answers.items())
-
-            agent2 = Agent(
-                task=f"""Fill out this job application form. The form is already visible on the page.
-
-FILL THESE FIELDS IN ORDER:
-
-1. RESUME/CV: Find the file upload field labeled "Resume/CV" and upload this file:
-   {resume_path}
-   Look for an "ATTACH RESUME/CV" button or file input.
-
-2. FULL NAME: Type "Edrick Chang" in the Full name field.
-
-3. EMAIL: Type "eachang@scu.edu" in the Email field.
-
-4. PHONE: Type "(408) 806-6495" in the Phone field.
-
-5. CURRENT COMPANY: Type "Santa Clara University" if there is a current company field.
-
-6. LINKEDIN: Type "https://linkedin.com/in/edrickchang" in the LinkedIn URL field.
-
-7. GITHUB: Type "https://github.com/edrickchang" in any GitHub field.
-
-8. For any PRONOUNS section: select "He/him"
-
-9. For any text area questions asking why you want to work here or why interested:
-{answers_text}
-
-10. For DROPDOWNS about work authorization: Select "Yes" for authorized, "No" for sponsorship needed.
-
-11. For EDUCATION fields: Santa Clara University, BS Computer Science & Engineering, GPA 3.78, June 2028
-
-CRITICAL RULES:
-- Do NOT click "Apply with LinkedIn"
-- Do NOT click Submit or Send Application
-- Fill fields one at a time, verify each one is filled before moving to the next
-- If a field is already filled, skip it
-- After filling all fields, STOP and report what you filled""",
-                llm=llm,
-                browser=browser_instance,
-                use_vision=False,
-                max_actions_per_step=3,
-                max_failures=3,
-            )
-
-            result2 = await agent2.run(max_steps=30, on_step_end=_capture_screenshot)
-            add_event("Fill Form", "success", "Form fields filled")
-
-            if pipeline_stop_requested:
-                return
-
-            # Step 5: Final screenshot for review
-            add_event("Screenshot & Review", "start", "Capturing final state...")
-
-            # Take one more screenshot
+        if page:
             try:
-                if browser_instance:
-                    # Create a minimal agent just to take a final screenshot
-                    final_agent = Agent(
-                        task="Scroll to the top of the page so the full form is visible. Then scroll down slowly to show all filled fields. Do not click anything.",
-                        llm=llm,
-                        browser=browser_instance,
-                        use_vision=False,
-                        max_actions_per_step=2,
-                    )
-                    await final_agent.run(max_steps=3, on_step_end=_capture_screenshot)
+                screenshot_bytes = await page.screenshot(type="png")
+                latest_screenshot_b64 = base64.b64encode(screenshot_bytes).decode("utf-8")
+                screenshot_version += 1
             except Exception:
                 pass
 
-            # Save screenshot to disk
-            if latest_screenshot_b64:
-                try:
-                    screenshots_dir = Path(__file__).parent.parent / "screenshots"
-                    screenshots_dir.mkdir(exist_ok=True)
-                    fname = f"{company}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-                    (screenshots_dir / fname).write_bytes(base64.b64decode(latest_screenshot_b64))
-                    add_event("Screenshot & Review", "info", f"Saved screenshot: {fname}")
-                except Exception as e:
-                    add_event("Screenshot & Review", "info", f"Screenshot save failed: {e}")
+        # Save screenshot to disk
+        if latest_screenshot_b64:
+            try:
+                screenshots_dir = Path(__file__).parent.parent / "screenshots"
+                screenshots_dir.mkdir(exist_ok=True)
+                fname = f"{company}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+                (screenshots_dir / fname).write_bytes(base64.b64decode(latest_screenshot_b64))
+                add_event("Screenshot & Review", "info", f"Saved screenshot: {fname}")
+            except Exception as e:
+                add_event("Screenshot & Review", "info", f"Screenshot save failed: {e}")
 
-            add_event("Screenshot & Review", "success", "Ready for your review. Check the browser view.")
-            add_event("Pipeline Complete", "success",
-                      "Form is filled. Review it in the browser view above, then submit manually in the browser window.")
+        summary = result.get("summary", {})
+        add_event("Screenshot & Review", "success", "Ready for review.")
+        add_event("Pipeline Complete", "success",
+                  f"Filled {summary.get('filled', 0)} fields, "
+                  f"{summary.get('failed', 0)} failed. "
+                  f"Auto-marked as applied.")
 
-            # Keep browser open for manual review - don't close it
+        # Auto-mark as applied
+        from database.tracker import mark_applied
+        mark_applied(url, company, role)
 
-        except Exception as e:
-            import traceback
-            tb = traceback.format_exc()
-            add_event("Navigate", "error", f"Browser agent failed: {e}")
-            # Log more traceback for debugging (first 1500 chars has root cause)
-            add_event("Navigate", "info", f"Traceback: {tb[:1500]}")
+        # Close browser after 5 seconds
+        await asyncio.sleep(5)
+        if browser_instance:
+            try:
+                await browser_instance.close()
+            except Exception:
+                pass
+            browser_instance = None
+        try:
+            from applicator.form_filler import close_browser as cb
+            await cb()
+        except Exception:
+            pass
+        add_event("Pipeline Complete", "info", "Browser closed.")
 
     except Exception as e:
-        add_event("Pipeline Error", "error", str(e))
+        import traceback
+        tb = traceback.format_exc()
+        add_event("Pipeline Error", "error", f"{e}")
+        add_event("Pipeline Error", "info", f"Traceback: {tb[:1500]}")
     finally:
         pipeline_running = False
 
