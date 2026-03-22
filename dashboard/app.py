@@ -1,10 +1,15 @@
 import asyncio
+import sys
 import json
 import os
 import base64
 import time
 from datetime import datetime
 from pathlib import Path
+
+# Playwright needs ProactorEventLoop on Windows for subprocess spawning.
+# Uvicorn's --reload flag forces SelectorEventLoop which breaks this.
+# We ensure the default (ProactorEventLoop) is used.
 
 from fastapi import FastAPI, Request, UploadFile, File
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
@@ -19,6 +24,8 @@ pipeline_stop_requested = False
 latest_screenshot_b64: str = ""  # base64 encoded PNG of latest browser state
 screenshot_version: int = 0  # incremented each time screenshot changes
 browser_instance = None  # Keep browser ref for screenshots
+active_page = None       # Current Playwright page - stays valid while browser open
+active_context = None    # Browser context - needed for new tabs (email verify)
 
 # File uploads directory
 UPLOADS_DIR = Path(__file__).parent.parent / "uploads"
@@ -195,7 +202,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             font-size: 10px; background: #1a3a1a; color: #4ade80;
             font-weight: 600;
         }
-        .applied-row { opacity: 0.6; }
+        .applied-row { opacity: 1; }
         .mark-applied-btn {
             background: #2563eb; color: #fff; border: none;
             padding: 4px 12px; border-radius: 4px; font-size: 11px;
@@ -334,7 +341,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
                 <div class="filter-group">
                     <label>Search</label>
-                    <input type="text" id="filterSearch" placeholder="Company or role..." value="software engineer intern" oninput="applyFilters()">
+                    <input type="text" id="filterSearch" placeholder="Company or role..." value="" oninput="applyFilters()">
                 </div>
 
                 <div class="filter-group">
@@ -350,10 +357,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 <div class="filter-group">
                     <label>Posted Within</label>
                     <select id="filterAge" onchange="applyFilters()">
-                        <option value="all">Any Time</option>
+                        <option value="all" selected>Any Time</option>
                         <option value="1">Last 1 day</option>
                         <option value="3">Last 3 days</option>
-                        <option value="7" selected>Last 7 days</option>
+                        <option value="7">Last 7 days</option>
                         <option value="14">Last 14 days</option>
                         <option value="30">Last 30 days</option>
                     </select>
@@ -415,6 +422,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                     <div style="display:flex;gap:6px;">
                         <button id="startBtn" onclick="startApplication()" style="flex:1">Start Application</button>
                         <button id="stopBtn" onclick="stopApplication()" style="flex:0 0 70px;background:#dc2626;display:none">Stop</button>
+                    </div>
+                    <div style="display:flex;gap:6px;margin-top:4px;">
+                        <button id="continueBtn" onclick="continueApplication()" style="flex:1;background:#7c3aed;display:none;padding:8px;border:none;color:#fff;border-radius:6px;cursor:pointer;font-size:13px;">Continue</button>
+                        <button id="emailVerifyBtn" onclick="triggerEmailVerify()" style="flex:1;background:#d97706;display:none;padding:8px;border:none;color:#fff;border-radius:6px;cursor:pointer;font-size:13px;">Get Email Code</button>
                     </div>
                     <button class="mark-applied-btn" onclick="markAsApplied()">Mark as Applied</button>
                 </div>
@@ -561,9 +572,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 const escapedUrl = job.url.replace(/'/g, "\\\\'");
                 const escapedCompany = job.company.replace(/'/g, "\\\\'");
                 const escapedRole = job.role.replace(/'/g, "\\\\'");
-                const actionBtn = isApplied
-                    ? '<span class="applied-badge">Applied</span>'
-                    : '<button class="apply-btn" onclick="selectJob(\\'' + escapedUrl + '\\', \\'' + escapedCompany + '\\', \\'' + escapedRole + '\\')">Apply</button>';
+                const actionBtn = '<button class="apply-btn" onclick="selectJob(\\'' + escapedUrl + '\\', \\'' + escapedCompany + '\\', \\'' + escapedRole + '\\')">Apply</button>';
                 return '<tr class="' + rowClass + '">' +
                     '<td class="company-name">' + job.company + appliedBadge + '</td>' +
                     '<td class="role-name">' + job.role + '</td>' +
@@ -598,6 +607,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             document.getElementById('startBtn').disabled = true;
             document.getElementById('startBtn').textContent = 'Running...';
             document.getElementById('stopBtn').style.display = 'block';
+            document.getElementById('continueBtn').style.display = 'none';
+            document.getElementById('emailVerifyBtn').style.display = 'none';
             document.getElementById('globalStatus').className = 'status-badge status-running';
             document.getElementById('globalStatus').textContent = 'Running';
             document.getElementById('eventLog').innerHTML = '';
@@ -628,10 +639,38 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             document.getElementById('startBtn').disabled = false;
             document.getElementById('startBtn').textContent = 'Start Application';
             document.getElementById('stopBtn').style.display = 'none';
+            document.getElementById('continueBtn').style.display = 'none';
+            document.getElementById('emailVerifyBtn').style.display = 'none';
             document.getElementById('globalStatus').className = 'status-badge status-idle';
             document.getElementById('globalStatus').textContent = 'Stopped';
             if (screenshotSource) { screenshotSource.close(); screenshotSource = null; }
             addEvent({timestamp: new Date().toLocaleTimeString().slice(0,8), step: 'Stopped', status: 'error', detail: 'Stopped by user'});
+        }
+
+        function continueApplication() {
+            var btn = document.getElementById('continueBtn');
+            btn.disabled = true; btn.textContent = 'Analyzing...';
+            fetch('/continue', {method: 'POST'}).then(r => r.json()).then(data => {
+                btn.disabled = false; btn.textContent = 'Continue';
+                if (!screenshotSource) startScreenshotStream();
+            }).catch(() => { btn.disabled = false; btn.textContent = 'Continue'; });
+        }
+
+        function triggerEmailVerify() {
+            var btn = document.getElementById('emailVerifyBtn');
+            btn.disabled = true; btn.textContent = 'Checking email...';
+            addEvent({timestamp: new Date().toLocaleTimeString().slice(0,8), step: 'Email Verify', status: 'start', detail: 'Opening Gmail to find verification code...'});
+            fetch('/email-verify', {method: 'POST'}).then(r => r.json()).then(data => {
+                btn.disabled = false; btn.textContent = 'Get Email Code';
+                if (data.code) {
+                    addEvent({timestamp: new Date().toLocaleTimeString().slice(0,8), step: 'Email Verify', status: 'success', detail: 'Found code: ' + data.code});
+                } else if (data.link) {
+                    addEvent({timestamp: new Date().toLocaleTimeString().slice(0,8), step: 'Email Verify', status: 'success', detail: 'Clicked verification link'});
+                } else {
+                    addEvent({timestamp: new Date().toLocaleTimeString().slice(0,8), step: 'Email Verify', status: 'error', detail: data.error || 'No verification email found'});
+                }
+                if (!screenshotSource) startScreenshotStream();
+            }).catch(() => { btn.disabled = false; btn.textContent = 'Get Email Code'; });
         }
 
         let screenshotSource = null;
@@ -650,13 +689,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                     }
                 }
                 if (data.done) {
-                    screenshotSource.close();
-                    screenshotSource = null;
                     document.getElementById('startBtn').disabled = false;
-                    document.getElementById('startBtn').textContent = 'Start Application';
-                    document.getElementById('stopBtn').style.display = 'none';
+                    document.getElementById('startBtn').textContent = 'Start New';
+                    document.getElementById('continueBtn').style.display = 'block';
+                    document.getElementById('emailVerifyBtn').style.display = 'block';
                     document.getElementById('globalStatus').className = 'status-badge status-idle';
-                    document.getElementById('globalStatus').textContent = 'Done';
+                    document.getElementById('globalStatus').textContent = 'Review';
+                    // Keep screenshot stream alive for Continue/Email Verify
+                }
+                if (data.closed) {
+                    if (screenshotSource) { screenshotSource.close(); screenshotSource = null; }
+                    document.getElementById('continueBtn').style.display = 'none';
+                    document.getElementById('emailVerifyBtn').style.display = 'none';
                 }
             };
             screenshotSource.onerror = function() {
@@ -850,25 +894,371 @@ async def get_screenshot():
 
 @app.get("/screenshot-stream")
 async def screenshot_stream():
-    """SSE stream that pushes screenshots as they change."""
+    """SSE stream that pushes screenshots. Stays alive for Continue/Email Verify."""
     async def stream():
         last_version = -1
+        sent_done = False
+        idle_ticks = 0
         while True:
             if screenshot_version != last_version and latest_screenshot_b64:
                 last_version = screenshot_version
+                idle_ticks = 0
                 yield f"data: {json.dumps({'image': latest_screenshot_b64, 'done': not pipeline_running, 'v': screenshot_version})}\n\n"
-            if not pipeline_running and last_version > 0:
-                yield f"data: {json.dumps({'done': True, 'v': screenshot_version})}\n\n"
+                if not pipeline_running and not sent_done:
+                    sent_done = True
+
+            idle_ticks += 1
+            # Send keepalive every ~5s to prevent SSE timeout
+            if idle_ticks > 33:
+                idle_ticks = 0
+                yield f"data: {json.dumps({'keepalive': True, 'done': not pipeline_running, 'v': screenshot_version})}\n\n"
+
+            # Only close if browser is gone AND pipeline done AND we already sent done
+            if not pipeline_running and browser_instance is None and sent_done:
+                yield f"data: {json.dumps({'closed': True})}\n\n"
                 break
             await asyncio.sleep(0.15)
     return StreamingResponse(stream(), media_type="text/event-stream")
 
 
+@app.post("/continue")
+async def continue_application_endpoint():
+    """Analyze current page and TAKE ACTION: fill credentials, run Workday handler, fill forms."""
+    global pipeline_running, latest_screenshot_b64, screenshot_version
+
+    page = active_page
+    if not page:
+        # Fallback: try browser-use browser
+        try:
+            from applicator.form_filler import _bu_browser
+            if _bu_browser:
+                page = await _bu_browser.get_current_page()
+        except Exception:
+            pass
+
+    if not page:
+        return JSONResponse({"status": "error", "message": "No browser open"})
+
+    # Verify page is alive
+    try:
+        current_url = page.url
+    except Exception:
+        return JSONResponse({"status": "error", "message": "Browser page closed"})
+
+    # Screenshot
+    try:
+        ss = await page.screenshot(type="png")
+        latest_screenshot_b64 = base64.b64encode(ss).decode("utf-8")
+        screenshot_version += 1
+    except Exception:
+        pass
+
+    add_event("Continue", "info", f"Analyzing: {current_url[:80]}")
+
+    try:
+        state = await page.evaluate("""() => {
+            const t = document.body.innerText.toLowerCase();
+            const url = window.location.href.toLowerCase();
+            return {
+                url: window.location.href,
+                bodyText: document.body.innerText.substring(0, 2000),
+                isWorkday: url.includes('workday') || url.includes('myworkdayjobs'),
+                hasProgressBar: !!document.querySelector('[data-automation-id="progressBar"]'),
+                isLogin: (
+                    !!document.querySelector('[data-automation-id="signInSubmitButton"]') ||
+                    !!document.querySelector('[data-automation-id="createAccountSubmitButton"]') ||
+                    !!document.querySelector('[data-automation-id="createAccountLink"]') ||
+                    (t.includes('sign in') && !!document.querySelector('input[type="password"]'))
+                ),
+                hasEmailField: !!document.querySelector('[data-automation-id="email"], input[type="email"]'),
+                hasCreateAccount: !!document.querySelector('[data-automation-id="createAccountSubmitButton"]'),
+                hasSignIn: !!document.querySelector('[data-automation-id="signInSubmitButton"]'),
+                isVerify: ['verify your email','verification code','check your email','check your inbox','enter the code'].some(k => t.includes(k)),
+                isSuccess: ['application submitted','thank you for applying','application received','successfully submitted'].some(k => t.includes(k)),
+                errorMsgs: Array.from(document.querySelectorAll('[class*="error"],[role="alert"],[data-automation-id="errorMessage"]')).filter(e => e.offsetParent !== null).map(e => e.innerText.trim()).filter(t => t),
+                visibleFields: Array.from(document.querySelectorAll('input:not([type="hidden"]),textarea,select')).filter(e => e.offsetParent !== null).length,
+                activeStep: (() => { const s = document.querySelector('[data-automation-id="progressBarActiveStep"]'); return s ? s.innerText.trim() : ''; })(),
+                buttons: Array.from(document.querySelectorAll('button')).filter(b => b.offsetParent !== null).map(b => b.innerText.trim().substring(0,40)).filter(t => t).slice(0,10),
+            };
+        }""")
+
+        # --- SUCCESS ---
+        if state.get("isSuccess"):
+            add_event("Continue", "success", "Application submitted successfully!")
+            return JSONResponse({"status": "ok", "action": "success"})
+
+        # --- VERIFICATION ---
+        if state.get("isVerify"):
+            add_event("Continue", "info", "Verification page detected. Click 'Get Email Code' to handle it.")
+            return JSONResponse({"status": "ok", "action": "verify"})
+
+        # --- ERRORS ---
+        if state.get("errorMsgs"):
+            for err in state["errorMsgs"][:3]:
+                add_event("Continue", "error", f"Page error: {err[:150]}")
+
+        # --- LOGIN/ACCOUNT ---
+        if state.get("isLogin"):
+            add_event("Continue", "info", "Login page detected. Filling credentials...")
+            import yaml
+            creds_path = Path(__file__).parent.parent / "credentials.yaml"
+            creds = {}
+            try:
+                with open(creds_path) as f:
+                    creds = yaml.safe_load(f) or {}
+            except Exception:
+                pass
+            wd = creds.get("workday", {})
+            email = wd.get("email", "")
+            pw = wd.get("password", "")
+            if not email or not pw:
+                add_event("Continue", "error", "No credentials in credentials.yaml")
+                return JSONResponse({"status": "error", "message": "No credentials"})
+
+            # Fill email
+            for sel in ['[data-automation-id="email"]', 'input[type="email"]', 'input[name="email"]']:
+                try:
+                    el = page.locator(sel).first
+                    if await el.is_visible(timeout=1000):
+                        await el.fill(email, timeout=3000)
+                        break
+                except Exception:
+                    continue
+            # Fill password
+            for sel in ['[data-automation-id="password"]', 'input[type="password"]']:
+                try:
+                    el = page.locator(sel).first
+                    if await el.is_visible(timeout=1000):
+                        await el.fill(pw, timeout=3000)
+                        break
+                except Exception:
+                    continue
+            # Fill verify password
+            try:
+                vp = page.locator('[data-automation-id="verifyPassword"]').first
+                if await vp.is_visible(timeout=1000):
+                    await vp.fill(pw, timeout=3000)
+            except Exception:
+                pass
+            # Check ALL checkboxes (privacy, terms, consent) using robust handler
+            from applicator.workday_handler import check_workday_checkbox
+            await check_workday_checkbox(page, event_callback=lambda s, st, d: add_event(s, st, d))
+            await page.wait_for_timeout(1000)
+
+            # Click appropriate button
+            clicked = False
+            for sel in ['[data-automation-id="createAccountSubmitButton"]', '[data-automation-id="signInSubmitButton"]',
+                        'div[data-automation-id="click_filter"][aria-label="Create Account"]',
+                        'div[data-automation-id="click_filter"][aria-label="Sign In"]',
+                        'button:has-text("Sign In")', 'button:has-text("Create Account")']:
+                try:
+                    btn = page.locator(sel).first
+                    if await btn.is_visible(timeout=1000):
+                        await btn.click(force=True, timeout=5000)
+                        clicked = True
+                        add_event("Continue", "info", f"Clicked: {sel[:50]}")
+                        break
+                except Exception:
+                    continue
+            if not clicked:
+                # JS fallback
+                await page.evaluate("""() => {
+                    for (const sel of ['[data-automation-id="createAccountSubmitButton"]','[data-automation-id="signInSubmitButton"]']) {
+                        const el = document.querySelector(sel);
+                        if (el) { el.click(); return; }
+                    }
+                    for (const btn of document.querySelectorAll('button, div[role="button"]')) {
+                        const t = btn.innerText.trim();
+                        if (t === 'Create Account' || t === 'Sign In') { btn.click(); return; }
+                    }
+                }""")
+                add_event("Continue", "info", "Clicked auth button via JS")
+
+            await page.wait_for_timeout(5000)
+            try:
+                ss = await page.screenshot(type="png")
+                latest_screenshot_b64 = base64.b64encode(ss).decode("utf-8")
+                screenshot_version += 1
+            except Exception:
+                pass
+            # Check if still stuck on Create Account (checkbox may not have worked)
+            still_on_create = await page.evaluate(
+                "() => !!document.querySelector('[data-automation-id=\"createAccountSubmitButton\"]')")
+            if still_on_create:
+                add_event("Continue", "info", "Still on Create Account page. Retrying checkbox + submit...")
+                await check_workday_checkbox(page, event_callback=lambda s, st, d: add_event(s, st, d))
+                await page.wait_for_timeout(1000)
+                # Try clicking again with JS
+                await page.evaluate("""() => {
+                    const btn = document.querySelector('[data-automation-id="createAccountSubmitButton"]')
+                        || document.querySelector('div[data-automation-id="click_filter"][aria-label="Create Account"]');
+                    if (btn) btn.click();
+                }""")
+                await page.wait_for_timeout(5000)
+                try:
+                    ss = await page.screenshot(type="png")
+                    latest_screenshot_b64 = base64.b64encode(ss).decode("utf-8")
+                    screenshot_version += 1
+                except Exception:
+                    pass
+                # Check for error messages
+                errs = await page.evaluate("""() =>
+                    Array.from(document.querySelectorAll('[class*="error"],[role="alert"]'))
+                    .filter(e => e.offsetParent !== null).map(e => e.innerText.trim()).filter(t => t)
+                """)
+                if errs:
+                    add_event("Continue", "error", f"Create Account errors: {errs}")
+
+            add_event("Continue", "info", f"After auth: {page.url[:80]}. Click Continue again to proceed.")
+            return JSONResponse({"status": "ok", "action": "auth"})
+
+        # --- WORKDAY WIZARD ---
+        if state.get("isWorkday") and (state.get("hasProgressBar") or state.get("activeStep")):
+            step = state.get("activeStep", "Unknown")
+            add_event("Continue", "info", f"Workday wizard step: {step}. Running handler...")
+
+            resume_path = ""
+            for c in [Path(__file__).parent.parent / "uploads" / "EdrickChang_Resume.pdf",
+                       Path(os.path.expanduser("~/Downloads/EdrickChang.pdf"))]:
+                if c.exists():
+                    resume_path = str(c.resolve())
+                    break
+
+            from applicator.workday_handler import handle_workday_application
+            async def on_evt(s, st, d=""):
+                add_event(s, st, d)
+            async def on_ss(b):
+                global latest_screenshot_b64, screenshot_version
+                if b:
+                    latest_screenshot_b64 = base64.b64encode(b).decode("utf-8")
+                    screenshot_version += 1
+
+            result = await handle_workday_application(page, resume_path, "", "", "", on_evt, on_ss)
+            add_event("Continue", "success" if not result.get("errors") else "info",
+                f"Workday: {result.get('filled',0)} filled, {result.get('failed',0)} failed. Click Continue if more steps remain.")
+            return JSONResponse({"status": "ok", "action": "workday"})
+
+        # --- REGULAR FORM ---
+        if state.get("visibleFields", 0) > 3:
+            add_event("Continue", "info", f"Form with {state['visibleFields']} fields. Filling...")
+
+            resume_path = ""
+            for c in [Path(__file__).parent.parent / "uploads" / "EdrickChang_Resume.pdf",
+                       Path(os.path.expanduser("~/Downloads/EdrickChang.pdf"))]:
+                if c.exists():
+                    resume_path = str(c.resolve())
+                    break
+
+            from applicator.form_filler import JS_EXTRACT_FIELDS, map_fields_to_profile, fill_form
+            fields = await page.evaluate(JS_EXTRACT_FIELDS)
+            if fields:
+                company = await page.evaluate("document.title") or ""
+                mappings = map_fields_to_profile(fields, "", company, "")
+                async def on_evt(s, st, d=""):
+                    add_event(s, st, d)
+                result = await fill_form(page, mappings, resume_path, event_callback=on_evt, screenshot_page=page)
+                add_event("Continue", "info", f"Filled {result.get('filled',0)}, failed {result.get('failed',0)}")
+            else:
+                add_event("Continue", "info", "No extractable fields on this page.")
+            return JSONResponse({"status": "ok", "action": "form"})
+
+        # --- UNKNOWN ---
+        add_event("Continue", "info",
+            f"{state.get('visibleFields',0)} fields. Buttons: {state.get('buttons',[])}. "
+            f"Text: {state.get('bodyText','')[:200]}...")
+        return JSONResponse({"status": "ok", "action": "unknown"})
+
+    except Exception as e:
+        add_event("Continue", "error", f"Failed: {e}")
+        import traceback
+        add_event("Continue", "info", traceback.format_exc()[:500])
+        return JSONResponse({"status": "error", "message": str(e)})
+
+
+@app.post("/email-verify")
+async def email_verify_endpoint():
+    """Open Gmail, find verification code/link, enter it on current page."""
+    global pipeline_running, latest_screenshot_b64, screenshot_version
+
+    page = active_page
+    context = active_context
+    if not page:
+        try:
+            from applicator.form_filler import _bu_browser
+            if _bu_browser:
+                page = await _bu_browser.get_current_page()
+                if page:
+                    context = page.context
+        except Exception:
+            pass
+
+    if not page or not context:
+        return JSONResponse({"status": "error", "error": "No browser page available"})
+
+    try:
+        from applicator.email_handler import handle_email_verification, enter_verification_code
+
+        company = ""
+        try:
+            company = await page.title()
+        except Exception:
+            pass
+
+        async def on_event(step, status, detail=""):
+            add_event(step, status, detail)
+
+        async def on_ss(ss_bytes):
+            global latest_screenshot_b64, screenshot_version
+            if ss_bytes:
+                latest_screenshot_b64 = base64.b64encode(ss_bytes).decode("utf-8")
+                screenshot_version += 1
+
+        result = await handle_email_verification(
+            context=context, original_page=page,
+            company_name=company, event_callback=on_event, screenshot_callback=on_ss,
+        )
+
+        if result["success"] and result["method"] == "code" and result["code"]:
+            entered = await enter_verification_code(page, result["code"], on_event)
+            try:
+                ss = await page.screenshot(type="png")
+                latest_screenshot_b64 = base64.b64encode(ss).decode("utf-8")
+                screenshot_version += 1
+            except Exception:
+                pass
+            return JSONResponse({"status": "ok", "code": result["code"]})
+
+        elif result["success"] and result["method"] == "link":
+            add_event("Email Verify", "success", "Verification link clicked. Refreshing...")
+            await page.wait_for_timeout(3000)
+            try:
+                await page.reload(wait_until="domcontentloaded", timeout=15000)
+            except Exception:
+                pass
+            try:
+                ss = await page.screenshot(type="png")
+                latest_screenshot_b64 = base64.b64encode(ss).decode("utf-8")
+                screenshot_version += 1
+            except Exception:
+                pass
+            return JSONResponse({"status": "ok", "link": result["link"]})
+
+        else:
+            add_event("Email Verify", "warning", "No verification email found. Try again in a few seconds.")
+            return JSONResponse({"status": "error", "error": "No verification email found"})
+
+    except Exception as e:
+        add_event("Email Verify", "error", f"Failed: {e}")
+        return JSONResponse({"status": "error", "error": str(e)})
+
+
 @app.post("/stop")
 async def stop_pipeline():
-    global pipeline_stop_requested, pipeline_running, browser_instance
+    global pipeline_stop_requested, pipeline_running, browser_instance, active_page, active_context
     pipeline_stop_requested = True
     pipeline_running = False
+    active_page = None
+    active_context = None
     add_event("Stopped", "error", "Stopped by user")
     if browser_instance:
         try:
@@ -877,8 +1267,9 @@ async def stop_pipeline():
             pass
         browser_instance = None
     try:
-        from applicator.form_filler import close_browser
+        from applicator.form_filler import close_browser, close_browser_agent
         await close_browser()
+        await close_browser_agent()
     except Exception:
         pass
     return JSONResponse({"status": "stopped"})
@@ -904,7 +1295,9 @@ async def run_pipeline(request: Request):
 
 
 async def _run_application(url: str, company: str, role: str):
-    global pipeline_running, latest_screenshot_b64, browser_instance
+    global pipeline_running, latest_screenshot_b64, browser_instance, active_page, active_context
+    active_page = None
+    active_context = None
 
     # Close any previous browser before starting a new one
     if browser_instance:
@@ -914,8 +1307,9 @@ async def _run_application(url: str, company: str, role: str):
             pass
         browser_instance = None
     try:
-        from applicator.form_filler import close_browser as cb
+        from applicator.form_filler import close_browser as cb, close_browser_agent as cba
         await cb()
+        await cba()
     except Exception:
         pass
 
@@ -935,8 +1329,8 @@ async def _run_application(url: str, company: str, role: str):
         if pipeline_stop_requested:
             return
 
-        # Steps 2-4: Hybrid Playwright + LLM approach
-        from applicator.form_filler import fill_application, close_browser
+        # Steps 2-4: Use browser-use AI agent to fill the application
+        from applicator.form_filler import fill_with_browser_agent, close_browser_agent
 
         async def on_event(step, status, detail=""):
             add_event(step, status, detail)
@@ -947,7 +1341,7 @@ async def _run_application(url: str, company: str, role: str):
                 latest_screenshot_b64 = base64.b64encode(screenshot_bytes).decode("utf-8")
                 screenshot_version += 1
 
-        result = await fill_application(
+        result = await fill_with_browser_agent(
             url=url,
             company=company,
             role=role,
@@ -960,6 +1354,37 @@ async def _run_application(url: str, company: str, role: str):
 
         browser_instance = result.get("browser")
         page = result.get("page")
+        completed = result.get("completed", False)
+
+        # Set global page refs for Continue/Email Verify buttons
+        active_page = page
+        if page:
+            try:
+                active_context = page.context
+            except Exception:
+                active_context = None
+
+        # Workday multi-step: if agent finished but didn't complete, try dedicated handler
+        if page and not completed and ("workday" in url.lower() or "myworkdayjobs" in url.lower()):
+            add_event("Workday Handler", "info", "Agent didn't fully complete. Trying dedicated Workday multi-step handler...")
+            try:
+                from applicator.workday_handler import handle_workday_application
+                wd_result = await handle_workday_application(
+                    page=page,
+                    resume_path=resume_path,
+                    company=company,
+                    role=role,
+                    job_description=jd,
+                    event_callback=on_event,
+                    screenshot_callback=on_screenshot,
+                )
+                wd_filled = wd_result.get("filled", 0)
+                wd_failed = wd_result.get("failed", 0)
+                add_event("Workday Handler", "info", f"Workday handler: filled {wd_filled}, failed {wd_failed}")
+                if wd_filled > 0:
+                    completed = True
+            except Exception as e:
+                add_event("Workday Handler", "error", f"Workday handler error: {str(e)[:200]}")
 
         # Step 5: Final screenshot for review
         add_event("Screenshot & Review", "start", "Capturing final state...")
@@ -984,18 +1409,32 @@ async def _run_application(url: str, company: str, role: str):
                 add_event("Screenshot & Review", "info", f"Screenshot save failed: {e}")
 
         summary = result.get("summary", {})
-        add_event("Screenshot & Review", "success", "Ready for review.")
-        add_event("Pipeline Complete", "success",
-                  f"Filled {summary.get('filled', 0)} fields, "
-                  f"{summary.get('failed', 0)} failed. "
-                  f"Auto-marked as applied.")
+        # completed may already be True from Workday handler above
+        if not completed:
+            completed = result.get("completed", False)
 
-        # Auto-mark as applied
-        from database.tracker import mark_applied
-        mark_applied(url, company, role)
+        if completed:
+            add_event("Screenshot & Review", "success", "Ready for review.")
+            add_event("Pipeline Complete", "success",
+                      f"Agent completed in {summary.get('steps', 0)} steps. "
+                      f"Auto-marked as applied.")
 
-        # Keep browser open so user can review and manually submit
-        add_event("Pipeline Complete", "info", "Browser stays open for review. Click Stop or start a new job to close it.")
+            # Only auto-mark as applied if the agent actually completed
+            from database.tracker import mark_applied
+            mark_applied(url, company, role)
+        else:
+            add_event("Screenshot & Review", "warning", "Agent did NOT complete the application.")
+            final_result = summary.get("final_result", "")
+            error = summary.get("error", "")
+            detail = final_result or error or "Agent stopped without completing the form"
+            add_event("Pipeline Incomplete", "error",
+                      f"NOT marked as applied. {detail[:200]}")
+
+        # Keep browser open so user can review and manually submit/retry
+        add_event("Pipeline Complete", "info", "Browser stays open. Use Continue to analyze page, or Get Email Code for verification.")
+
+        # Start background screenshot loop
+        asyncio.create_task(_background_screenshot_loop())
 
     except Exception as e:
         import traceback
@@ -1006,6 +1445,33 @@ async def _run_application(url: str, company: str, role: str):
         pipeline_running = False
 
 
+async def _background_screenshot_loop():
+    """Keep taking screenshots while browser is alive after pipeline finishes."""
+    global latest_screenshot_b64, screenshot_version
+    while True:
+        page = active_page
+        if not page:
+            try:
+                from applicator.form_filler import _bu_browser
+                if _bu_browser:
+                    page = await _bu_browser.get_current_page()
+            except Exception:
+                pass
+        if not page:
+            await asyncio.sleep(2)
+            if not active_page:
+                break
+            continue
+        try:
+            ss = await page.screenshot(type="png")
+            if ss:
+                latest_screenshot_b64 = base64.b64encode(ss).decode("utf-8")
+                screenshot_version += 1
+        except Exception:
+            break
+        await asyncio.sleep(1)
+
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8080)
+    uvicorn.run(app, host="127.0.0.1", port=8080, loop="asyncio")

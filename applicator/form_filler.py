@@ -10,12 +10,16 @@ import asyncio
 import json
 import os
 import re
+import sys
+import threading
 from pathlib import Path
 
 import yaml
 from openai import OpenAI
 from playwright.async_api import async_playwright, Page, Browser, Frame
 from config import CANDIDATE_PROFILE, WRITING_STYLE
+from applicator.email_verifier import complete_email_verification
+from applicator.ats_profiles import detect_ats, get_profile
 
 
 def _load_personal_info() -> dict:
@@ -36,12 +40,15 @@ def _build_known_values(info: dict) -> str:
         ("full_name", "Full name / Name"),
         ("email", "Email"),
         ("phone", "Phone"),
+        ("phone_country", "Phone country / Phone number country"),
+        ("phone_country_code", "Phone country code"),
         ("pronouns", "Pronouns"),
         ("street_address", "Street address / Address"),
         ("city", "City"),
         ("state", "State"),
         ("zip_code", "Zip code / Postal code"),
         ("country", "Country"),
+        ("location", "Current location / Location"),
         ("linkedin", "LinkedIn URL"),
         ("github", "GitHub URL"),
         ("portfolio", "Portfolio / Website"),
@@ -49,7 +56,7 @@ def _build_known_values(info: dict) -> str:
         ("degree", "Degree"),
         ("gpa", "GPA"),
         ("graduation_date", "Graduation date"),
-        ("graduation_year", "Graduation year"),
+        ("graduation_year", "Graduation year / Expected graduation year / What year will you graduate"),
         ("authorized_to_work", "Work authorization in US"),
         ("sponsorship_needed", "Sponsorship needed"),
         ("citizenship", "Citizenship"),
@@ -59,7 +66,12 @@ def _build_known_values(info: dict) -> str:
         ("veteran_status", "Veteran status"),
         ("disability_status", "Disability status"),
         ("current_company", "Current company / organization"),
+        ("currently_employed", "Currently employed"),
+        ("previous_employer", "Previous employer / Has had previous job"),
         ("years_of_experience", "Years of experience"),
+        ("internship_experience", "Previous internship experience / Has had internship"),
+        ("coop_experience", "Co-op experience / Has had co-op"),
+        ("previous_internships", "Number of previous internships"),
         ("start_date", "Available start date"),
         ("desired_salary", "Desired salary"),
         ("willing_to_relocate", "Willing to relocate"),
@@ -68,6 +80,18 @@ def _build_known_values(info: dict) -> str:
         ("emergency_contact_name", "Emergency contact name"),
         ("emergency_contact_phone", "Emergency contact phone"),
         ("emergency_contact_relationship", "Emergency contact relationship"),
+        ("how_did_you_hear", "How did you hear about us / this position / this role / Referral source"),
+        ("previously_worked_here", "Previously worked at this company / Have you worked here before"),
+        ("previously_applied_here", "Previously applied / Have you applied before"),
+        ("referral", "Were you referred / Referral / Do you know anyone who works here"),
+        ("referral_name", "Referral name / Who referred you"),
+        ("age_over_18", "Are you 18 or older / Are you over 18"),
+        ("felony_conviction", "Felony / conviction / criminal record"),
+        ("drug_test_consent", "Drug test / screening consent"),
+        ("background_check_consent", "Background check consent"),
+        ("available_start_date", "Available start date / When can you start / Earliest start date"),
+        ("highest_education", "Highest level of education / education level"),
+        ("reason_for_leaving", "Reason for leaving current position"),
     ]
     for key, label in mappings:
         value = info.get(key, "")
@@ -80,6 +104,319 @@ def _build_known_values(info: dict) -> str:
 # Module-level refs so browser stays alive after fill
 _playwright = None
 _browser = None
+_bu_browser = None  # browser-use browser instance
+
+
+async def fill_with_browser_agent(
+    url: str,
+    company: str,
+    role: str,
+    resume_path: str,
+    job_description: str,
+    event_callback=None,
+    screenshot_callback=None,
+    transcript_path: str = "",
+) -> dict:
+    """Use browser-use AI agent to fill job applications.
+
+    The agent sees the page visually and decides what to click/type,
+    making it much more robust than DOM extraction for complex portals.
+    """
+    global _bu_browser
+
+    personal_info = _load_personal_info()
+    known_values = _build_known_values(personal_info)
+    creds = _load_credentials()
+
+    # Pick credentials for this ATS
+    ats_key = detect_ats(url)
+    ats_creds = creds.get(ats_key or "workday", creds.get("workday", {}))
+    cred_email = ats_creds.get("email", "")
+    cred_password = ats_creds.get("password", "")
+
+    if event_callback:
+        await event_callback("Navigate", "info", f"Starting browser-use agent (ATS: {ats_key or 'unknown'})")
+
+    # Set up LLM - use Gemini via OpenAI-compatible endpoint through browser-use's ChatOpenAI
+    from browser_use import Agent, Browser
+    from browser_use.llm import ChatOpenAI
+
+    llm = ChatOpenAI(
+        model="gemini-2.5-flash",
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+        api_key=os.getenv("GEMINI_API_KEY"),
+        frequency_penalty=None,
+    )
+
+    _bu_browser = Browser(headless=False, keep_alive=True, disable_security=True)
+
+    task = f"""You are filling out a job application for {company} - {role}.
+
+URL: {url}
+
+STEP-BY-STEP INSTRUCTIONS:
+{f"""1. Navigate to the URL above
+2. Click "Apply" or "Apply Now" button. On Workday sites the button may be a link with text "Apply" inside an element with data-uxi-element-id="Apply_adventureButton".
+3. If you see options like "Apply Manually" / "Autofill with Resume", click "Apply Manually"
+
+CRITICAL — BUTTONS TO AVOID (DO NOT CLICK THESE EVER):
+- "Sign in with Google" / "Continue with Google" / Google SSO buttons
+- "Apply with LinkedIn" / "Sign in with LinkedIn" / LinkedIn OAuth buttons
+- "Sign in with Facebook" / "Continue with Facebook"
+- "Sign in with Apple"
+- "Sign in with SSO" / "Single Sign-On"
+- Any OAuth/social login button that opens a popup or redirects to Google/LinkedIn/Facebook/Apple/Microsoft
+- "Autofill with Resume" (on Workday — this uses LinkedIn)
+These will open OAuth popups or redirects that will FAIL. Always use manual email/password sign-in instead.
+
+4. If you see a Sign In / Create Account page:
+   - IMPORTANT: Each employer has SEPARATE accounts. You likely do NOT have an account yet.
+   - FIRST look for a "Create Account" link or button and click it
+   - On Workday: the Create Account link uses data-automation-id="createAccountLink"
+   - Fill in email: {cred_email} and password: {cred_password}
+   - If there is a "Verify Password" or "Confirm Password" field, enter the same password: {cred_password}
+   - If there is a terms/conditions checkbox, check it
+   - Click the "Create Account" submit button
+   - On Workday: Sign In and Create Account submit buttons are both div[role="button"][data-automation-id="click_filter"] — they differ by aria-label ("Sign In" vs "Create Account")
+   - After account creation, you may be taken to the Sign In page
+   - Enter the SAME email: {cred_email} and password: {cred_password} and click Sign In
+   - If the page asks you to verify your email: STOP and report "NEEDS_EMAIL_VERIFICATION". Do NOT keep refreshing or clicking. The system will handle email verification automatically.
+   - CRITICAL: If you click Sign In and the page does not change (still shows Sign In), it means the sign-in FAILED. Do NOT keep clicking Sign In. Instead look for "Create Account" link.
+   - If account already exists (error message), just sign in with the same credentials.
+
+CRITICAL RULES FOR AVOIDING LOOPS:
+- NEVER retry the same exact action more than twice. If it didn't work twice, try a completely different approach.
+- If you see the exact same page 3 times in a row, STOP and report what you see.
+- If the page says "verify your email" or "check your inbox", STOP immediately and report "NEEDS_EMAIL_VERIFICATION".
+- If you tried creating an account and it failed, STOP and report "ACCOUNT_CREATION_FAILED".
+- If you've taken 15+ actions and haven't reached the form yet, STOP and describe what page you're on.
+- If a button click doesn't change the page, do NOT click it again. Try a different button or approach.
+
+HANDLING COMMON OBSTACLES:
+- Cookie consent banners: click "Accept" or "Accept All" to dismiss
+- "This job is no longer accepting applications" / "Position has been filled": STOP immediately, the job is closed
+- CAPTCHA: STOP and wait, do not try to solve it
+- "Already applied": STOP, you already applied to this job
+- Pop-up overlays / modals blocking the form: close them by clicking X or "Close"
+- Loading spinners: wait up to 10 seconds for them to finish before taking action
+- If a page looks completely blank or broken, wait 5 seconds and try refreshing once
+
+5."""} Once on the application form, fill out ALL fields using this information:
+
+CANDIDATE INFO:
+{known_values}
+
+RESUME: Upload the file at {resume_path}
+{f'TRANSCRIPT: Upload the file at {transcript_path}' if transcript_path else ''}
+
+ADDITIONAL RULES:
+- For "How did you hear about us": select "LinkedIn" or "Job Board" or "Internet"
+- For any referral questions: answer "No"
+- For internship/co-op experience: "No" or "0"
+- For cover letter / additional info fields: skip them (leave blank)
+- For EEO questions: Gender=Male, Race=Asian, Veteran=Not a veteran, Disability=No disability
+- For open-ended questions about why this company/role, write 2-3 sentences connecting the candidate's hackathon experience in AI systems to {company}'s work
+- For phone country: select "United States"
+- For graduation year: 2028
+- DO NOT click Submit at the end. Stop before submitting.
+
+CRITICAL — HOW TO USE DROPDOWN MENUS (especially on Workday):
+Workday dropdowns are NOT native <select> elements. They are custom widgets. To select an option:
+1. CLICK the dropdown button/field to OPEN it (it will show a popup list of options)
+2. WAIT for the dropdown options to appear
+3. If there is a search/filter input inside the dropdown, TYPE the value you want (e.g. type "LinkedIn" or "California")
+4. CLICK the matching option from the list
+5. If the dropdown has a multi-select (shows "0 items selected"), click the option to select it, then click outside to close
+- If clicking the dropdown doesn't open options, try clicking the arrow icon next to it
+- For "How did you hear about us" multi-select: click the field, type "LinkedIn", click the "LinkedIn" option
+- For State dropdown: click the "Select One" button, type "California", click "California" from the list
+- For radio buttons (Yes/No): just click the correct radio button directly
+
+JOB DESCRIPTION:
+{job_description[:1500]}
+
+Fill ALL fields. Do not skip any required field. Be thorough and check each page of the form."""
+
+    agent = Agent(
+        task=task,
+        llm=llm,
+        browser=_bu_browser,
+        use_vision=False,
+        max_failures=10,
+        max_actions_per_step=3,
+        loop_detection_enabled=True,
+        loop_detection_window=5,
+    )
+
+    steps = 0
+    agent_error = None
+
+    from applicator.stuck_detector import StuckDetector
+    from applicator.email_handler import handle_email_verification, enter_verification_code
+    stuck = StuckDetector(max_repeats=3)
+
+    async def on_step_end(agent_instance: Agent) -> None:
+        nonlocal steps
+        steps += 1
+        if screenshot_callback:
+            try:
+                ss = await agent_instance.browser_session.take_screenshot()
+                if ss:
+                    await screenshot_callback(ss)
+            except Exception:
+                pass
+        if event_callback:
+            await event_callback("Fill Form", "info", f"Agent step {steps} completed")
+
+        # Check if stuck
+        try:
+            page = await _bu_browser.get_current_page()
+            if page:
+                current_url = page.url
+                page_text = await page.evaluate("document.body.innerText.substring(0, 1000)")
+                is_stuck = stuck.check(current_url, page_text, f"step {steps}")
+
+                if is_stuck and stuck.is_verification_page(page_text):
+                    if event_callback:
+                        await event_callback("Stuck Detection", "info", "Email verification detected. Checking email...")
+
+                    context = page.context
+                    result = await handle_email_verification(
+                        context=context, original_page=page,
+                        company_name=company,
+                        event_callback=event_callback,
+                        screenshot_callback=screenshot_callback,
+                    )
+                    if result["success"]:
+                        if result["method"] == "code" and result["code"]:
+                            await enter_verification_code(page, result["code"], event_callback)
+                        elif result["method"] == "link":
+                            await page.wait_for_timeout(3000)
+                            await page.reload()
+                            await page.wait_for_timeout(5000)
+                        stuck.reset()
+                        if event_callback:
+                            await event_callback("Stuck Detection", "success", "Email verification handled!")
+                    else:
+                        if event_callback:
+                            await event_callback("Stuck Detection", "warning",
+                                "Auto-verify failed. Waiting 60s for manual verification...")
+                        for _ in range(60):
+                            await page.wait_for_timeout(1000)
+                            new_text = await page.evaluate("document.body.innerText.substring(0, 500)")
+                            if not stuck.is_verification_page(new_text):
+                                stuck.reset()
+                                if event_callback:
+                                    await event_callback("Stuck Detection", "success", "Verification completed!")
+                                break
+
+                elif is_stuck:
+                    if event_callback:
+                        await event_callback("Stuck Detection", "warning",
+                            f"Loop detected: {stuck.stuck_reason[:150]}")
+                    # Try recovery: Escape, scroll, click Continue/Next
+                    await page.keyboard.press("Escape")
+                    await page.wait_for_timeout(500)
+                    for sel in ['button:has-text("Continue")', 'button:has-text("Next")',
+                                'button:has-text("Skip")', 'a:has-text("Continue")']:
+                        try:
+                            btn = page.locator(sel).first
+                            if await btn.is_visible(timeout=1000):
+                                await btn.click()
+                                await page.wait_for_timeout(2000)
+                                stuck.reset()
+                                if event_callback:
+                                    await event_callback("Stuck Detection", "info", f"Recovery: clicked {sel}")
+                                break
+                        except:
+                            continue
+        except Exception:
+            pass
+
+    history = None
+    try:
+        if event_callback:
+            await event_callback("Navigate", "info", "Browser-use agent starting...")
+
+        history = await agent.run(max_steps=50, on_step_end=on_step_end)
+
+        if event_callback:
+            await event_callback("Fill Form", "info", f"Agent finished after {steps} steps")
+
+    except Exception as e:
+        agent_error = str(e)
+        if event_callback:
+            await event_callback("Fill Form", "error", f"Agent error: {str(e)[:100]}")
+
+    # Determine if the agent actually completed the task
+    agent_done = False
+    agent_successful = False
+    if history:
+        agent_done = history.is_done()
+        agent_successful = history.is_successful() or False
+        if history.has_errors():
+            error_list = [e for e in history.errors() if e]
+            if error_list and event_callback:
+                await event_callback("Fill Form", "warning", f"Agent errors: {'; '.join(error_list[:3])}")
+
+    if agent_done and agent_successful:
+        if event_callback:
+            await event_callback("Fill Form", "success", f"Agent completed task successfully in {steps} steps")
+    elif agent_done:
+        if event_callback:
+            await event_callback("Fill Form", "warning", f"Agent marked done but may not have succeeded ({steps} steps)")
+    else:
+        if event_callback:
+            await event_callback("Fill Form", "warning", f"Agent did NOT complete the task after {steps} steps")
+
+    # Get final page for the dashboard to keep open
+    page = None
+    browser_pw = None
+    try:
+        page = await _bu_browser.get_current_page()
+    except Exception:
+        pass
+    try:
+        # Try to get the underlying Playwright browser for the dashboard
+        if hasattr(_bu_browser, 'browser') and _bu_browser.browser:
+            browser_pw = _bu_browser.browser
+        elif hasattr(_bu_browser, '_playwright_browser'):
+            browser_pw = _bu_browser._playwright_browser
+    except Exception:
+        pass
+
+    # Take final screenshot
+    if screenshot_callback and page:
+        try:
+            ss = await page.screenshot(type="png")
+            await screenshot_callback(ss)
+        except Exception:
+            pass
+
+    return {
+        "browser": browser_pw,
+        "page": page,
+        "completed": agent_done and agent_successful,
+        "summary": {
+            "steps": steps,
+            "agent_done": agent_done,
+            "agent_successful": agent_successful,
+            "error": agent_error,
+            "final_result": history.final_result() if history else None,
+        },
+    }
+
+
+async def close_browser_agent():
+    """Clean up browser-use browser."""
+    global _bu_browser
+    if _bu_browser:
+        try:
+            await _bu_browser.close()
+        except Exception:
+            pass
+        _bu_browser = None
+
 
 JS_EXTRACT_FIELDS = """
 () => {
@@ -225,8 +562,8 @@ JS_EXTRACT_FIELDS = """
 
 def _get_llm_client():
     return OpenAI(
-        base_url="https://api.cerebras.ai/v1",
-        api_key=os.getenv("CEREBRAS_API_KEY"),
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+        api_key=os.getenv("GEMINI_API_KEY"),
     )
 
 
@@ -251,6 +588,7 @@ def map_fields_to_profile(
     job_description: str,
     company: str,
     role: str,
+    cover_letter_text: str = "",
 ) -> list[dict]:
     """Send extracted fields to LLM, get back field->value mappings."""
     client = _get_llm_client()
@@ -259,14 +597,14 @@ def map_fields_to_profile(
     slim_fields = []
     for f in fields:
         slim = {
-            "selector": f["selector"],
-            "tag": f["tag"],
-            "type": f["type"],
-            "label": f["label"],
-            "required": f["required"],
+            "selector": f.get("selector", ""),
+            "tag": f.get("tag", ""),
+            "type": f.get("type", ""),
+            "label": f.get("label", "") or f.get("name", "") or f.get("dataid", ""),
+            "required": f.get("required", True),
         }
         if f.get("options"):
-            slim["options"] = [o["text"] for o in f["options"] if o["value"]]
+            slim["options"] = [o.get("text", "") for o in f["options"] if o.get("value")]
         if f.get("placeholder"):
             slim["placeholder"] = f["placeholder"]
         slim_fields.append(slim)
@@ -274,25 +612,48 @@ def map_fields_to_profile(
     personal_info = _load_personal_info()
     known_values = _build_known_values(personal_info)
 
+    # Cover letter instructions
+    if cover_letter_text:
+        cover_letter_instruction = f'- Cover letter / "anything else" fields: If REQUIRED, fill with the provided cover letter text. If optional, skip.\n  Cover letter text: "{cover_letter_text[:500]}"'
+    else:
+        cover_letter_instruction = '- Cover letter / additional information / "anything else": ALWAYS skip (action "skip") - leave blank'
+
+    # "How did you hear" preference
+    how_heard = personal_info.get("how_did_you_hear", "LinkedIn")
+
     prompt = f"""You are a form-filling assistant. Given form fields and a candidate profile, return a JSON array mapping each field to its value.
+
+CRITICAL RULE: You MUST fill EVERY field. Do NOT skip any field unless it is a cover letter/additional info field that is not required. If you are unsure how to answer a question, use your best judgment based on the candidate's profile, resume, and context. NEVER leave a required field empty.
 
 CANDIDATE PROFILE:
 {CANDIDATE_PROFILE}
 
-KNOWN VALUES (use exactly):
+KNOWN VALUES (use these exactly when the field matches):
 {known_values}
-- Additional information / cover letter / "anything else": ALWAYS skip (action "skip") - leave blank
+{cover_letter_instruction}
 
 {WRITING_STYLE}
 
-For open-ended text questions (why this company, why interested in role, etc.), write authentic answers connecting the candidate's experience to {company} and the {role} role. Keep under 150 words.
-IMPORTANT: Do NOT fill the "additional information" or "cover letter" or "anything else you want to share" field. Skip it.
-IMPORTANT: For any referral question, ALWAYS answer "No" - the candidate was NOT referred by an employee.
-
-For dropdowns, pick the best matching option from the available choices.
-For radio buttons, return the selector of the correct option to click.
-For file inputs (resume/CV), use action "upload_file" with value "resume".
-For file inputs asking for transcript, use action "upload_file" with value "transcript".
+FIELD-SPECIFIC RULES:
+- Phone country / country code dropdowns: select "United States" or "US (+1)" or the closest match
+- Graduation year / "what year will you graduate": "2028"
+- Internship or co-op experience: "No" or "0" (candidate has no prior internship/co-op experience)
+- Currently employed / previous employer: "No"
+- Years of experience: "0"
+- For any referral question: ALWAYS answer "No" - the candidate was NOT referred by an employee
+- For "how did you hear about us": "{how_heard}"
+- For open-ended text questions (why this company, why interested, tell us about yourself, etc.): write authentic answers connecting the candidate's experience to {company} and the {role} role. Keep under 150 words.
+- For 'How did you hear about us' or similar: ALWAYS answer 'Job Board' or select the closest option like 'Job Board', 'Online', 'Internet', or 'Other'.
+- For 'Have you previously worked/applied here': ALWAYS answer 'No'.
+- For 'Country': ALWAYS answer 'United States' or select 'US' / 'USA' / 'United States'.
+- For EEO/demographic questions (gender, race, veteran, disability): use the values from KNOWN VALUES or select 'Prefer not to say' / 'I do not wish to answer' if available.
+- For referral questions: ALWAYS answer 'No'.
+- For dropdowns (including custom dropdowns): use action "select" with the EXACT text of the option you want. Use common phrasing (e.g. 'United States' not 'US', 'No' not 'N/A').
+- For radio buttons: return the selector of the correct option to click.
+- For file inputs (resume/CV): use action "upload_file" with value "resume".
+- For file inputs asking for transcript: use action "upload_file" with value "transcript".
+- For any question you don't have information for: select 'Prefer not to say' or skip rather than making something up.
+- For any question you don't have an exact answer for: use context from the candidate profile and job description to give a reasonable answer. Do NOT skip it.
 
 Company: {company}
 Role: {role}
@@ -306,11 +667,11 @@ Return ONLY a JSON array. Each element must have exactly these keys:
 - "action": one of "fill", "select", "click", "upload_file", "skip"
 - "value": the value to fill/select, or file path for upload_file, or empty string for skip
 
-Do NOT include any explanation, only the JSON array."""
+REMEMBER: Fill EVERY field. Only use "skip" for optional cover letter / additional info fields. Do NOT include any explanation, only the JSON array."""
 
     response = client.chat.completions.create(
-        model="qwen-3-235b-a22b-instruct-2507",
-        max_tokens=4000,
+        model="gemini-2.5-flash",
+        max_tokens=8000,
         messages=[
             {"role": "system", "content": "You return only valid JSON arrays. No markdown, no explanation."},
             {"role": "user", "content": prompt},
@@ -390,8 +751,347 @@ def _load_credentials() -> dict:
     return {}
 
 
-async def _handle_workday_apply(page, resume_path, event_callback=None, screenshot_callback=None) -> dict:
-    """Handle the full Workday multi-step application flow."""
+def _generate_cover_letter(company: str, role: str, job_description: str) -> str:
+    """Generate a short cover letter via LLM when the portal requires one."""
+    client = _get_llm_client()
+    personal_info = _load_personal_info()
+
+    prompt = f"""Write a brief, authentic cover letter (under 200 words) for this job application.
+
+CANDIDATE PROFILE:
+{CANDIDATE_PROFILE}
+
+{WRITING_STYLE}
+
+Company: {company}
+Role: {role}
+Job Description: {job_description[:1500]}
+
+Write the cover letter. Do NOT use "Dear Hiring Manager" or other generic openers. Start with something specific about the company. Output ONLY the letter text."""
+
+    response = client.chat.completions.create(
+        model="gemini-2.5-flash",
+        max_tokens=1000,
+        messages=[
+            {"role": "system", "content": "You write concise, authentic cover letters. No markdown, no explanation."},
+            {"role": "user", "content": prompt},
+        ],
+    )
+    raw = response.choices[0].message.content
+    # Strip think tags
+    raw = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL)
+    return raw.strip()
+
+
+async def _handle_ats_auth(page, ats_key: str, event_callback=None) -> bool:
+    """Handle sign-in or account creation for ATS portals that require accounts.
+
+    Supports: iCIMS, Taleo, SuccessFactors.
+    Workday has its own handler (_handle_workday_auth).
+    """
+    creds = _load_credentials().get(ats_key, {})
+    email = creds.get("email", "")
+    password = creds.get("password", "")
+    if not email or not password:
+        if event_callback:
+            await event_callback("Navigate", "error", f"No {ats_key} credentials in credentials.yaml")
+        return False
+
+    personal = _load_personal_info()
+    first_name = personal.get("first_name", "")
+    last_name = personal.get("last_name", "")
+
+    if ats_key == "icims":
+        return await _handle_icims_auth(page, email, password, first_name, last_name, event_callback)
+    elif ats_key == "taleo":
+        return await _handle_taleo_auth(page, email, password, first_name, last_name, event_callback)
+    elif ats_key == "successfactors":
+        return await _handle_successfactors_auth(page, email, password, first_name, last_name, event_callback)
+
+    return True  # No auth needed for other portals
+
+
+async def _handle_icims_auth(page, email, password, first_name, last_name, event_callback=None) -> bool:
+    """Handle iCIMS sign-in or account creation. iCIMS forms are in iframes."""
+    if event_callback:
+        await event_callback("Navigate", "info", "iCIMS: Looking for login/create account...")
+
+    # iCIMS application is often in an iframe
+    target = page
+    for frame in page.frames:
+        if frame == page.main_frame:
+            continue
+        try:
+            has_inputs = await frame.evaluate("document.querySelectorAll('input').length")
+            if has_inputs > 2:
+                target = frame
+                break
+        except Exception:
+            continue
+
+    # Try to find sign-in form
+    try:
+        # Look for email/username field
+        email_field = target.locator('input[type="email"], input[name*="email"], input[name*="user"], input[id*="email"], input[id*="user"]')
+        if await email_field.first.is_visible(timeout=3000):
+            await email_field.first.fill(email)
+
+            pw_field = target.locator('input[type="password"]')
+            if await pw_field.first.is_visible(timeout=2000):
+                await pw_field.first.fill(password)
+
+            # Submit
+            submit = target.locator('button[type="submit"], input[type="submit"], .iCIMS_PrimaryButton')
+            if await submit.first.is_visible(timeout=2000):
+                await submit.first.click()
+                await page.wait_for_timeout(5000)
+
+            # Check if we landed on the form
+            inputs = await target.evaluate("document.querySelectorAll('input, textarea, select').length")
+            if inputs > 5:
+                if event_callback:
+                    await event_callback("Navigate", "success", "iCIMS: Signed in")
+                return True
+
+            # Sign-in failed, try creating account
+            if event_callback:
+                await event_callback("Navigate", "info", "iCIMS: Sign-in failed, creating account...")
+    except Exception:
+        pass
+
+    # Try creating account
+    try:
+        create_link = target.locator('a:has-text("Create"), a:has-text("Register"), a:has-text("Sign Up"), button:has-text("Create")')
+        if await create_link.first.is_visible(timeout=3000):
+            await create_link.first.click()
+            await page.wait_for_timeout(3000)
+
+        # Fill account creation fields
+        for selector, value in [
+            ('input[name*="first" i], input[id*="first" i]', first_name),
+            ('input[name*="last" i], input[id*="last" i]', last_name),
+            ('input[type="email"], input[name*="email" i]', email),
+            ('input[type="password"]', password),
+        ]:
+            try:
+                field = target.locator(selector)
+                if await field.first.is_visible(timeout=2000):
+                    await field.first.fill(value)
+            except Exception:
+                continue
+
+        # Confirm password if present
+        try:
+            confirm = target.locator('input[name*="confirm" i], input[name*="verify" i], input[id*="confirm" i]')
+            if await confirm.first.is_visible(timeout=2000):
+                await confirm.first.fill(password)
+        except Exception:
+            pass
+
+        # Submit
+        submit = target.locator('button[type="submit"], input[type="submit"], .iCIMS_PrimaryButton')
+        if await submit.first.is_visible(timeout=2000):
+            await submit.first.click()
+            await page.wait_for_timeout(5000)
+
+        if event_callback:
+            await event_callback("Navigate", "success", "iCIMS: Account created")
+        return True
+    except Exception as e:
+        if event_callback:
+            await event_callback("Navigate", "error", f"iCIMS auth failed: {e}")
+        return False
+
+
+async def _handle_taleo_auth(page, email, password, first_name, last_name, event_callback=None) -> bool:
+    """Handle Taleo sign-in or account creation."""
+    if event_callback:
+        await event_callback("Navigate", "info", "Taleo: Looking for login page...")
+
+    try:
+        # Taleo uses #ftlform with email/password fields
+        email_field = page.locator('input[type="email"], input[name*="email" i], input[id*="email" i], input[name*="user" i]')
+        if await email_field.first.is_visible(timeout=3000):
+            await email_field.first.fill(email)
+
+            pw_field = page.locator('input[type="password"]')
+            if await pw_field.first.is_visible(timeout=2000):
+                await pw_field.first.fill(password)
+
+            submit = page.locator('button[type="submit"], input[type="submit"], a:has-text("Sign In"), button:has-text("Sign In"), button:has-text("Log In")')
+            if await submit.first.is_visible(timeout=2000):
+                await submit.first.click()
+                await page.wait_for_timeout(5000)
+
+            # Check if signed in
+            still_login = await page.locator('input[type="password"]').first.is_visible(timeout=2000)
+            if not still_login:
+                if event_callback:
+                    await event_callback("Navigate", "success", "Taleo: Signed in")
+                return True
+
+            if event_callback:
+                await event_callback("Navigate", "info", "Taleo: Sign-in failed, creating account...")
+    except Exception:
+        pass
+
+    # Create account
+    try:
+        create_link = page.locator('a:has-text("New User"), a:has-text("Create"), a:has-text("Register")')
+        if await create_link.first.is_visible(timeout=3000):
+            await create_link.first.click()
+            await page.wait_for_timeout(3000)
+
+        for selector, value in [
+            ('input[name*="first" i], input[id*="first" i]', first_name),
+            ('input[name*="last" i], input[id*="last" i]', last_name),
+            ('input[type="email"], input[name*="email" i]', email),
+            ('input[type="password"]', password),
+        ]:
+            try:
+                field = page.locator(selector)
+                if await field.first.is_visible(timeout=2000):
+                    await field.first.fill(value)
+            except Exception:
+                continue
+
+        # Confirm password
+        try:
+            confirm = page.locator('input[name*="confirm" i], input[name*="verify" i]')
+            if await confirm.first.is_visible(timeout=2000):
+                await confirm.first.fill(password)
+        except Exception:
+            pass
+
+        submit = page.locator('button[type="submit"], input[type="submit"]')
+        if await submit.first.is_visible(timeout=2000):
+            await submit.first.click()
+            await page.wait_for_timeout(5000)
+
+        if event_callback:
+            await event_callback("Navigate", "success", "Taleo: Account created")
+        return True
+    except Exception as e:
+        if event_callback:
+            await event_callback("Navigate", "error", f"Taleo auth failed: {e}")
+        return False
+
+
+async def _handle_successfactors_auth(page, email, password, first_name, last_name, event_callback=None) -> bool:
+    """Handle SuccessFactors sign-in or account creation (Talent Community)."""
+    if event_callback:
+        await event_callback("Navigate", "info", "SuccessFactors: Looking for login...")
+
+    try:
+        email_field = page.locator('input[type="email"], input[name*="email" i], input[id*="email" i]')
+        if await email_field.first.is_visible(timeout=3000):
+            await email_field.first.fill(email)
+
+            pw_field = page.locator('input[type="password"]')
+            if await pw_field.first.is_visible(timeout=2000):
+                await pw_field.first.fill(password)
+
+            submit = page.locator('button[type="submit"], input[type="submit"], button:has-text("Sign In"), button:has-text("Log In")')
+            if await submit.first.is_visible(timeout=2000):
+                await submit.first.click()
+                await page.wait_for_timeout(5000)
+
+            still_login = await page.locator('input[type="password"]').first.is_visible(timeout=2000)
+            if not still_login:
+                if event_callback:
+                    await event_callback("Navigate", "success", "SuccessFactors: Signed in")
+                return True
+
+            if event_callback:
+                await event_callback("Navigate", "info", "SuccessFactors: Creating account (joining Talent Community)...")
+    except Exception:
+        pass
+
+    # Create account / join Talent Community
+    try:
+        create_link = page.locator('a:has-text("Create"), a:has-text("Register"), a:has-text("Join"), button:has-text("Create")')
+        if await create_link.first.is_visible(timeout=3000):
+            await create_link.first.click()
+            await page.wait_for_timeout(3000)
+
+        for selector, value in [
+            ('input[name*="first" i], input[id*="first" i]', first_name),
+            ('input[name*="last" i], input[id*="last" i]', last_name),
+            ('input[type="email"], input[name*="email" i]', email),
+            ('input[type="password"]', password),
+        ]:
+            try:
+                field = page.locator(selector)
+                if await field.first.is_visible(timeout=2000):
+                    await field.first.fill(value)
+            except Exception:
+                continue
+
+        # Confirm password
+        try:
+            confirm = page.locator('input[name*="confirm" i], input[name*="verify" i]')
+            if await confirm.first.is_visible(timeout=2000):
+                await confirm.first.fill(password)
+        except Exception:
+            pass
+
+        # Accept data privacy consent if present
+        try:
+            consent = page.locator('input[type="checkbox"][name*="consent" i], input[type="checkbox"][name*="privacy" i], input[type="checkbox"][name*="agree" i]')
+            if await consent.first.is_visible(timeout=2000):
+                await consent.first.check()
+        except Exception:
+            pass
+
+        submit = page.locator('button[type="submit"], input[type="submit"]')
+        if await submit.first.is_visible(timeout=2000):
+            await submit.first.click()
+            await page.wait_for_timeout(5000)
+
+        # Handle email verification if required
+        page_text = await page.evaluate("document.body.innerText")
+        if "verify" in page_text.lower() and "email" in page_text.lower():
+            verified = await complete_email_verification(
+                page, sender_filter="successfactors", event_callback=event_callback
+            )
+            if verified:
+                await page.wait_for_timeout(3000)
+                await page.reload(wait_until="domcontentloaded")
+                await page.wait_for_timeout(5000)
+            else:
+                if event_callback:
+                    await event_callback("Navigate", "warning",
+                        "Auto-verify failed. Please verify your email manually.")
+                for _ in range(90):
+                    await page.wait_for_timeout(1000)
+                    try:
+                        page_text = await page.evaluate("document.body.innerText")
+                        if "verify" not in page_text.lower():
+                            break
+                    except Exception:
+                        pass
+
+        if event_callback:
+            await event_callback("Navigate", "success", "SuccessFactors: Account created")
+        return True
+    except Exception as e:
+        if event_callback:
+            await event_callback("Navigate", "error", f"SuccessFactors auth failed: {e}")
+        return False
+
+
+async def _handle_workday_apply(page, resume_path, event_callback=None, screenshot_callback=None, job_url=None) -> dict:
+    """Handle the full Workday multi-step application flow.
+
+    Correct Workday flow:
+    1. Click Apply on job page
+    2. Click "Apply Manually"
+    3. Create Account / Sign In page appears
+    4. Fill create account form, submit
+    5. Sign in with same credentials
+    6. If email verification needed, verify then sign in again
+    7. Fill the multi-step application form
+    """
     creds = _load_credentials().get("workday", {})
     email = creds.get("email", "")
     password = creds.get("password", "")
@@ -410,104 +1110,328 @@ async def _handle_workday_apply(page, resume_path, event_callback=None, screensh
     except Exception:
         pass
 
-    # Step 1: Sign in
+    # Step 1: Click Apply button on job page
     if event_callback:
-        await event_callback("Navigate", "info", "Workday: Signing in...")
+        await event_callback("Navigate", "info", "Workday: Clicking Apply...")
 
     try:
-        sign_in = page.locator('[data-automation-id="utilityButtonSignIn"]')
-        if await sign_in.is_visible(timeout=3000):
-            await sign_in.click()
-            await page.wait_for_timeout(3000)
-            await page.fill('[data-automation-id="email"]', email)
-            await page.fill('[data-automation-id="password"]', password)
-            await page.evaluate("""document.querySelector('[data-automation-id="click_filter"]').click()""")
+        apply_btn = page.locator('[data-automation-id="adventureButton"], a:has-text("Apply"), button:has-text("Apply")')
+        if await apply_btn.first.is_visible(timeout=5000):
+            await apply_btn.first.click()
             await page.wait_for_timeout(5000)
-
-            # Check if we need to create account
-            sign_in_still = False
-            try:
-                sign_in_still = await page.locator('[data-automation-id="signInSubmitButton"]').is_visible(timeout=2000)
-            except Exception:
-                pass
-
-            if sign_in_still:
-                if event_callback:
-                    await event_callback("Navigate", "info", "Creating new Workday account...")
-                await page.click('[data-automation-id="createAccountLink"]')
-                await page.wait_for_timeout(3000)
-                await page.fill('[data-automation-id="email"]', email)
-                await page.fill('[data-automation-id="password"]', password)
-                await page.fill('[data-automation-id="verifyPassword"]', password)
-                await page.evaluate("""() => {
-                    const els = document.querySelectorAll('[data-automation-id="click_filter"]');
-                    for (let i = els.length - 1; i >= 0; i--) {
-                        if (els[i].offsetParent !== null) { els[i].click(); return; }
-                    }
-                }""")
-                await page.wait_for_timeout(8000)
-
             if event_callback:
-                await event_callback("Navigate", "success", "Workday: Signed in")
-    except Exception as e:
-        if event_callback:
-            await event_callback("Navigate", "error", f"Workday sign-in failed: {e}")
-        return {"filled": 0, "failed": 1, "skipped": 0, "errors": [str(e)]}
+                await event_callback("Navigate", "info", "Workday: Clicked Apply")
+    except Exception:
+        pass
 
     if screenshot_callback:
         ss = await _take_screenshot(page)
         if ss:
             await screenshot_callback(ss)
 
-    # Step 2: Navigate to apply page if not already there
-    if "/apply" not in page.url:
-        # Try clicking Apply button on job page
+    # Step 2: Click "Apply Manually"
+    if event_callback:
+        await event_callback("Navigate", "info", "Workday: Clicking Apply Manually...")
+
+    try:
+        manual = page.locator('[data-automation-id="applyManually"]')
+        if await manual.is_visible(timeout=5000):
+            await manual.click()
+            await page.wait_for_timeout(5000)
+            if event_callback:
+                await event_callback("Navigate", "info", "Workday: Clicked Apply Manually")
+    except Exception:
+        pass
+
+    if screenshot_callback:
+        ss = await _take_screenshot(page)
+        if ss:
+            await screenshot_callback(ss)
+
+    # Step 3: We should now be on the Create Account / Sign In page
+    # Try signing in first (in case account already exists)
+    if event_callback:
+        await event_callback("Navigate", "info", "Workday: On auth page, trying sign in first...")
+
+    signed_in = False
+
+    # Check if email field is visible (we're on an auth page)
+    email_field = page.locator('[data-automation-id="email"]')
+    if await email_field.is_visible(timeout=5000):
+        # Try sign in first
+        await email_field.fill(email)
+        pw_field = page.locator('[data-automation-id="password"]')
+        if await pw_field.is_visible(timeout=3000):
+            await pw_field.fill(password)
+
+        # Look for Sign In button and click it
         try:
-            apply = page.locator('[data-automation-id="adventureButton"], a:has-text("Apply")')
-            if await apply.first.is_visible(timeout=3000):
-                href = await apply.first.get_attribute("href")
-                if href:
-                    await page.goto(href if href.startswith("http") else page.url.split("/job/")[0] + href,
-                                    wait_until="domcontentloaded", timeout=30000)
-                else:
-                    await apply.first.click()
-                await page.wait_for_timeout(5000)
+            await page.evaluate("""() => {
+                const btn = document.querySelector('[data-automation-id="signInSubmitButton"]');
+                if (btn) btn.click();
+            }""")
+            await page.wait_for_timeout(5000)
         except Exception:
             pass
 
-    # Step 3: Choose "Autofill with Resume" if available
-    try:
-        autofill = page.locator('[data-automation-id="autofillWithResume"]')
-        if await autofill.is_visible(timeout=3000):
-            await autofill.click()
-            await page.wait_for_timeout(3000)
+        # Check if sign-in succeeded
+        error_visible = False
+        try:
+            error_visible = await page.locator(
+                '[data-automation-id="errorMessage"], [data-automation-id="formErrorBanner"]'
+            ).first.is_visible(timeout=2000)
+        except Exception:
+            pass
 
-            # Upload resume
-            file_input = page.locator('input[type="file"]')
-            await file_input.set_input_files(resume_path, timeout=10000)
-            await page.wait_for_timeout(5000)  # Wait for Workday to process
-            filled_total += 1
+        still_on_auth = await page.locator('[data-automation-id="signInSubmitButton"]').is_visible(timeout=2000)
+
+        if not still_on_auth and not error_visible:
+            signed_in = True
+            if event_callback:
+                await event_callback("Navigate", "success", "Workday: Signed in (existing account)")
+        else:
+            if event_callback:
+                await event_callback("Navigate", "info", "Sign-in failed, creating account...")
+
+    # Step 4: Create account if sign-in failed
+    if not signed_in:
+        # Click Create Account link/tab
+        try:
+            create_link = page.locator(
+                '[data-automation-id="createAccountLink"], '
+                'a:has-text("Create Account"), '
+                'button:has-text("Create Account"), '
+                'a:has-text("create account"), '
+                'a:has-text("Create an Account")'
+            )
+            if await create_link.first.is_visible(timeout=5000):
+                await create_link.first.click()
+                await page.wait_for_timeout(3000)
+                if event_callback:
+                    await event_callback("Navigate", "info", "Workday: On Create Account form")
+            else:
+                if event_callback:
+                    await event_callback("Navigate", "info", "No Create Account link found, may already be on create form")
+        except Exception:
+            pass
+
+        # Fill create account form
+        try:
+            email_field = page.locator('[data-automation-id="email"]')
+            if await email_field.is_visible(timeout=5000):
+                await email_field.fill(email)
+
+            pw_field = page.locator('[data-automation-id="password"]')
+            if await pw_field.is_visible(timeout=3000):
+                await pw_field.fill(password)
+
+            # Verify password
+            verify_pw = page.locator('[data-automation-id="verifyPassword"]')
+            try:
+                if await verify_pw.is_visible(timeout=3000):
+                    await verify_pw.fill(password)
+            except Exception:
+                pass
+
+            # Accept terms checkbox
+            try:
+                checkbox = page.locator(
+                    '[data-automation-id="createAccountCheckbox"], '
+                    '[data-automation-id="agreeToTermsCheckbox"], '
+                    'input[type="checkbox"]'
+                )
+                if await checkbox.first.is_visible(timeout=2000):
+                    await checkbox.first.check()
+            except Exception:
+                pass
 
             if event_callback:
-                await event_callback("Fill Form", "info", "Workday: Resume uploaded and parsed")
+                await event_callback("Navigate", "info", "Workday: Submitting Create Account...")
+
+            # Click Create Account submit
+            await page.evaluate("""() => {
+                const btn = document.querySelector('[data-automation-id="createAccountSubmitButton"]')
+                    || document.querySelector('button[data-automation-id*="create"]')
+                    || document.querySelector('button[type="submit"]');
+                if (btn) btn.click();
+            }""")
+            await page.wait_for_timeout(8000)
 
             if screenshot_callback:
                 ss = await _take_screenshot(page)
                 if ss:
                     await screenshot_callback(ss)
 
-            # Click Continue
-            await page.evaluate("""document.querySelector('[data-automation-id="pageFooterNextButton"]').click()""")
-            await page.wait_for_timeout(5000)
-    except Exception as e:
-        # Try "Apply Manually" instead
+            if event_callback:
+                await event_callback("Navigate", "info", "Account created, now signing in...")
+
+        except Exception as e:
+            if event_callback:
+                await event_callback("Navigate", "error", f"Create account failed: {e}")
+            return {"filled": 0, "failed": 1, "skipped": 0, "errors": [str(e)]}
+
+        # Step 5: After account creation, sign in with same credentials
         try:
-            manual = page.locator('[data-automation-id="applyManually"]')
-            if await manual.is_visible(timeout=2000):
-                await manual.click()
-                await page.wait_for_timeout(5000)
+            email_field = page.locator('[data-automation-id="email"]')
+            if await email_field.is_visible(timeout=5000):
+                await email_field.fill(email)
+
+            pw_field = page.locator('[data-automation-id="password"]')
+            if await pw_field.is_visible(timeout=3000):
+                await pw_field.fill(password)
+
+            await page.evaluate("""() => {
+                const btn = document.querySelector('[data-automation-id="signInSubmitButton"]');
+                if (btn) btn.click();
+            }""")
+            await page.wait_for_timeout(5000)
         except Exception:
             pass
+
+        if screenshot_callback:
+            ss = await _take_screenshot(page)
+            if ss:
+                await screenshot_callback(ss)
+
+        # Step 6: Check for email verification
+        try:
+            page_text = await page.evaluate("document.body.innerText")
+            if "verify" in page_text.lower() and "email" in page_text.lower():
+                if event_callback:
+                    await event_callback("Navigate", "info",
+                        "Email verification required. Please check your email and verify. Waiting up to 2 minutes...")
+
+                verified = await complete_email_verification(
+                    page, sender_filter="workday", event_callback=event_callback
+                )
+                if verified:
+                    await page.wait_for_timeout(3000)
+                else:
+                    if event_callback:
+                        await event_callback("Navigate", "warning",
+                            "Auto-verify failed. Please verify manually in your email, then come back here.")
+                    # Wait for manual verification
+                    for _ in range(120):
+                        await page.wait_for_timeout(1000)
+                        try:
+                            page_text = await page.evaluate("document.body.innerText")
+                            if "verify" not in page_text.lower():
+                                break
+                        except Exception:
+                            pass
+
+                # After verification, click Sign In again on the SAME tab
+                if event_callback:
+                    await event_callback("Navigate", "info", "Verification done, signing in again...")
+
+                # May need to reload or the page may have updated
+                try:
+                    email_field = page.locator('[data-automation-id="email"]')
+                    if await email_field.is_visible(timeout=5000):
+                        await email_field.fill(email)
+                    pw_field = page.locator('[data-automation-id="password"]')
+                    if await pw_field.is_visible(timeout=3000):
+                        await pw_field.fill(password)
+                    await page.evaluate("""() => {
+                        const btn = document.querySelector('[data-automation-id="signInSubmitButton"]');
+                        if (btn) btn.click();
+                    }""")
+                    await page.wait_for_timeout(5000)
+                except Exception:
+                    pass
+
+                # Also try clicking any Sign In button/link that might be visible
+                try:
+                    sign_in = page.locator('button:has-text("Sign In"), a:has-text("Sign In"), [data-automation-id="utilityButtonSignIn"]')
+                    if await sign_in.first.is_visible(timeout=3000):
+                        await sign_in.first.click()
+                        await page.wait_for_timeout(5000)
+                        # Fill credentials again if we're on a sign-in form
+                        email_field = page.locator('[data-automation-id="email"]')
+                        if await email_field.is_visible(timeout=3000):
+                            await email_field.fill(email)
+                            pw_field = page.locator('[data-automation-id="password"]')
+                            if await pw_field.is_visible(timeout=2000):
+                                await pw_field.fill(password)
+                            await page.evaluate("""() => {
+                                const btn = document.querySelector('[data-automation-id="signInSubmitButton"]');
+                                if (btn) btn.click();
+                            }""")
+                            await page.wait_for_timeout(5000)
+                except Exception:
+                    pass
+
+        except Exception:
+            pass
+
+        if event_callback:
+            await event_callback("Navigate", "success", "Workday: Signed in")
+
+    if screenshot_callback:
+        ss = await _take_screenshot(page)
+        if ss:
+            await screenshot_callback(ss)
+
+    # Step 7: We should now be on the application form (or need to re-navigate)
+    # Check if we're on a form page or need to go back to the job
+    try:
+        has_form_fields = await page.evaluate("document.querySelectorAll('input:not([type=hidden]), textarea, select').length")
+        if has_form_fields < 3:
+            # Not on a form yet - might need to re-navigate to the job and click Apply again
+            if event_callback:
+                await event_callback("Navigate", "info", "Workday: Re-navigating to job to start application...")
+
+            # Navigate back to the original job URL
+            if job_url:
+                await page.goto(job_url, wait_until="domcontentloaded", timeout=30000)
+                await page.wait_for_timeout(5000)
+                # Accept cookies again
+                try:
+                    btn = page.locator('[data-automation-id="legalNoticeAcceptButton"]')
+                    if await btn.is_visible(timeout=2000):
+                        await btn.click()
+                        await page.wait_for_timeout(1000)
+                except Exception:
+                    pass
+                # Click Apply again
+                apply_btn = page.locator('[data-automation-id="adventureButton"], a:has-text("Apply")')
+                if await apply_btn.first.is_visible(timeout=5000):
+                    await apply_btn.first.click()
+                    await page.wait_for_timeout(5000)
+            else:
+                await page.go_back()
+                await page.wait_for_timeout(3000)
+
+            # Choose apply method again if prompted
+            try:
+                manual = page.locator('[data-automation-id="applyManually"]')
+                if await manual.is_visible(timeout=3000):
+                    await manual.click()
+                    await page.wait_for_timeout(5000)
+            except Exception:
+                pass
+            try:
+                autofill = page.locator('[data-automation-id="autofillWithResume"]')
+                if await autofill.is_visible(timeout=3000):
+                    await autofill.click()
+                    await page.wait_for_timeout(3000)
+                    # Upload resume
+                    try:
+                        file_input = page.locator('input[type="file"]')
+                        await file_input.set_input_files(resume_path, timeout=10000)
+                        await page.wait_for_timeout(5000)
+                        filled_total += 1
+                        try:
+                            await page.evaluate("""document.querySelector('[data-automation-id="pageFooterNextButton"]').click()""")
+                            await page.wait_for_timeout(5000)
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+    except Exception:
+        pass
 
     # Step 4: Process each page of the multi-step form
     max_pages = 10
@@ -558,6 +1482,7 @@ async def _handle_workday_apply(page, resume_path, event_callback=None, screensh
                     type: type,
                     dataid: el.getAttribute('data-automation-id') || '',
                     label: '',
+                    required: el.required || el.getAttribute('aria-required') === 'true',
                     value: el.value || '',
                     name: el.name || '',
                     placeholder: el.placeholder || ''
@@ -575,6 +1500,7 @@ async def _handle_workday_apply(page, resume_path, event_callback=None, screensh
                         type: 'workday-field',
                         dataid: dataid,
                         label: labelText,
+                        required: true,
                         value: '',
                         name: '',
                         placeholder: ''
@@ -606,15 +1532,16 @@ async def _handle_workday_apply(page, resume_path, event_callback=None, screensh
                             except Exception:
                                 await page.evaluate(f"""() => {{
                                     const el = document.querySelector('{selector}');
-                                    if (el) {{ el.value = '{value.replace(chr(39), "")}'; el.dispatchEvent(new Event('input', {{bubbles:true}})); }}
+                                    if (el) {{ el.value = '{value.replace(chr(39), "")}'; el.dispatchEvent(new Event('input', {{bubbles:true}})); el.dispatchEvent(new Event('change', {{bubbles:true}})); }}
                                 }}""")
                             filled_total += 1
                         elif action == "select":
-                            try:
-                                await page.select_option(selector, label=value, timeout=3000)
-                            except Exception:
-                                await page.select_option(selector, value=value, timeout=3000)
-                            filled_total += 1
+                            success = await _handle_custom_dropdown(page, selector, value, event_callback)
+                            if success:
+                                filled_total += 1
+                            else:
+                                failed_total += 1
+                                errors.append(f"Dropdown {selector}: could not select '{value}'")
                         elif action == "click":
                             try:
                                 await page.click(selector, timeout=3000)
@@ -654,7 +1581,22 @@ async def _handle_workday_apply(page, resume_path, event_callback=None, screensh
 
 
 async def _handle_workday_auth(page, event_callback=None) -> bool:
-    """Handle Workday sign-in or account creation. Returns True if auth succeeded."""
+    """Handle Workday sign-in or account creation. Returns True if auth succeeded.
+
+    Real Workday DOM patterns (confirmed via live testing):
+    - Apply: a[data-uxi-element-id="Apply_adventureButton"] or a[data-automation-id="adventureButton"]
+    - Apply Manually: a[data-automation-id="applyManually"]
+    - Sign In nav: button[data-automation-id="utilityButtonSignIn"]
+    - Sign In submit: div[data-automation-id="click_filter"][aria-label="Sign In"] OR button:has-text("Sign In")
+    - Create Account link: button[data-automation-id="createAccountLink"]
+    - Create Account submit: button[data-automation-id="createAccountSubmitButton"] AND div[data-automation-id="click_filter"][aria-label="Create Account"]
+    - Sign In link (from create account popup): button[data-automation-id="signInLink"]
+    - Email: input[data-automation-id="email"]
+    - Password: input[data-automation-id="password"]
+    - Verify Password: input[data-automation-id="verifyPassword"]
+    - Form fields appear in: div[data-automation-id="applyFlowPage"]
+    - Auth popup: div[data-automation-id="popUpDialog"]
+    """
     creds = _load_credentials().get("workday", {})
     email = creds.get("email", "")
     password = creds.get("password", "")
@@ -663,92 +1605,352 @@ async def _handle_workday_auth(page, event_callback=None) -> bool:
             await event_callback("Navigate", "error", "No Workday credentials in credentials.yaml")
         return False
 
-    # Click Sign In button
+    async def _log(msg):
+        if event_callback:
+            await event_callback("Navigate", "info", f"Workday: {msg}")
+
+    async def _log_ok(msg):
+        if event_callback:
+            await event_callback("Navigate", "success", f"Workday: {msg}")
+
+    # --- Dismiss Google SSO overlays ---
     try:
-        sign_in_btn = page.locator('[data-automation-id="utilityButtonSignIn"]')
-        if await sign_in_btn.is_visible(timeout=3000):
-            await sign_in_btn.click()
-            await page.wait_for_timeout(3000)
+        await page.evaluate("""() => {
+            document.querySelectorAll('iframe[src*="accounts.google.com"]').forEach(el => el.remove());
+            document.querySelectorAll('#credential_picker_container, #credential_picker_iframe').forEach(el => el.remove());
+        }""")
     except Exception:
-        return False
+        pass
 
-    # Try to sign in first
-    try:
-        email_input = page.locator('[data-automation-id="email"]')
-        if await email_input.is_visible(timeout=3000):
-            await email_input.fill(email)
-            await page.locator('[data-automation-id="password"]').fill(password)
-            # Workday uses click_filter divs that overlay buttons - use JS click
-            await page.evaluate('document.querySelector(\'[data-automation-id="signInSubmitButton"]\').click()')
-            await page.wait_for_timeout(5000)
+    # --- Check if already on application form (no auth needed) ---
+    async def _is_on_form() -> bool:
+        try:
+            return await page.evaluate("""() => {
+                // Look for Workday application form markers
+                const hasApplyFlow = document.querySelector('[data-automation-id="applyFlowPage"]') !== null;
+                const hasNextBtn = document.querySelector('[data-automation-id="pageFooterNextButton"]') !== null;
+                const hasFormField = document.querySelector('input[name="legalName--firstName"]') !== null
+                    || document.querySelector('[data-automation-id="formField-legalName--firstName"]') !== null
+                    || document.querySelector('[data-automation-id="file-upload-drop-zone"]') !== null;
+                // Make sure we're NOT looking at a sign-in popup overlay
+                const hasAuthPopup = document.querySelector('[data-automation-id="popUpDialog"] [data-automation-id="signInContent"]') !== null;
+                return (hasApplyFlow || hasNextBtn || hasFormField) && !hasAuthPopup;
+            }""")
+        except Exception:
+            return False
 
-            if event_callback:
-                await event_callback("Navigate", "info", "Attempted Workday sign-in...")
+    if await _is_on_form():
+        await _log_ok("Already on application form, no auth needed!")
+        return True
 
-            # Check if sign-in succeeded (no error message visible)
-            error_visible = False
+    # --- Helper: try clicking with multiple methods ---
+    async def _multi_click(selectors, js_fallback=None, force=False, timeout=2000):
+        """Try Playwright selectors, then JS. Returns True if clicked."""
+        for sel in selectors:
             try:
-                error_el = page.locator('[data-automation-id="errorMessage"], .WJCC, [data-automation-id="formErrorBanner"]')
-                error_visible = await error_el.is_visible(timeout=2000)
+                loc = page.locator(sel).first
+                if await loc.is_visible(timeout=timeout):
+                    await loc.click(force=force, timeout=5000)
+                    return True
+            except Exception:
+                continue
+        if js_fallback:
+            try:
+                result = await page.evaluate(js_fallback)
+                if result:
+                    return True
             except Exception:
                 pass
-
-            if not error_visible:
-                # Check if we're past the sign-in page
-                sign_in_still = False
-                try:
-                    sign_in_still = await page.locator('[data-automation-id="signInSubmitButton"]').is_visible(timeout=2000)
-                except Exception:
-                    pass
-
-                if not sign_in_still:
-                    if event_callback:
-                        await event_callback("Navigate", "success", "Signed in to Workday")
-                    return True
-
-            # Sign-in failed, try creating account
-            if event_callback:
-                await event_callback("Navigate", "info", "Sign-in failed, creating new account...")
-
-            try:
-                await page.locator('[data-automation-id="createAccountLink"]').click()
-                await page.wait_for_timeout(3000)
-
-                # Fill create account form
-                await page.locator('[data-automation-id="email"]').fill(email)
-                await page.locator('[data-automation-id="password"]').fill(password)
-                await page.locator('[data-automation-id="verifyPassword"]').fill(password)
-                await page.evaluate('document.querySelector(\'[data-automation-id="createAccountSubmitButton"]\').click()')
-                await page.wait_for_timeout(8000)
-
-                if event_callback:
-                    await event_callback("Navigate", "info", "Created Workday account, waiting for form...")
-
-                # Check for verification requirement
-                page_text = await page.evaluate("document.body.innerText")
-                if "verify" in page_text.lower() and "email" in page_text.lower():
-                    if event_callback:
-                        await event_callback("Navigate", "info",
-                            "Email verification required. Check your email and verify, then the form will load.")
-                    # Wait up to 60s for user to verify email
-                    for _ in range(60):
-                        await page.wait_for_timeout(1000)
-                        try:
-                            inputs = await page.evaluate("document.querySelectorAll('input, textarea, select').length")
-                            if inputs > 5:
-                                break
-                        except Exception:
-                            pass
-
-                return True
-            except Exception as e:
-                if event_callback:
-                    await event_callback("Navigate", "error", f"Account creation failed: {e}")
-                return False
-    except Exception as e:
-        if event_callback:
-            await event_callback("Navigate", "error", f"Workday auth failed: {e}")
         return False
+
+    # --- Helper: fill credentials ---
+    async def _fill_creds():
+        for field_aid, value in [("email", email), ("password", password)]:
+            try:
+                loc = page.locator(f'input[data-automation-id="{field_aid}"]').first
+                if await loc.is_visible(timeout=3000):
+                    await loc.fill(value)
+                    continue
+            except Exception:
+                pass
+            # JS fallback with proper event dispatch
+            await page.evaluate(f"""() => {{
+                const el = document.querySelector('[data-automation-id="{field_aid}"]');
+                if (el) {{
+                    el.focus();
+                    el.value = {json.dumps(value)};
+                    el.dispatchEvent(new Event('input', {{bubbles: true}}));
+                    el.dispatchEvent(new Event('change', {{bubbles: true}}));
+                    el.dispatchEvent(new Event('blur', {{bubbles: true}}));
+                }}
+            }}""")
+
+    # --- Check: is Sign In nav button present? ---
+    # Some Workday sites show Sign In in the header, others don't require auth at all
+    needs_auth = False
+    try:
+        needs_auth = await page.locator('button[data-automation-id="utilityButtonSignIn"]').is_visible(timeout=2000)
+    except Exception:
+        pass
+
+    # Also check if a sign-in popup is already showing
+    has_auth_popup = False
+    try:
+        has_auth_popup = await page.locator('[data-automation-id="signInContent"]').is_visible(timeout=1000)
+    except Exception:
+        pass
+
+    if not needs_auth and not has_auth_popup:
+        # Might already be on the form or no auth required
+        if await _is_on_form():
+            await _log_ok("No auth required, already on form!")
+            return True
+        await _log("No sign-in button found, proceeding anyway")
+        return True
+
+    # --- Step 1: Click Sign In nav button (header) if not already in auth popup ---
+    if needs_auth and not has_auth_popup:
+        clicked = await _multi_click(
+            ['button[data-automation-id="utilityButtonSignIn"]'],
+            js_fallback="""() => {
+                const btn = document.querySelector('[data-automation-id="utilityButtonSignIn"]');
+                if (btn) { btn.click(); return true; }
+                return false;
+            }"""
+        )
+        if clicked:
+            await _log("Clicked Sign In nav button")
+            await page.wait_for_timeout(3000)
+        else:
+            await _log("Could not click Sign In nav")
+
+    # --- Step 2: Try signing in first (account may already exist) ---
+    # Wait for the sign-in popup/form to appear
+    try:
+        await page.locator('input[data-automation-id="email"]').wait_for(state="visible", timeout=5000)
+    except Exception:
+        await _log("Email field not visible after clicking Sign In")
+        if await _is_on_form():
+            await _log_ok("On form already!")
+            return True
+        return True
+
+    await _log("Sign-in form visible. Trying sign in...")
+    await _fill_creds()
+    await page.wait_for_timeout(500)
+
+    # Click Sign In submit - try all known patterns
+    sign_in_clicked = await _multi_click(
+        [
+            'div[data-automation-id="click_filter"][aria-label="Sign In"]',
+            'div[role="button"][aria-label="Sign In"]',
+            'button[data-automation-id="signInSubmitButton"]',
+            'button:has-text("Sign In")',
+        ],
+        js_fallback="""() => {
+            // Try click_filter with Sign In aria-label
+            let el = document.querySelector('[data-automation-id="click_filter"][aria-label="Sign In"]');
+            if (el && el.offsetParent !== null) { el.click(); return true; }
+            // Try any visible Sign In button
+            for (const btn of document.querySelectorAll('button, div[role="button"]')) {
+                if ((btn.innerText || '').trim() === 'Sign In' && btn.offsetParent !== null) {
+                    btn.click(); return true;
+                }
+            }
+            return false;
+        }""",
+        force=True,
+    )
+
+    if sign_in_clicked:
+        await _log("Clicked Sign In submit")
+        await page.wait_for_timeout(5000)
+        if await _is_on_form():
+            await _log_ok("Signed in successfully!")
+            return True
+
+    # --- Step 3: Sign-in failed. Try Create Account ---
+    await _log("Sign-in didn't work, trying Create Account...")
+
+    # Click "Create Account" link in the sign-in popup
+    create_clicked = await _multi_click(
+        [
+            'button[data-automation-id="createAccountLink"]',
+            '[data-automation-id="createAccountLink"]',
+            'button:has-text("Create Account")',
+            'a:has-text("Create Account")',
+        ],
+        js_fallback="""() => {
+            // Look for createAccountLink
+            let el = document.querySelector('[data-automation-id="createAccountLink"]');
+            if (el && el.offsetParent !== null) { el.click(); return true; }
+            // Text-based search
+            for (const btn of document.querySelectorAll('button, a, div[role="button"]')) {
+                const t = (btn.innerText || '').trim();
+                if ((t === 'Create Account' || t === 'Create an Account') && btn.offsetParent !== null) {
+                    btn.click(); return true;
+                }
+            }
+            return false;
+        }""",
+    )
+
+    if not create_clicked:
+        await _log("Could not find Create Account link")
+        return False
+
+    await _log("Clicked Create Account link")
+    await page.wait_for_timeout(3000)
+
+    # --- Step 4: Fill create account form ---
+    await _fill_creds()
+
+    # Verify password
+    try:
+        vp = page.locator('input[data-automation-id="verifyPassword"]').first
+        if await vp.is_visible(timeout=3000):
+            await vp.fill(password)
+    except Exception:
+        await page.evaluate(f"""() => {{
+            const el = document.querySelector('[data-automation-id="verifyPassword"]');
+            if (el) {{
+                el.focus();
+                el.value = {json.dumps(password)};
+                el.dispatchEvent(new Event('input', {{bubbles: true}}));
+                el.dispatchEvent(new Event('change', {{bubbles: true}}));
+            }}
+        }}""")
+
+    # Terms/privacy/consent checkboxes — use robust Workday handler
+    from applicator.workday_handler import check_workday_checkbox
+    await check_workday_checkbox(page, event_callback)
+
+    await page.wait_for_timeout(500)
+
+    # Submit create account — try BOTH button and click_filter
+    submit_clicked = await _multi_click(
+        [
+            'button[data-automation-id="createAccountSubmitButton"]',
+            'div[data-automation-id="click_filter"][aria-label="Create Account"]',
+            'div[role="button"][aria-label="Create Account"]',
+        ],
+        js_fallback="""() => {
+            // Try the createAccountSubmitButton first
+            let el = document.querySelector('[data-automation-id="createAccountSubmitButton"]');
+            if (el && el.offsetParent !== null) { el.click(); return true; }
+            // Try click_filter with Create Account
+            el = document.querySelector('[data-automation-id="click_filter"][aria-label="Create Account"]');
+            if (el && el.offsetParent !== null) { el.click(); return true; }
+            // Dispatch full mouse event sequence as last resort
+            for (const btn of document.querySelectorAll('button, div[role="button"]')) {
+                const t = (btn.innerText || '').trim();
+                if (t === 'Create Account' && btn.offsetParent !== null) {
+                    btn.dispatchEvent(new PointerEvent('pointerdown', {bubbles: true}));
+                    btn.dispatchEvent(new MouseEvent('mousedown', {bubbles: true}));
+                    btn.dispatchEvent(new PointerEvent('pointerup', {bubbles: true}));
+                    btn.dispatchEvent(new MouseEvent('mouseup', {bubbles: true}));
+                    btn.dispatchEvent(new MouseEvent('click', {bubbles: true}));
+                    return true;
+                }
+            }
+            return false;
+        }""",
+        force=True,
+    )
+
+    if submit_clicked:
+        await _log("Clicked Create Account submit")
+        await page.wait_for_timeout(8000)
+    else:
+        await _log("Could not click Create Account submit")
+        return False
+
+    # --- Check for "account already exists" ---
+    already_exists = await page.evaluate("""() => {
+        const t = document.body.innerText.toLowerCase();
+        return t.includes('already in use') || t.includes('already exists')
+            || t.includes('already have an account') || t.includes('sign into this account');
+    }""")
+
+    if already_exists:
+        await _log("Account already exists, switching to sign in...")
+        # Click signInLink button
+        await _multi_click(
+            [
+                'button[data-automation-id="signInLink"]',
+                'a:has-text("Sign In")',
+                'button:has-text("Sign In")',
+            ]
+        )
+        await page.wait_for_timeout(3000)
+        await _fill_creds()
+        await page.wait_for_timeout(500)
+        await _multi_click(
+            [
+                'div[data-automation-id="click_filter"][aria-label="Sign In"]',
+                'button[data-automation-id="signInSubmitButton"]',
+                'button:has-text("Sign In")',
+            ],
+            force=True,
+        )
+        await page.wait_for_timeout(5000)
+        if await _is_on_form():
+            await _log_ok("Signed in with existing account!")
+            return True
+
+    # --- Step 5: Email verification ---
+    try:
+        page_text = await page.evaluate("document.body.innerText")
+        if "verify" in page_text.lower() and "email" in page_text.lower():
+            await _log("Email verification required...")
+            verified = await complete_email_verification(
+                page, sender_filter="workday", event_callback=event_callback
+            )
+            if verified:
+                await page.wait_for_timeout(3000)
+                await page.reload(wait_until="domcontentloaded")
+                await page.wait_for_timeout(5000)
+            else:
+                if event_callback:
+                    await event_callback("Navigate", "warning",
+                        "Auto-verify failed. Waiting up to 90s for manual verification...")
+                for _ in range(90):
+                    await page.wait_for_timeout(1000)
+                    try:
+                        t = await page.evaluate("document.body.innerText")
+                        if "verify" not in t.lower():
+                            break
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    # --- Step 6: Sign in after account creation ---
+    try:
+        email_vis = await page.locator('input[data-automation-id="email"]').is_visible(timeout=3000)
+    except Exception:
+        email_vis = False
+
+    if email_vis:
+        await _log("Signing in after account creation...")
+        await _fill_creds()
+        await page.wait_for_timeout(500)
+        await _multi_click(
+            [
+                'div[data-automation-id="click_filter"][aria-label="Sign In"]',
+                'button[data-automation-id="signInSubmitButton"]',
+                'button:has-text("Sign In")',
+            ],
+            force=True,
+        )
+        await page.wait_for_timeout(5000)
+
+    if await _is_on_form():
+        await _log_ok("Auth completed, on application form!")
+        return True
+
+    await _log_ok("Auth flow completed")
+    return True
 
 
 async def _take_screenshot(page: Page) -> bytes:
@@ -757,6 +1959,409 @@ async def _take_screenshot(page: Page) -> bytes:
         return await page.screenshot(type="png")
     except Exception:
         return b""
+
+
+def _is_dropdown_match(option_text: str, target_value: str) -> bool:
+    """Check if a dropdown option matches the target value, with alias support."""
+    opt = option_text.lower().strip()
+    target = target_value.lower().strip()
+
+    if not opt or not target:
+        return False
+    if opt == target or target in opt or opt in target:
+        return True
+
+    # Check aliases
+    aliases = {
+        "united states": ["us", "usa", "united states of america", "u.s.", "u.s.a.", "united states (us)"],
+        "no": ["none", "n/a", "not applicable"],
+        "yes": ["y"],
+        "male": ["man", "m", "he/him"],
+        "female": ["woman", "f", "she/her"],
+        "job board": ["online", "internet", "website", "web", "other", "job site", "jobs board"],
+        "linkedin": ["job board", "online", "internet", "other"],
+        "asian": ["asian or pacific islander", "asian american", "asian (not hispanic)"],
+        "bachelor": ["bachelor's", "bachelors", "bachelor's degree", "4-year degree", "undergraduate"],
+        "i do not wish to answer": ["prefer not to say", "decline to self-identify", "prefer not to answer", "decline", "choose not to disclose"],
+        "i am not a protected veteran": ["not a veteran", "non-veteran", "i am not a veteran", "not a protected veteran", "i am not"],
+        "california": ["ca"],
+    }
+
+    # Collect all acceptable matches
+    acceptable = [target]
+    for key, alias_list in aliases.items():
+        if target == key or target in alias_list:
+            acceptable = [key] + alias_list
+            break
+
+    for acc in acceptable:
+        if acc in opt or opt in acc:
+            return True
+        # Check if all words appear
+        words = acc.split()
+        if len(words) > 1 and all(w in opt for w in words):
+            return True
+
+    return False
+
+
+async def _handle_custom_dropdown(page, selector: str, value: str, event_callback=None) -> bool:
+    """Universal dropdown handler for both native <select> and custom dropdowns.
+
+    Strategy order:
+    1. Try native select_option with exact and fuzzy matching
+    2. Click to open + search/type + select from visible options
+    3. Click to open + JS fuzzy match on all visible option elements
+    4. Type into the dropdown and press Enter
+    """
+    # Strategy 1: native <select> with alias matching
+    try:
+        tag = await page.evaluate(f"document.querySelector('{selector}')?.tagName")
+        if tag and tag.lower() == "select":
+            # Get all options
+            options = await page.evaluate(f"""() => {{
+                const el = document.querySelector('{selector}');
+                if (!el) return [];
+                return Array.from(el.options).map(o => ({{value: o.value, text: o.text.trim()}}));
+            }}""")
+
+            # Find best match — prefer exact match, then starts-with, then fuzzy
+            target_lower = value.lower().strip()
+            best_match = None
+            best_score = 0  # 3=exact, 2=starts-with, 1=fuzzy
+            for opt in options:
+                opt_lower = opt["text"].lower().strip()
+                if not opt_lower or opt_lower in ("select", "select...", "choose", "--", ""):
+                    continue
+                if opt_lower == target_lower:
+                    best_match = opt
+                    best_score = 3
+                    break
+                if opt_lower.startswith(target_lower) and best_score < 2:
+                    best_match = opt
+                    best_score = 2
+                elif _is_dropdown_match(opt["text"], value) and best_score < 1:
+                    best_match = opt
+                    best_score = 1
+
+            if best_match:
+                try:
+                    await page.select_option(selector, value=best_match["value"], timeout=3000)
+                    if event_callback:
+                        await event_callback("Fill Form", "info", f"Selected: {best_match['text'][:50]}")
+                    return True
+                except Exception:
+                    pass
+
+            if event_callback:
+                opt_texts = [o["text"] for o in options[:10]]
+                await event_callback("Fill Form", "info", f"No match for '{value}' in select. Options: {opt_texts}")
+            return False
+    except Exception:
+        pass
+
+    # Strategy 2: click to open, then search/type in filter input
+    try:
+        el = page.locator(selector).first
+        await el.scroll_into_view_if_needed(timeout=3000)
+        await el.click(timeout=3000)
+        await page.wait_for_timeout(800)
+
+        # Check for a search/filter input inside the dropdown
+        search_selectors = [
+            'input[type="search"]:visible',
+            'input[role="combobox"]:visible',
+            'input[aria-autocomplete]:visible',
+            'input[placeholder*="Search" i]:visible',
+            'input[placeholder*="Type" i]:visible',
+            'input[placeholder*="Filter" i]:visible',
+        ]
+        for search_sel in search_selectors:
+            try:
+                search_input = page.locator(search_sel).first
+                if await search_input.is_visible(timeout=500):
+                    await search_input.fill(value, timeout=3000)
+                    await page.wait_for_timeout(800)
+                    # Click the first visible matching option
+                    for opt_sel in ['[role="option"]', 'li', '[class*="option"]']:
+                        try:
+                            opts = page.locator(opt_sel)
+                            count = await opts.count()
+                            for i in range(min(count, 10)):
+                                opt = opts.nth(i)
+                                if await opt.is_visible(timeout=300):
+                                    text = await opt.inner_text()
+                                    if _is_dropdown_match(text, value):
+                                        await opt.click(timeout=3000)
+                                        if event_callback:
+                                            await event_callback("Fill Form", "info", f"Selected: {text[:50]}")
+                                        return True
+                        except Exception:
+                            continue
+                    # If typed and there's a single visible option, click it
+                    try:
+                        first_opt = page.locator('[role="option"]:visible, li:visible').first
+                        if await first_opt.is_visible(timeout=500):
+                            text = await first_opt.inner_text()
+                            if text.strip():
+                                await first_opt.click(timeout=3000)
+                                return True
+                    except Exception:
+                        pass
+                    break
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    # Strategy 3: JS fuzzy match on all visible option-like elements
+    try:
+        # Re-click to make sure dropdown is open
+        try:
+            el = page.locator(selector).first
+            await el.click(timeout=2000)
+            await page.wait_for_timeout(500)
+        except Exception:
+            pass
+
+        clicked = await page.evaluate("""(targetValue) => {
+            const aliases = {
+                "united states": ["us", "usa", "united states of america"],
+                "job board": ["online", "internet", "website", "other", "linkedin"],
+                "linkedin": ["job board", "online", "internet", "other"],
+                "asian": ["asian or pacific islander", "asian american"],
+                "no": ["none", "n/a"],
+                "california": ["ca"],
+                "i do not wish to answer": ["prefer not to say", "decline to self-identify", "decline"],
+                "i am not a protected veteran": ["not a veteran", "i am not a veteran"],
+            };
+            const target = targetValue.toLowerCase().trim();
+            let acceptable = [target];
+            for (const [key, alts] of Object.entries(aliases)) {
+                if (target === key || alts.includes(target)) {
+                    acceptable = [key, ...alts];
+                    break;
+                }
+            }
+            const candidates = document.querySelectorAll(
+                '[role="option"], [role="listbox"] *, [role="menuitem"], ' +
+                'li, [class*="option"], [class*="menu-item"], [class*="dropdown-item"], ' +
+                '[data-automation-id*="promptOption"], [class*="listbox"] *'
+            );
+            for (const el of candidates) {
+                if (el.offsetParent === null) continue;
+                const text = (el.innerText || '').trim().toLowerCase();
+                if (!text) continue;
+                for (const acc of acceptable) {
+                    if (text === acc || text.includes(acc) || acc.includes(text)) {
+                        el.click();
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }""", value)
+
+        if clicked:
+            await page.wait_for_timeout(500)
+            return True
+    except Exception:
+        pass
+
+    # Strategy 4: type into the dropdown element and press Enter
+    try:
+        await page.keyboard.press("Escape")
+        await page.wait_for_timeout(300)
+        el = page.locator(selector).first
+        await el.click(timeout=2000)
+        await page.keyboard.type(value, delay=50)
+        await page.wait_for_timeout(1000)
+        await page.keyboard.press("Enter")
+        await page.wait_for_timeout(500)
+        return True
+    except Exception:
+        pass
+
+    if event_callback:
+        await event_callback("Fill Form", "info", f"Could not select '{value[:40]}' in dropdown {selector[:30]}")
+    return False
+
+
+async def _handle_phone_country(page_or_frame, target_country: str = "United States", event_callback=None) -> bool:
+    """Handle intl-tel-input (ITI) phone country dropdown used by Greenhouse etc."""
+    has_iti = await page_or_frame.evaluate("""() => {
+        return document.querySelector('.iti__flag-container, .iti__selected-flag, [class*="intl-tel"]') !== null
+            || (() => {
+                for (const pf of document.querySelectorAll('input[type="tel"]')) {
+                    const p = pf.parentElement;
+                    if (p && (p.classList.contains('iti') || p.querySelector('.iti__flag'))) return true;
+                }
+                return false;
+            })();
+    }""")
+    if not has_iti:
+        return False
+
+    try:
+        # Check if US already selected
+        is_us = await page_or_frame.evaluate("""() => {
+            const flag = document.querySelector('.iti__selected-flag .iti__flag');
+            if (flag) {
+                const cls = Array.from(flag.classList);
+                return cls.some(c => c === 'iti__us');
+            }
+            return false;
+        }""")
+        if is_us:
+            if event_callback:
+                await event_callback("Fill Form", "info", "Phone country already US")
+            return True
+
+        # Click flag to open dropdown
+        flag_btn = page_or_frame.locator('.iti__selected-flag').first
+        await flag_btn.click(timeout=3000)
+        await page_or_frame.wait_for_timeout(500)
+
+        # Try search box if available
+        try:
+            search = page_or_frame.locator('.iti__search-input, .iti__country-list input').first
+            if await search.is_visible(timeout=1000):
+                await search.fill("United States")
+                await page_or_frame.wait_for_timeout(500)
+        except Exception:
+            pass
+
+        # Click US option
+        for sel in [
+            '.iti__country-list li[data-country-code="us"]',
+            '.iti__country-list li:has-text("United States")',
+        ]:
+            try:
+                opt = page_or_frame.locator(sel).first
+                if await opt.is_visible(timeout=2000):
+                    await opt.click(timeout=3000)
+                    if event_callback:
+                        await event_callback("Fill Form", "info", "Selected US (+1) phone country")
+                    return True
+            except Exception:
+                continue
+
+        # JS fallback
+        clicked = await page_or_frame.evaluate("""() => {
+            const items = document.querySelectorAll('.iti__country-list li');
+            for (const item of items) {
+                if (item.getAttribute('data-country-code') === 'us') { item.click(); return true; }
+            }
+            return false;
+        }""")
+        if clicked:
+            if event_callback:
+                await event_callback("Fill Form", "info", "Selected US via JS")
+            return True
+
+        await page_or_frame.keyboard.press("Escape")
+    except Exception as e:
+        try:
+            await page_or_frame.keyboard.press("Escape")
+        except Exception:
+            pass
+        if event_callback:
+            await event_callback("Fill Form", "info", f"Phone country error: {e}")
+    return False
+
+
+async def _handle_resume_upload(page_or_frame, resume_path: str, event_callback=None) -> bool:
+    """Robust resume upload handling for Greenhouse, Lever, Workday etc."""
+    if not resume_path or not os.path.exists(resume_path):
+        if event_callback:
+            await event_callback("Fill Form", "error", f"Resume not found: {resume_path}")
+        return False
+
+    # Check if already uploaded
+    already = await page_or_frame.evaluate("""() => {
+        for (const sel of ['.filename', '.file-name', '.resume-filename', '.attachment-filename',
+                           '[data-automation-id="file-upload-item"]', '[class*="upload-success"]']) {
+            const el = document.querySelector(sel);
+            if (el && el.innerText.trim()) return el.innerText.trim();
+        }
+        for (const fi of document.querySelectorAll('input[type="file"]')) {
+            if (fi.files && fi.files.length > 0) return fi.files[0].name;
+        }
+        return '';
+    }""")
+    if already:
+        if event_callback:
+            await event_callback("Fill Form", "info", f"Resume already uploaded: {already}")
+        return True
+
+    # STRATEGY 1: Make hidden file inputs visible and use set_input_files
+    file_count = await page_or_frame.evaluate("document.querySelectorAll('input[type=\"file\"]').length")
+    if event_callback:
+        await event_callback("Fill Form", "info", f"Found {file_count} file input(s)")
+
+    for i in range(file_count):
+        try:
+            context = await page_or_frame.evaluate(f"""() => {{
+                const el = document.querySelectorAll('input[type="file"]')[{i}];
+                if (!el) return '';
+                el.style.display = 'block';
+                el.style.visibility = 'visible';
+                el.style.opacity = '1';
+                el.style.position = 'relative';
+                el.style.width = '200px';
+                el.style.height = '30px';
+                el.style.zIndex = '99999';
+                const parent = el.closest('.field, .application-field, .form-group, li, div[class*="upload"]');
+                if (parent) {{
+                    const lbl = parent.querySelector('label, .field-label, h3, h4');
+                    if (lbl) return lbl.innerText.trim();
+                }}
+                return '';
+            }}""")
+
+            ctx_lower = (context or "").lower()
+            is_resume = "resume" in ctx_lower or "cv" in ctx_lower or i == 0
+            if not is_resume and file_count > 1:
+                continue
+
+            fi = page_or_frame.locator('input[type="file"]').nth(i)
+            await fi.set_input_files(resume_path, timeout=10000)
+            await page_or_frame.wait_for_timeout(2000)
+
+            if event_callback:
+                await event_callback("Fill Form", "success", f"Resume uploaded via file input {i}")
+            return True
+        except Exception as e:
+            if event_callback:
+                await event_callback("Fill Form", "info", f"File input {i} failed: {e}")
+
+    # STRATEGY 2: Click Attach/Upload button and intercept file chooser
+    if file_count == 0:
+        upload_sels = [
+            'button:has-text("Attach")', 'button:has-text("Upload")',
+            'button:has-text("Choose File")', 'a:has-text("Attach")',
+            'a:has-text("Upload")', 'label:has-text("Attach")',
+            'a.attachment-link', '[class*="upload"] button', '[class*="dropzone"]',
+        ]
+        for sel in upload_sels:
+            try:
+                btn = page_or_frame.locator(sel).first
+                if not await btn.is_visible(timeout=1000):
+                    continue
+                async with page_or_frame.expect_file_chooser(timeout=10000) as fc:
+                    await btn.click(timeout=3000)
+                chooser = await fc.value
+                await chooser.set_files(resume_path)
+                await page_or_frame.wait_for_timeout(2000)
+                if event_callback:
+                    await event_callback("Fill Form", "success", "Resume uploaded via file chooser")
+                return True
+            except Exception:
+                continue
+
+    if event_callback:
+        await event_callback("Fill Form", "warning", "All resume upload strategies failed")
+    return False
 
 
 async def fill_form(
@@ -785,39 +2390,116 @@ async def fill_form(
 
         try:
             if action == "fill":
+                is_location = "location" in selector.lower() or "location" in m.get("label", "").lower()
                 try:
-                    await page.locator(selector).first.scroll_into_view_if_needed(timeout=3000)
-                    await page.fill(selector, value, timeout=5000)
+                    loc = page.locator(selector).first
+                    await loc.scroll_into_view_if_needed(timeout=3000)
+                    if is_location:
+                        # Location fields often have autocomplete - type slowly and select suggestion
+                        await loc.click(timeout=3000)
+                        await loc.fill("", timeout=2000)  # Clear first
+                        await page.keyboard.type(value, delay=80)
+                        await page.wait_for_timeout(1500)
+                        # Try pressing ArrowDown + Enter to accept autocomplete suggestion
+                        await page.keyboard.press("ArrowDown")
+                        await page.wait_for_timeout(300)
+                        await page.keyboard.press("Enter")
+                        await page.wait_for_timeout(500)
+                        # If autocomplete cleared the value, just set it directly
+                        current = await loc.input_value()
+                        if not current:
+                            await page.fill(selector, value, timeout=3000)
+                    else:
+                        await page.fill(selector, value, timeout=5000)
                 except Exception:
-                    # Fallback: use JS to set value (bypasses overlays)
-                    escaped_val = value.replace("'", "\\'").replace("\n", "\\n")
-                    await page.evaluate(f"document.querySelector('{selector}').value = '{escaped_val}'")
-                    await page.evaluate(f"document.querySelector('{selector}').dispatchEvent(new Event('input', {{bubbles: true}}))")
+                    # Fallback: use JS to set value
+                    try:
+                        await page.evaluate(
+                            """(args) => {
+                                const [sel, val] = args;
+                                const el = document.querySelector(sel);
+                                if (el) {
+                                    el.focus();
+                                    el.value = val;
+                                    el.dispatchEvent(new Event('input', {bubbles: true}));
+                                    el.dispatchEvent(new Event('change', {bubbles: true}));
+                                    el.dispatchEvent(new Event('blur', {bubbles: true}));
+                                }
+                            }""",
+                            [selector, value]
+                        )
+                    except Exception:
+                        pass
                 filled += 1
                 if event_callback:
                     label = m.get("label", selector)
                     await event_callback("Fill Form", "info", f"Filled: {label[:50]}")
 
             elif action == "select":
-                await page.locator(selector).first.scroll_into_view_if_needed(timeout=3000)
-                try:
-                    await page.select_option(selector, label=value, timeout=5000)
-                except Exception:
-                    await page.select_option(selector, value=value, timeout=5000)
-                filled += 1
-                if event_callback:
-                    await event_callback("Fill Form", "info", f"Selected: {value[:50]}")
+                success = await _handle_custom_dropdown(page, selector, value, event_callback)
+                if success:
+                    filled += 1
+                    if event_callback:
+                        await event_callback("Fill Form", "info", f"Selected: {value[:50]}")
+                else:
+                    failed += 1
+                    errors.append(f"Dropdown {selector}: could not select '{value}'")
+                    if event_callback:
+                        await event_callback("Fill Form", "info", f"Dropdown failed: {value[:50]}")
 
             elif action == "click":
+                click_ok = False
                 try:
-                    await page.locator(selector).first.scroll_into_view_if_needed(timeout=3000)
-                    await page.click(selector, timeout=5000)
+                    loc = page.locator(selector).first
+                    await loc.scroll_into_view_if_needed(timeout=3000)
+                    await loc.click(timeout=5000)
+                    click_ok = True
                 except Exception:
-                    # Fallback: use JS click to bypass overlays (CAPTCHA, modals)
-                    await page.evaluate(f'document.querySelector(\'{selector}\').click()')
-                filled += 1
-                if event_callback:
-                    await event_callback("Fill Form", "info", f"Clicked: {selector[:50]}")
+                    pass
+                if not click_ok:
+                    # Fallback: use JS click with proper escaping
+                    try:
+                        click_ok = await page.evaluate(
+                            "sel => { const el = document.querySelector(sel); if (el) { el.click(); return true; } return false; }",
+                            selector
+                        )
+                    except Exception:
+                        pass
+                if not click_ok:
+                    # Last resort: try by label text (for radio/checkbox)
+                    try:
+                        # Extract label from composite selector like [name="x"][label="Yes :: Yes"]
+                        import re as _re
+                        label_match = _re.search(r'label="([^"]*)"', selector)
+                        if label_match:
+                            label_text = label_match.group(1).split(" :: ")[-1].strip()
+                            name_match = _re.search(r'name="([^"]*)"', selector)
+                            if name_match:
+                                field_name = name_match.group(1)
+                                # Find the radio/checkbox by name and label text
+                                click_ok = await page.evaluate("""(args) => {
+                                    const [fieldName, labelText] = args;
+                                    const inputs = document.querySelectorAll('input[name="' + fieldName + '"]');
+                                    for (const inp of inputs) {
+                                        const wrapper = inp.closest('li, div, label');
+                                        if (wrapper && wrapper.innerText.trim().includes(labelText)) {
+                                            inp.click();
+                                            return true;
+                                        }
+                                    }
+                                    return false;
+                                }""", [field_name, label_text])
+                    except Exception:
+                        pass
+                if click_ok:
+                    filled += 1
+                    if event_callback:
+                        await event_callback("Fill Form", "info", f"Clicked: {selector[:50]}")
+                else:
+                    failed += 1
+                    errors.append(f"{selector[:60]}: click failed")
+                    if event_callback:
+                        await event_callback("Fill Form", "info", f"Click failed: {selector[:50]}")
 
             elif action == "upload_file":
                 try:
@@ -827,13 +2509,14 @@ async def fill_form(
                         file_path = transcript_path
                         file_label = "transcript"
 
-                    file_input = page.locator('input[type="file"]').first
-                    await file_input.set_input_files(file_path, timeout=10000)
-                    filled += 1
-                    if event_callback:
-                        await event_callback("Fill Form", "info", f"Uploaded {file_label}")
+                    success = await _handle_resume_upload(page, file_path, event_callback)
+                    if success:
+                        filled += 1
+                    else:
+                        failed += 1
+                        errors.append(f"{file_label} upload failed")
                 except Exception as e:
-                    errors.append(f"File upload failed: {e}")
+                    errors.append(f"File upload error: {e}")
                     failed += 1
 
             # Take screenshot after each successful action for live feed
@@ -848,7 +2531,57 @@ async def fill_form(
             if event_callback:
                 await event_callback("Fill Form", "info", f"Failed: {selector[:40]} - {str(e)[:60]}")
 
+    # Post-fill: handle phone country dropdown (ITI) if present
+    try:
+        await _handle_phone_country(page, "United States", event_callback)
+    except Exception:
+        pass
+
+    # Post-fill: verify resume was uploaded, retry if not
+    try:
+        resume_ok = await page.evaluate("""() => {
+            for (const fi of document.querySelectorAll('input[type="file"]')) {
+                if (fi.files && fi.files.length > 0) return true;
+            }
+            for (const sel of ['.filename', '.file-name', '.resume-filename', '.attachment-filename']) {
+                const el = document.querySelector(sel);
+                if (el && el.innerText.trim()) return true;
+            }
+            return false;
+        }""")
+        if not resume_ok and resume_path:
+            if event_callback:
+                await event_callback("Fill Form", "info", "Resume not detected after fill, retrying upload...")
+            await _handle_resume_upload(page, resume_path, event_callback)
+    except Exception:
+        pass
+
     return {"filled": filled, "skipped": skipped, "failed": failed, "errors": errors}
+
+
+async def _start_playwright_windows():
+    """Start Playwright on Windows by running the subprocess spawn in a separate thread
+    with its own event loop that supports subprocess creation."""
+    import concurrent.futures
+
+    def _start_in_thread():
+        # Create a new event loop with ProactorEventLoop (supports subprocesses on Windows)
+        loop = asyncio.ProactorEventLoop()
+        asyncio.set_event_loop(loop)
+        try:
+            from playwright.async_api import async_playwright as ap
+            pw = loop.run_until_complete(ap().start())
+            return pw, loop
+        except Exception:
+            loop.close()
+            raise
+
+    # Run the playwright startup in a thread with its own ProactorEventLoop
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(_start_in_thread)
+        pw, _thread_loop = future.result(timeout=30)
+
+    return pw
 
 
 async def fill_application(
@@ -875,6 +2608,13 @@ async def fill_application(
     if event_callback:
         await event_callback("Navigate", "info", "Browser launched")
 
+    # Detect ATS before navigating
+    ats_key = detect_ats(url)
+    ats_profile = get_profile(ats_key) if ats_key else None
+    if event_callback and ats_key:
+        ats_name = ats_profile.get("name", ats_key) if ats_profile else ats_key
+        await event_callback("Navigate", "info", f"Detected ATS: {ats_name}")
+
     # Navigate
     await page.goto(url, wait_until="domcontentloaded", timeout=30000)
     # Wait a bit for JS rendering
@@ -888,22 +2628,39 @@ async def fill_application(
     if dismissed and event_callback:
         await event_callback("Navigate", "info", "Dismissed cookie banner")
 
+    # Handle ATS-specific authentication (account creation / sign-in)
+    if ats_profile and ats_profile.get("account_required"):
+        if ats_key == "workday" or ats_key == "myworkdayjobs":
+            pass  # Workday auth is handled later in its own flow
+        else:
+            auth_ok = await _handle_ats_auth(page, ats_key, event_callback)
+            if not auth_ok and event_callback:
+                await event_callback("Navigate", "warning", f"Auth for {ats_key} may have failed, continuing anyway...")
+
     # Screenshot
     if screenshot_callback:
         ss = await _take_screenshot(page)
         await screenshot_callback(ss)
 
-    # Check for CAPTCHA
+    # Check for CAPTCHA (reCAPTCHA, hCaptcha, etc.)
     has_captcha = await _check_for_captcha(page)
-    if has_captcha and event_callback:
-        await event_callback("Navigate", "info",
-            "CAPTCHA detected - please solve it in the browser window. Waiting 30s...")
-        # Wait for user to solve CAPTCHA manually
-        for _ in range(30):
+    if has_captcha:
+        if event_callback:
+            await event_callback("Navigate", "info",
+                "CAPTCHA detected - please solve it in the browser window. Waiting up to 2 minutes...")
+        # Wait for user to solve CAPTCHA manually (up to 120s)
+        for _ in range(120):
             await page.wait_for_timeout(1000)
             still_captcha = await _check_for_captcha(page)
             if not still_captcha:
                 break
+            # Also check if form fields appeared (CAPTCHA solved and page moved on)
+            try:
+                input_count = await page.evaluate("document.querySelectorAll('input:not([type=hidden])').length")
+                if input_count > 3:
+                    break
+            except Exception:
+                pass
         if event_callback:
             await event_callback("Navigate", "info", "Continuing after CAPTCHA wait")
 
@@ -966,7 +2723,10 @@ async def fill_application(
             '[data-qa="btn-apply"]',
             '.postings-btn',
             'a.postings-btn',
-            # SmartRecruiters
+            # SmartRecruiters - uses "I'm interested" instead of "Apply"
+            'a:has-text("I\'m interested")',
+            'button:has-text("I\'m interested")',
+            'a[href*="smartr.me"]',
             'a.apply-btn',
             'button.js-apply-btn',
             '[data-test="apply-button"]',
@@ -1002,6 +2762,57 @@ async def fill_application(
                     break
             except Exception:
                 continue
+
+        # After clicking apply, check for CAPTCHA on the new page (iCIMS, etc.)
+        if apply_clicked:
+            has_captcha = await _check_for_captcha(page)
+            if has_captcha:
+                if event_callback:
+                    await event_callback("Extract Fields", "info",
+                        "CAPTCHA on application page - please solve it. Waiting up to 2 minutes...")
+                for _ in range(120):
+                    await page.wait_for_timeout(1000)
+                    still_captcha = await _check_for_captcha(page)
+                    if not still_captcha:
+                        break
+                    try:
+                        input_count = await page.evaluate("document.querySelectorAll('input:not([type=hidden])').length")
+                        if input_count > 3:
+                            break
+                    except Exception:
+                        pass
+                await page.wait_for_timeout(2000)
+                if event_callback:
+                    await event_callback("Extract Fields", "info", "Continuing after CAPTCHA")
+
+            # Handle iCIMS email login gate
+            try:
+                email_input = page.locator('#email, input[name*="loginName"], input[name*="email"]')
+                if await email_input.first.is_visible(timeout=2000):
+                    creds = _load_credentials()
+                    ats_creds = creds.get(ats_key or "", creds.get("icims", {}))
+                    login_email = ats_creds.get("email", "")
+                    if login_email:
+                        await email_input.first.fill(login_email)
+                        # Click submit/continue
+                        submit = page.locator('#enterEmailSubmitButton, button[type="submit"], input[type="submit"]')
+                        if await submit.first.is_visible(timeout=2000):
+                            await submit.first.click()
+                            await page.wait_for_timeout(5000)
+                        # Check for password field (existing account)
+                        pw_field = page.locator('input[type="password"]')
+                        if await pw_field.first.is_visible(timeout=3000):
+                            pw = ats_creds.get("password", "")
+                            if pw:
+                                await pw_field.first.fill(pw)
+                                submit2 = page.locator('button[type="submit"], input[type="submit"]')
+                                if await submit2.first.is_visible(timeout=2000):
+                                    await submit2.first.click()
+                                    await page.wait_for_timeout(5000)
+                        if event_callback:
+                            await event_callback("Extract Fields", "info", f"Logged in, now at: {page.url[:60]}")
+            except Exception:
+                pass
 
         # After clicking apply, re-extract from main page and iframes
         fields = await page.evaluate(JS_EXTRACT_FIELDS)
@@ -1055,18 +2866,34 @@ async def fill_application(
             if event_callback:
                 await event_callback("Extract Fields", "info", "Workday detected - using Workday-specific handler...")
 
-            summary = await _handle_workday_apply(page, resume_path, event_callback, screenshot_callback)
+            summary = await _handle_workday_apply(page, resume_path, event_callback, screenshot_callback, job_url=url)
             return {"browser": _browser, "page": page, "summary": summary}
 
         if len(fields) == 0:
             return {"browser": _browser, "page": page, "summary": {"filled": 0, "failed": 0, "skipped": 0, "errors": ["No form fields found"]}}
+
+    # Check if cover letter is needed (required field with cover letter label)
+    cover_letter_text = ""
+    has_required_cover_letter = any(
+        f.get("required") and any(kw in (f.get("label", "") + f.get("name", "")).lower()
+            for kw in ["cover letter", "cover_letter", "coverletter"])
+        for f in fields
+    )
+    if has_required_cover_letter:
+        if event_callback:
+            await event_callback("Generate Answers", "info", "Cover letter required, generating...")
+        try:
+            cover_letter_text = _generate_cover_letter(company, role, job_description)
+        except Exception as e:
+            if event_callback:
+                await event_callback("Generate Answers", "warning", f"Cover letter generation failed: {e}")
 
     # LLM mapping
     if event_callback:
         await event_callback("Generate Answers", "start", "Mapping fields to profile (single LLM call)...")
 
     try:
-        mappings = map_fields_to_profile(fields, job_description, company, role)
+        mappings = map_fields_to_profile(fields, job_description, company, role, cover_letter_text)
         if event_callback:
             fill_count = sum(1 for m in mappings if m.get("action") != "skip")
             await event_callback("Generate Answers", "success", f"Mapped {fill_count} fields to fill")
@@ -1075,7 +2902,7 @@ async def fill_application(
             await event_callback("Generate Answers", "error", f"LLM mapping failed: {e}")
         return {"browser": _browser, "page": page, "summary": {"filled": 0, "failed": 0, "errors": [str(e)]}}
 
-    # Fill the form with continuous background screenshots
+    # Fill the form with continuous background screenshots and retry loop
     if event_callback:
         await event_callback("Fill Form", "start", "Filling fields...")
 
@@ -1095,7 +2922,70 @@ async def fill_application(
 
     bg_task = asyncio.create_task(_bg_screenshots())
 
-    summary = await fill_form(form_context, mappings, resume_path, transcript_path, event_callback, screenshot_callback, page)
+    total_filled = 0
+    total_failed = 0
+    total_skipped = 0
+    all_errors = []
+    max_passes = 5  # retry up to 5 times
+
+    for pass_num in range(max_passes):
+        if pass_num == 0:
+            # First pass uses the mappings we already have
+            summary = await fill_form(form_context, mappings, resume_path, transcript_path, event_callback, screenshot_callback, page)
+        else:
+            # Re-extract fields and check which are still empty
+            await page.wait_for_timeout(1500)
+
+            # Scroll to load any lazy content
+            page_height = await form_context.evaluate("document.body.scrollHeight") if hasattr(form_context, 'evaluate') else await page.evaluate("document.body.scrollHeight")
+            for i in range(0, page_height, 900):
+                target = form_context if hasattr(form_context, 'evaluate') else page
+                await target.evaluate(f"window.scrollTo(0, {i})")
+                await page.wait_for_timeout(300)
+            target = form_context if hasattr(form_context, 'evaluate') else page
+            await target.evaluate("window.scrollTo(0, 0)")
+            await page.wait_for_timeout(500)
+
+            re_fields = await form_context.evaluate(JS_EXTRACT_FIELDS)
+
+            # Filter to only unfilled fields (empty value, no selection made)
+            unfilled = [f for f in re_fields if not f.get("value", "").strip()]
+            # Also include dropdowns that might show placeholder text
+            for f in re_fields:
+                if f.get("tag") == "select" and f.get("value", "") in ("", "0", "--"):
+                    if f not in unfilled:
+                        unfilled.append(f)
+
+            if len(unfilled) == 0:
+                if event_callback:
+                    await event_callback("Fill Form", "success", f"All fields filled after {pass_num + 1} passes")
+                break
+
+            if event_callback:
+                await event_callback("Fill Form", "info", f"Pass {pass_num + 1}: {len(unfilled)} fields still empty, retrying...")
+
+            try:
+                retry_mappings = map_fields_to_profile(unfilled, job_description, company, role, cover_letter_text)
+                # Filter out skips for retry - we want to fill everything
+                retry_mappings = [m for m in retry_mappings if m.get("action") != "skip" or m.get("value")]
+                if not retry_mappings:
+                    if event_callback:
+                        await event_callback("Fill Form", "info", f"No new mappings on pass {pass_num + 1}, moving on")
+                    break
+                summary = await fill_form(form_context, retry_mappings, resume_path, transcript_path, event_callback, screenshot_callback, page)
+            except Exception as e:
+                if event_callback:
+                    await event_callback("Fill Form", "info", f"Retry pass {pass_num + 1} failed: {e}")
+                break
+
+        total_filled += summary.get("filled", 0)
+        total_failed += summary.get("failed", 0)
+        total_skipped += summary.get("skipped", 0)
+        all_errors.extend(summary.get("errors", []))
+
+        # If nothing failed, we're done
+        if summary.get("failed", 0) == 0 and pass_num > 0:
+            break
 
     _screenshot_active = False
     bg_task.cancel()
@@ -1104,11 +2994,13 @@ async def fill_application(
     except asyncio.CancelledError:
         pass
 
+    final_summary = {"filled": total_filled, "failed": total_failed, "skipped": total_skipped, "errors": all_errors}
+
     if event_callback:
-        status = "success" if summary["failed"] == 0 else "info"
+        status = "success" if total_failed == 0 else "info"
         await event_callback(
             "Fill Form", status,
-            f"Done: {summary['filled']} filled, {summary['skipped']} skipped, {summary['failed']} failed"
+            f"Done: {total_filled} filled, {total_skipped} skipped, {total_failed} failed across {min(pass_num + 1, max_passes)} passes"
         )
 
     # Final screenshot
@@ -1118,7 +3010,7 @@ async def fill_application(
         ss = await _take_screenshot(page)
         await screenshot_callback(ss)
 
-    return {"browser": _browser, "page": page, "summary": summary}
+    return {"browser": _browser, "page": page, "summary": final_summary}
 
 
 async def close_browser():
