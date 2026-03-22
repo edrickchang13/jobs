@@ -237,6 +237,10 @@ JOB DESCRIPTION:
 
 Fill ALL fields. Do not skip any required field. Be thorough and check each page of the form."""
 
+    file_paths = [resume_path]
+    if transcript_path:
+        file_paths.append(transcript_path)
+
     agent = Agent(
         task=task,
         llm=llm,
@@ -246,6 +250,7 @@ Fill ALL fields. Do not skip any required field. Be thorough and check each page
         max_actions_per_step=3,
         loop_detection_enabled=True,
         loop_detection_window=5,
+        available_file_paths=file_paths,
     )
 
     steps = 0
