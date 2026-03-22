@@ -792,6 +792,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 '<div class="event-step">' + event.step + '</div>' +
                 '<div class="event-detail">' + (event.detail || '') + '</div></div>';
             log.insertBefore(li, log.firstChild);
+            // CAPTCHA alert
+            var d = (event.detail || '').toLowerCase();
+            var s = (event.step || '').toLowerCase();
+            if (d.includes('captcha') || s.includes('captcha')) {
+                playCaptchaAlert();
+                var origTitle = document.title;
+                var flashInt = setInterval(function() {
+                    document.title = document.title === origTitle ? '\u26a0\ufe0f CAPTCHA NEEDED' : origTitle;
+                }, 500);
+                setTimeout(function() { clearInterval(flashInt); document.title = origTitle; }, 30000);
+            }
         }
 
         function updatePills(event) {
@@ -880,9 +891,35 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             });
         }
 
+        // CAPTCHA alert sound - plays beeps using Web Audio API
+        function playCaptchaAlert() {
+            try {
+                var ctx = new (window.AudioContext || window.webkitAudioContext)();
+                for (var i = 0; i < 3; i++) {
+                    var osc = ctx.createOscillator();
+                    var gain = ctx.createGain();
+                    osc.connect(gain);
+                    gain.connect(ctx.destination);
+                    osc.frequency.value = 800;
+                    osc.type = 'square';
+                    gain.gain.value = 0.3;
+                    osc.start(ctx.currentTime + i * 0.3);
+                    osc.stop(ctx.currentTime + i * 0.3 + 0.15);
+                }
+            } catch(e) {}
+            if (Notification.permission === 'granted') {
+                new Notification('CAPTCHA Detected!', { body: 'Solve the CAPTCHA in the browser window to continue.' });
+            } else if (Notification.permission !== 'denied') {
+                Notification.requestPermission();
+            }
+        }
+
         // Load jobs and check uploads on page load
         loadJobs();
         checkUploads();
+        if ('Notification' in window && Notification.permission === 'default') {
+            Notification.requestPermission();
+        }
 
         // Auto-refresh jobs every 15 minutes
         setInterval(() => {

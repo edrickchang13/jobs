@@ -267,6 +267,21 @@ Report what page you're on when you stop."""
                 pass
         if event_callback:
             await event_callback("Agent", "info", f"Navigation step {steps}")
+        # Check for CAPTCHA on current page
+        try:
+            page = await agent_instance.browser_session.get_current_page()
+            if page:
+                has_captcha = await page.evaluate("""() => {
+                    const html = document.documentElement.innerHTML.toLowerCase();
+                    return html.includes('recaptcha') || html.includes('hcaptcha') ||
+                           html.includes('captcha-container') || html.includes('g-recaptcha') ||
+                           document.querySelector('iframe[src*="recaptcha"]') !== null ||
+                           document.querySelector('iframe[src*="hcaptcha"]') !== null;
+                }""")
+                if has_captcha and event_callback:
+                    await event_callback("CAPTCHA", "warning", "CAPTCHA detected! Please solve it in the browser window. Agent will wait...")
+        except Exception:
+            pass
 
     history = None
     try:
@@ -3145,8 +3160,8 @@ async def fill_application(
     has_captcha = await _check_for_captcha(page)
     if has_captcha:
         if event_callback:
-            await event_callback("Navigate", "info",
-                "CAPTCHA detected - please solve it in the browser window. Waiting up to 2 minutes...")
+            await event_callback("CAPTCHA", "warning",
+                "CAPTCHA detected! Please solve it in the browser window. Waiting up to 2 minutes...")
         # Wait for user to solve CAPTCHA manually (up to 120s)
         for _ in range(120):
             await asyncio.sleep(1.0)
@@ -3161,7 +3176,7 @@ async def fill_application(
             except Exception:
                 pass
         if event_callback:
-            await event_callback("Navigate", "info", "Continuing after CAPTCHA wait")
+            await event_callback("CAPTCHA", "info", "Continuing after CAPTCHA wait")
 
     # Scroll down incrementally to load lazy content (Greenhouse, etc.)
     page_height = await page.evaluate("document.body.scrollHeight")
@@ -3267,8 +3282,8 @@ async def fill_application(
             has_captcha = await _check_for_captcha(page)
             if has_captcha:
                 if event_callback:
-                    await event_callback("Extract Fields", "info",
-                        "CAPTCHA on application page - please solve it. Waiting up to 2 minutes...")
+                    await event_callback("CAPTCHA", "warning",
+                        "CAPTCHA detected! Please solve it in the browser window. Waiting up to 2 minutes...")
                 for _ in range(120):
                     await asyncio.sleep(1.0)
                     still_captcha = await _check_for_captcha(page)
@@ -3282,7 +3297,7 @@ async def fill_application(
                         pass
                 await asyncio.sleep(2.0)
                 if event_callback:
-                    await event_callback("Extract Fields", "info", "Continuing after CAPTCHA")
+                    await event_callback("CAPTCHA", "info", "Continuing after CAPTCHA")
 
             # Handle iCIMS email login gate
             try:
