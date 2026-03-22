@@ -989,7 +989,15 @@ async def continue_application_endpoint():
 
         # --- VERIFICATION ---
         if state.get("isVerify"):
-            add_event("Continue", "info", "Verification page detected. Click 'Get Email Code' to handle it.")
+            add_event("Continue", "info",
+                "Verification page detected. Click 'Get Email Code' button to auto-fetch code from Gmail.")
+            # Take a fresh screenshot so user can see the verification page
+            try:
+                ss = await page.screenshot(type="png")
+                latest_screenshot_b64 = base64.b64encode(ss).decode("utf-8")
+                screenshot_version += 1
+            except Exception:
+                pass
             return JSONResponse({"status": "ok", "action": "verify"})
 
         # --- ERRORS ---

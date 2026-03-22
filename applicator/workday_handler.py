@@ -16,14 +16,16 @@ async def check_workday_consent(page: Page, event_callback=None, max_wait_second
 
     Workday puts a transparent div[data-automation-id="click_filter"] on top of every
     interactive element. This IS the intended click target — Workday's event delegation
-    listens for clicks on click_filter and updates framework state. Clicking the checkbox
-    element directly bypasses this and the state never changes.
+    listens for clicks on click_filter and updates framework state.
+
+    CRITICAL: Synthetic JS dispatchEvent creates events with isTrusted=false which Workday
+    ignores. We MUST use real Playwright mouse.click() to generate isTrusted=true events.
     """
 
     if event_callback:
         await event_callback("Checkbox", "info", "Waiting for consent checkbox...")
 
-    # Step 1: Wait for checkbox to appear
+    # Step 1: Poll for checkbox to appear (500ms intervals, up to max_wait_seconds)
     for i in range(max_wait_seconds * 2):
         has = await page.evaluate("""() => {
             for (const cb of document.querySelectorAll('[role="checkbox"]'))
@@ -40,73 +42,52 @@ async def check_workday_consent(page: Page, event_callback=None, max_wait_second
             await event_callback("Checkbox", "info", "No checkbox found — may not be required")
         return True  # No checkbox = nothing to check = proceed
 
-    # Step 2: Wait for Workday to finish rendering + attach event handlers
-    await asyncio.sleep(3)
+    # Step 2: Wait 2s extra for Workday to attach event handlers
+    await asyncio.sleep(2)
 
-    # Step 3: Click the click_filter INSIDE each unchecked checkbox
-    result = await page.evaluate("""() => {
-        const results = [];
-        for (const cb of document.querySelectorAll('[role="checkbox"]')) {
-            if (cb.offsetParent === null) continue;
-            if (cb.getAttribute('aria-checked') === 'true') continue;
-
-            // Find the click_filter overlay inside this checkbox
-            const filter = cb.querySelector('[data-automation-id="click_filter"]');
-            const target = filter || cb.querySelector('div');
-            if (!target) continue;
-
-            const rect = target.getBoundingClientRect();
-            const x = rect.left + rect.width / 2;
-            const y = rect.top + rect.height / 2;
-            const opts = {bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, screenX: x, screenY: y, pointerId: 1};
-
-            target.dispatchEvent(new PointerEvent('pointerdown', opts));
-            target.dispatchEvent(new MouseEvent('mousedown', opts));
-            target.dispatchEvent(new PointerEvent('pointerup', opts));
-            target.dispatchEvent(new MouseEvent('mouseup', opts));
-            target.dispatchEvent(new MouseEvent('click', opts));
-
-            results.push({
-                method: filter ? 'click_filter' : 'child_div',
-                dataId: cb.getAttribute('data-automation-id') || '',
-                after: cb.getAttribute('aria-checked'),
-            });
-        }
-        return results;
-    }""")
-
-    if event_callback:
-        await event_callback("Checkbox", "info", f"Click filter results: {result}")
-
-    # Step 4: Wait for framework to process
-    await asyncio.sleep(1)
-
-    # Step 5: Verify
-    unchecked = await page.evaluate("""() =>
-        Array.from(document.querySelectorAll('[role="checkbox"][aria-checked="false"]'))
-            .filter(el => el.offsetParent !== null).length
-    """)
-
-    if unchecked == 0:
-        if event_callback:
-            await event_callback("Checkbox", "success", "All checkboxes confirmed checked")
-        return True
-
-    # Step 6: Fallback — Playwright mouse.click at exact center coordinates
-    if event_callback:
-        await event_callback("Checkbox", "info", "click_filter didn't work, trying coordinate click...")
-
+    # Step 3: Click the click_filter div INSIDE each unchecked checkbox using REAL
+    # Playwright mouse events (isTrusted=true). Verify each one individually.
     try:
-        cbs = page.locator('[role="checkbox"][aria-checked="false"]')
-        count = await cbs.count()
-        for i in range(count):
-            cb = cbs.nth(i)
-            if await cb.is_visible(timeout=1000):
-                # Try clicking the click_filter child specifically via Playwright mouse.click
-                filter_div = page.locator('[role="checkbox"][aria-checked="false"]').nth(i).locator('[data-automation-id="click_filter"]')
+        cbs = page.locator('[role="checkbox"]')
+        total = await cbs.count()
+        for idx in range(total):
+            cb = cbs.nth(idx)
+            if not await cb.is_visible(timeout=1000):
+                continue
+            state = await cb.get_attribute("aria-checked")
+            if state == "true":
+                continue
+
+            checked = False
+
+            # --- ATTEMPT A: Playwright mouse.click on click_filter child ---
+            filter_loc = cb.locator('[data-automation-id="click_filter"]')
+            try:
+                if await filter_loc.count() > 0 and await filter_loc.first.is_visible(timeout=500):
+                    box = await filter_loc.first.bounding_box()
+                    if box:
+                        cx = box['x'] + box['width'] / 2
+                        cy = box['y'] + box['height'] / 2
+                        # Full pointer event sequence with real coordinates
+                        await page.mouse.move(cx, cy)
+                        await page.mouse.down()
+                        await asyncio.sleep(0.05)
+                        await page.mouse.up()
+                        await asyncio.sleep(0.8)
+                        state = await cb.get_attribute("aria-checked")
+                        if state == "true":
+                            checked = True
+                            if event_callback:
+                                await event_callback("Checkbox", "success",
+                                    f"Checked via click_filter mouse.click({cx:.0f},{cy:.0f})")
+            except Exception:
+                pass
+
+            # --- ATTEMPT B: Playwright mouse.click directly on click_filter ---
+            if not checked:
                 try:
-                    if await filter_div.is_visible(timeout=500):
-                        box = await filter_div.bounding_box()
+                    if await filter_loc.count() > 0 and await filter_loc.first.is_visible(timeout=500):
+                        box = await filter_loc.first.bounding_box()
                         if box:
                             cx = box['x'] + box['width'] / 2
                             cy = box['y'] + box['height'] / 2
@@ -114,28 +95,72 @@ async def check_workday_consent(page: Page, event_callback=None, max_wait_second
                             await asyncio.sleep(1)
                             state = await cb.get_attribute("aria-checked")
                             if state == "true":
+                                checked = True
                                 if event_callback:
-                                    await event_callback("Checkbox", "success", f"Checked via click_filter mouse.click({cx:.0f},{cy:.0f})")
-                                continue
+                                    await event_callback("Checkbox", "success",
+                                        f"Checked via click_filter page.mouse.click({cx:.0f},{cy:.0f})")
                 except Exception:
                     pass
 
-                # Fallback: click checkbox itself
-                box = await cb.bounding_box()
-                if box:
-                    cx = box['x'] + box['width'] / 2
-                    cy = box['y'] + box['height'] / 2
-                    await page.mouse.click(cx, cy)
-                    await asyncio.sleep(1)
-                    state = await cb.get_attribute("aria-checked")
-                    if state == "true":
+            # --- ATTEMPT C: Playwright mouse.click on the checkbox bounding box center ---
+            if not checked:
+                try:
+                    box = await cb.bounding_box()
+                    if box:
+                        cx = box['x'] + box['width'] / 2
+                        cy = box['y'] + box['height'] / 2
+                        await page.mouse.click(cx, cy)
+                        await asyncio.sleep(1)
+                        state = await cb.get_attribute("aria-checked")
+                        if state == "true":
+                            checked = True
+                            if event_callback:
+                                await event_callback("Checkbox", "success",
+                                    f"Checked via checkbox mouse.click({cx:.0f},{cy:.0f})")
+                except Exception:
+                    pass
+
+            # --- ATTEMPT D: JS dispatchEvent fallback with full pointer sequence ---
+            if not checked:
+                try:
+                    js_result = await page.evaluate("""(idx) => {
+                        const cbs = Array.from(document.querySelectorAll('[role="checkbox"]'))
+                            .filter(el => el.offsetParent !== null);
+                        const cb = cbs[idx];
+                        if (!cb || cb.getAttribute('aria-checked') === 'true') return 'skip';
+                        const filter = cb.querySelector('[data-automation-id="click_filter"]');
+                        const target = filter || cb.querySelector('div') || cb;
+                        const rect = target.getBoundingClientRect();
+                        const x = rect.left + rect.width / 2;
+                        const y = rect.top + rect.height / 2;
+                        const opts = {bubbles: true, cancelable: true, composed: true, view: window,
+                                      button: 0, buttons: 1, clientX: x, clientY: y,
+                                      screenX: x, screenY: y, pointerId: 1};
+                        target.dispatchEvent(new PointerEvent('pointerdown', opts));
+                        target.dispatchEvent(new MouseEvent('mousedown', opts));
+                        target.dispatchEvent(new PointerEvent('pointerup', opts));
+                        target.dispatchEvent(new MouseEvent('mouseup', opts));
+                        target.dispatchEvent(new MouseEvent('click', opts));
+                        return cb.getAttribute('aria-checked');
+                    }""", idx)
+                    if js_result == "true":
+                        checked = True
                         if event_callback:
-                            await event_callback("Checkbox", "success", f"Checked via mouse.click({cx:.0f},{cy:.0f})")
+                            await event_callback("Checkbox", "success", "Checked via JS dispatchEvent fallback")
+                    await asyncio.sleep(0.5)
+                except Exception:
+                    pass
+
+            if not checked:
+                if event_callback:
+                    await event_callback("Checkbox", "error",
+                        f"Checkbox {idx} still unchecked after all attempts")
+
     except Exception as e:
         if event_callback:
-            await event_callback("Checkbox", "info", f"Coordinate click error: {e}")
+            await event_callback("Checkbox", "info", f"Checkbox click error: {e}")
 
-    # Step 7: Final check
+    # Step 4: Verify all checkboxes are checked BEFORE allowing Create Account click
     await asyncio.sleep(0.5)
     still_unchecked = await page.evaluate("""() =>
         Array.from(document.querySelectorAll('[role="checkbox"][aria-checked="false"]'))
@@ -144,7 +169,7 @@ async def check_workday_consent(page: Page, event_callback=None, max_wait_second
 
     if still_unchecked == 0:
         if event_callback:
-            await event_callback("Checkbox", "success", "All Workday checkboxes checked")
+            await event_callback("Checkbox", "success", "All Workday checkboxes confirmed checked")
         return True
     else:
         if event_callback:
