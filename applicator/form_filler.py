@@ -1040,33 +1040,41 @@ async def _dismiss_cookie_banners(page: Page):
 
 
 async def _check_for_captcha(page: Page) -> bool:
-    """Check if the page has a VISIBLE CAPTCHA that needs manual solving.
+    """Check if the page has a user-facing CAPTCHA challenge.
 
-    Only matches visible captcha iframes/challenge divs, not script tags
-    that merely load recaptcha JS in the background.
+    reCAPTCHA v3 (invisible) loads iframes and .g-recaptcha badge elements
+    that are technically in the DOM and even "visible", but they are tiny
+    (badge ~70x28, scoring iframe 0x0).  A real v2 checkbox/challenge or
+    hCaptcha widget is at least ~300x70.  We require minimum 70x65 to
+    distinguish an actual blocking challenge from background scoring.
     """
     return await page.evaluate("""
     () => {
-        function isVisible(el) {
+        function isChallengeSize(el) {
             if (!el) return false;
-            return el.offsetParent !== null || el.offsetWidth > 0 || el.offsetHeight > 0;
+            const r = el.getBoundingClientRect();
+            return r.width >= 70 && r.height >= 65;
         }
 
-        // Check for visible captcha iframes
+        // Check for large captcha iframes (v2 checkbox / hCaptcha widget)
         const captchaIframes = document.querySelectorAll(
-            'iframe[src*="recaptcha"], iframe[src*="hcaptcha"]'
+            'iframe[src*="recaptcha/api2"], iframe[src*="recaptcha/enterprise"], iframe[src*="hcaptcha"]'
         );
         for (const iframe of captchaIframes) {
-            if (isVisible(iframe)) return true;
+            if (isChallengeSize(iframe)) return true;
         }
 
-        // Check for visible captcha challenge divs
+        // Check for large captcha challenge divs
         const captchaDivs = document.querySelectorAll(
             '.g-recaptcha, .h-captcha, [class*="captcha-container"]'
         );
         for (const div of captchaDivs) {
-            if (isVisible(div)) return true;
+            if (isChallengeSize(div)) return true;
         }
+
+        // Check for the reCAPTCHA v2 overlay challenge popup
+        const overlay = document.querySelector('iframe[src*="recaptcha"][title*="challenge"]');
+        if (overlay && isChallengeSize(overlay)) return true;
 
         return false;
     }
