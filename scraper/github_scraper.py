@@ -2,6 +2,7 @@ import re
 import requests
 from bs4 import BeautifulSoup
 from config import GITHUB_REPO_URL
+from applicator.ats_profiles import detect_ats
 
 
 def fetch_readme() -> str:
@@ -90,6 +91,7 @@ def parse_internship_table(readme_text: str) -> list[dict]:
                 "location": location,
                 "url": url,
                 "date": age,
+                "ats": detect_ats(url) or "unknown",
             })
 
     return postings

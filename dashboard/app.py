@@ -203,6 +203,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             font-weight: 600;
         }
         .applied-row { opacity: 1; }
+        .ats-badge {
+            display: inline-block; padding: 1px 6px; border-radius: 3px;
+            font-size: 10px; margin-left: 4px; font-weight: 500;
+        }
+        .ats-workday { background: #2d1a4e; color: #a78bfa; }
+        .ats-lever { background: #1a3a1a; color: #4ade80; }
+        .ats-greenhouse { background: #1a3a3a; color: #5eead4; }
+        .ats-icims { background: #3a2a1a; color: #fb923c; }
+        .ats-ashby { background: #1a2a3a; color: #60a5fa; }
+        .ats-unknown { background: #222; color: #888; }
         .mark-applied-btn {
             background: #2563eb; color: #fff; border: none;
             padding: 4px 12px; border-radius: 4px; font-size: 11px;
@@ -355,6 +365,25 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 </div>
 
                 <div class="filter-group">
+                    <label>Portal Type</label>
+                    <select id="filterATS" onchange="applyFilters()">
+                        <option value="all" selected>All Portals</option>
+                        <option value="workday">Workday</option>
+                        <option value="lever">Lever</option>
+                        <option value="greenhouse">Greenhouse</option>
+                        <option value="icims">iCIMS</option>
+                        <option value="ashby">Ashby</option>
+                        <option value="smartrecruiters">SmartRecruiters</option>
+                        <option value="bamboohr">BambooHR</option>
+                        <option value="jobvite">Jobvite</option>
+                        <option value="successfactors">SuccessFactors</option>
+                        <option value="taleo">Taleo</option>
+                        <option value="workable">Workable</option>
+                        <option value="unknown">Other/Unknown</option>
+                    </select>
+                </div>
+
+                <div class="filter-group">
                     <label>Posted Within</label>
                     <select id="filterAge" onchange="applyFilters()">
                         <option value="all" selected>Any Time</option>
@@ -381,12 +410,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                             <th>Company</th>
                             <th>Role</th>
                             <th>Location</th>
+                            <th>Portal</th>
                             <th style="text-align:center">Age</th>
                             <th style="text-align:center">Action</th>
                         </tr>
                     </thead>
                     <tbody id="jobsBody">
-                        <tr><td colspan="5" class="loading-msg">Loading jobs...</td></tr>
+                        <tr><td colspan="6" class="loading-msg">Loading jobs...</td></tr>
                     </tbody>
                 </table>
             </div>
@@ -498,7 +528,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
         // ===== JOBS LIST =====
         function loadJobs() {
-            document.getElementById('jobsBody').innerHTML = '<tr><td colspan="5" class="loading-msg">Loading jobs from GitHub...</td></tr>';
+            document.getElementById('jobsBody').innerHTML = '<tr><td colspan="6" class="loading-msg">Loading jobs from GitHub...</td></tr>';
             document.getElementById('jobsCount').textContent = 'Loading...';
             // Load applied URLs first, then jobs
             fetch('/api/applied').then(r => r.json()).then(data => {
@@ -508,7 +538,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                     allJobs = data.jobs || [];
                     applyFilters();
                 }).catch(err => {
-                    document.getElementById('jobsBody').innerHTML = '<tr><td colspan="5" class="loading-msg">Failed to load jobs: ' + err + '</td></tr>';
+                    document.getElementById('jobsBody').innerHTML = '<tr><td colspan="6" class="loading-msg">Failed to load jobs: ' + err + '</td></tr>';
                 });
             });
         }
@@ -536,6 +566,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             const search = document.getElementById('filterSearch').value.toLowerCase();
             const locFilter = document.getElementById('filterLocation').value;
             const ageFilter = parseInt(document.getElementById('filterAge').value) || 0;
+            const atsFilter = document.getElementById('filterATS').value;
 
             let filtered = allJobs.filter(job => {
                 // Search filter
@@ -546,6 +577,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 if (locFilter === 'bayarea' && !isBayArea(job.location)) return false;
                 if (locFilter === 'california' && !isCalifornia(job.location) && !isUSRemote(job.location)) return false;
                 if (locFilter === 'remote' && !isUSRemote(job.location)) return false;
+                // ATS filter
+                if (atsFilter !== 'all' && job.ats !== atsFilter) return false;
                 // Age filter
                 if (ageFilter > 0) {
                     const days = parseInt(job.date) || 999;
@@ -555,13 +588,24 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             });
 
             renderJobs(filtered);
-            document.getElementById('jobsCount').textContent = filtered.length + ' of ' + allJobs.length + ' jobs shown';
+            // ATS breakdown
+            const atsCounts = {};
+            filtered.forEach(job => {
+                const ats = job.ats || 'unknown';
+                atsCounts[ats] = (atsCounts[ats] || 0) + 1;
+            });
+            const breakdown = Object.entries(atsCounts)
+                .sort((a, b) => b[1] - a[1])
+                .map(([k, v]) => k.charAt(0).toUpperCase() + k.slice(1) + ': ' + v)
+                .join(', ');
+            document.getElementById('jobsCount').innerHTML = filtered.length + ' of ' + allJobs.length + ' jobs shown' +
+                (breakdown ? '<br><span style="font-size:10px;color:#666">' + breakdown + '</span>' : '');
         }
 
         function renderJobs(jobs) {
             const tbody = document.getElementById('jobsBody');
             if (jobs.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="5" class="loading-msg">No jobs match your filters</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="6" class="loading-msg">No jobs match your filters</td></tr>';
                 return;
             }
             tbody.innerHTML = jobs.map((job, i) => {
@@ -573,10 +617,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 const escapedCompany = job.company.replace(/'/g, "\\\\'");
                 const escapedRole = job.role.replace(/'/g, "\\\\'");
                 const actionBtn = '<button class="apply-btn" onclick="selectJob(\\'' + escapedUrl + '\\', \\'' + escapedCompany + '\\', \\'' + escapedRole + '\\')">Apply</button>';
+                const ats = job.ats || 'unknown';
+                const atsClass = {'workday':'ats-workday','lever':'ats-lever','greenhouse':'ats-greenhouse','icims':'ats-icims','ashby':'ats-ashby'}[ats] || 'ats-unknown';
+                const atsBadge = '<span class="ats-badge ' + atsClass + '">' + ats + '</span>';
                 return '<tr class="' + rowClass + '">' +
                     '<td class="company-name">' + job.company + appliedBadge + '</td>' +
                     '<td class="role-name">' + job.role + '</td>' +
                     '<td class="location">' + job.location + locBadge + '</td>' +
+                    '<td>' + atsBadge + '</td>' +
                     '<td class="age">' + job.date + '</td>' +
                     '<td style="text-align:center">' + actionBtn + '</td>' +
                     '</tr>';
@@ -593,6 +641,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         function resetFilters() {
             document.getElementById('filterSearch').value = '';
             document.getElementById('filterLocation').value = 'all';
+            document.getElementById('filterATS').value = 'all';
             document.getElementById('filterAge').value = 'all';
             applyFilters();
         }
