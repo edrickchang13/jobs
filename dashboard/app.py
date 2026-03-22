@@ -1336,6 +1336,7 @@ async def continue_application_endpoint():
             if fields:
                 company = await page.evaluate("document.title") or ""
                 mappings = map_fields_to_profile(fields, "", company, "")
+                mappings = [m for m in mappings if isinstance(m, dict)]
                 async def on_evt(s, st, d=""):
                     add_event(s, st, d)
                 result = await fill_form(page, mappings, resume_path, event_callback=on_evt, screenshot_page=page)
@@ -1609,6 +1610,8 @@ async def _run_application(url: str, company: str, role: str):
                 add_event("Screenshot & Review", "info", f"Screenshot save failed: {e}")
 
         summary = result.get("summary", {})
+        if not isinstance(summary, dict):
+            summary = {"final_result": str(summary)}
         agent_steps = summary.get("steps", 0)
         # completed may already be True from Workday handler above
         if not completed:
@@ -1636,6 +1639,8 @@ async def _run_application(url: str, company: str, role: str):
                 fields = await page.evaluate(JS_EXTRACT_FIELDS)
                 if fields:
                     mappings = map_fields_to_profile(fields, jd, company, role)
+                    # Filter out non-dict elements (LLM may return malformed JSON with strings)
+                    mappings = [m for m in mappings if isinstance(m, dict)]
                     async def fallback_evt(s, st, d=""):
                         add_event(s, st, d)
                     fb_result = await fill_form(page, mappings, resume_path, event_callback=fallback_evt, screenshot_page=page)
@@ -1655,7 +1660,9 @@ async def _run_application(url: str, company: str, role: str):
                 else:
                     add_event("Fallback Filler", "info", "No extractable fields found for fallback filler.")
             except Exception as e:
-                add_event("Fallback Filler", "error", f"Fallback filler failed: {e}")
+                import traceback as _tb
+                tb_str = _tb.format_exc()
+                add_event("Fallback Filler", "error", f"Fallback filler failed: {e}\n{tb_str[:500]}")
             # Don't auto-mark as applied after fallback — let user review
             completed = False
 

@@ -267,7 +267,7 @@ Report what page you're on when you stop."""
                 pass
         if event_callback:
             await event_callback("Agent", "info", f"Navigation step {steps}")
-        # Check for CAPTCHA on current page
+        # Check for CAPTCHA on current page and wait for user to solve it
         try:
             page = await agent_instance.browser_session.get_current_page()
             if page:
@@ -278,8 +278,26 @@ Report what page you're on when you stop."""
                            document.querySelector('iframe[src*="recaptcha"]') !== null ||
                            document.querySelector('iframe[src*="hcaptcha"]') !== null;
                 }""")
-                if has_captcha and event_callback:
-                    await event_callback("CAPTCHA", "warning", "CAPTCHA detected! Please solve it in the browser window. Agent will wait...")
+                if has_captcha:
+                    if event_callback:
+                        await event_callback("CAPTCHA", "warning", "CAPTCHA detected! Please solve it in the browser window. Agent will wait up to 120s...")
+                    # Wait up to 120 seconds, checking every 2 seconds
+                    for _ in range(60):
+                        await asyncio.sleep(2)
+                        still_captcha = await page.evaluate("""() => {
+                            const html = document.documentElement.innerHTML.toLowerCase();
+                            return html.includes('recaptcha') || html.includes('hcaptcha') ||
+                                   html.includes('captcha-container') || html.includes('g-recaptcha') ||
+                                   document.querySelector('iframe[src*="recaptcha"]') !== null ||
+                                   document.querySelector('iframe[src*="hcaptcha"]') !== null;
+                        }""")
+                        if not still_captcha:
+                            if event_callback:
+                                await event_callback("CAPTCHA", "success", "CAPTCHA solved! Continuing...")
+                            break
+                    else:
+                        if event_callback:
+                            await event_callback("CAPTCHA", "warning", "CAPTCHA wait timed out after 120s. Continuing anyway...")
         except Exception:
             pass
 
@@ -2866,6 +2884,8 @@ async def fill_form(
     screenshot_page=None,
 ) -> dict:
     """Fill form fields using Playwright based on LLM mappings."""
+    # Filter out non-dict elements (LLM may return malformed JSON with strings)
+    mappings = [m for m in mappings if isinstance(m, dict)]
     filled = 0
     skipped = 0
     failed = 0
