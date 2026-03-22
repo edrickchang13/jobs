@@ -699,10 +699,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         function continueApplication() {
             var btn = document.getElementById('continueBtn');
             btn.disabled = true; btn.textContent = 'Analyzing...';
-            fetch('/continue', {method: 'POST'}).then(r => r.json()).then(data => {
+            addEvent({timestamp: new Date().toLocaleTimeString().slice(0,8), step: 'Continue', status: 'start', detail: 'Analyzing current page...'});
+            if (!screenshotSource) startScreenshotStream();
+            fetch('/continue', {method: 'POST'}).then(r => {
+                if (!r.ok) throw new Error('Server error: ' + r.status);
+                return r.json();
+            }).then(data => {
                 btn.disabled = false; btn.textContent = 'Continue';
-                if (!screenshotSource) startScreenshotStream();
-            }).catch(() => { btn.disabled = false; btn.textContent = 'Continue'; });
+                if (data.status === 'error') {
+                    addEvent({timestamp: new Date().toLocaleTimeString().slice(0,8), step: 'Continue', status: 'error', detail: data.message || 'Unknown error'});
+                }
+            }).catch(err => {
+                btn.disabled = false; btn.textContent = 'Continue';
+                addEvent({timestamp: new Date().toLocaleTimeString().slice(0,8), step: 'Continue', status: 'error', detail: 'Request failed: ' + err.message});
+            });
         }
 
         function triggerEmailVerify() {
@@ -973,25 +983,46 @@ async def screenshot_stream():
 @app.post("/continue")
 async def continue_application_endpoint():
     """Analyze current page and TAKE ACTION: fill credentials, run Workday handler, fill forms."""
-    global pipeline_running, latest_screenshot_b64, screenshot_version
+    global pipeline_running, latest_screenshot_b64, screenshot_version, active_page, active_context
+    print(">>> /continue endpoint called")
 
     page = active_page
+    print(f">>> active_page: {active_page}")
     if not page:
         # Fallback: try browser-use browser
+        print(">>> trying _bu_browser fallback...")
         try:
             from applicator.form_filler import _bu_browser
             if _bu_browser:
                 page = await _bu_browser.get_current_page()
-        except Exception:
-            pass
+                if page:
+                    print(f">>> _bu_browser fallback got page: {page.url}")
+                    active_page = page
+                    try:
+                        active_context = page.context
+                    except Exception:
+                        pass
+                else:
+                    print(">>> _bu_browser.get_current_page() returned None")
+            else:
+                print(">>> _bu_browser is None")
+        except Exception as e:
+            print(f">>> _bu_browser fallback failed: {e}")
 
     if not page:
-        return JSONResponse({"status": "error", "message": "No browser open"})
+        msg = "No browser page available. Start an application first."
+        print(f">>> FAIL: {msg}")
+        add_event("Continue", "error", msg)
+        return JSONResponse({"status": "error", "message": msg})
 
     # Verify page is alive
     try:
         current_url = page.url
-    except Exception:
+        print(f">>> page alive, url: {current_url[:80]}")
+    except Exception as e:
+        print(f">>> page dead: {e}")
+        active_page = None
+        add_event("Continue", "error", "Browser page closed. Start a new application.")
         return JSONResponse({"status": "error", "message": "Browser page closed"})
 
     # Screenshot
@@ -1411,12 +1442,23 @@ async def _run_application(url: str, company: str, role: str):
         completed = result.get("completed", False)
 
         # Set global page refs for Continue/Email Verify buttons
+        # If result didn't include a page, try getting it from _bu_browser directly
+        if not page:
+            try:
+                from applicator.form_filler import _bu_browser
+                if _bu_browser:
+                    page = await _bu_browser.get_current_page()
+                    add_event("Page Recovery", "info", f"Recovered page from browser-use: {page.url[:60] if page else 'None'}")
+            except Exception as e:
+                add_event("Page Recovery", "warning", f"Could not recover page: {e}")
+
         active_page = page
         if page:
             try:
                 active_context = page.context
             except Exception:
                 active_context = None
+        print(f">>> _run_application: active_page set to {active_page}")
 
         # Workday multi-step: if agent finished but didn't complete, try dedicated handler
         if page and not completed and ("workday" in url.lower() or "myworkdayjobs" in url.lower()):
