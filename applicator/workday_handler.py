@@ -182,6 +182,22 @@ async def check_workday_consent(page: Page, event_callback=None, max_wait_second
 check_workday_checkbox = check_workday_consent
 
 
+async def _verify_upload(page: Page) -> str:
+    """Check if a file upload succeeded. Returns filename or empty string."""
+    return await page.evaluate("""() => {
+        for (const fi of document.querySelectorAll('input[type="file"]')) {
+            if (fi.files && fi.files.length > 0) return fi.files[0].name;
+        }
+        for (const sel of ['.filename', '.file-name', '.resume-filename',
+                           '.attachment-filename', '[data-automation-id="file-upload-item"]',
+                           '[class*="upload-success"]', '[class*="attachment"]']) {
+            const el = document.querySelector(sel);
+            if (el && el.offsetParent !== null && el.innerText.trim()) return el.innerText.trim();
+        }
+        return '';
+    }""")
+
+
 async def upload_file_robust(page: Page, file_path: str, event_callback=None) -> bool:
     """Upload a file using multiple strategies. Works on Workday, Greenhouse, Lever."""
     if not file_path or not os.path.exists(file_path):
@@ -195,27 +211,33 @@ async def upload_file_robust(page: Page, file_path: str, event_callback=None) ->
         await event_callback("Upload", "info", f"Uploading: {fname}")
 
     # Check if already uploaded
-    already = await page.evaluate("""() => {
-        for (const sel of ['.filename','.file-name','[class*="upload-success"]','[data-automation-id="file-upload-item"]','[class*="attachment"]']) {
-            const el = document.querySelector(sel);
-            if (el && el.offsetParent !== null && el.innerText.trim()) return el.innerText.trim();
-        }
-        for (const fi of document.querySelectorAll('input[type="file"]')) {
-            if (fi.files && fi.files.length > 0) return fi.files[0].name;
-        }
-        return '';
-    }""")
+    already = await _verify_upload(page)
     if already:
         if event_callback:
             await event_callback("Upload", "info", f"Already uploaded: {already}")
         return True
 
-    # STRATEGY 1: Make hidden file inputs visible, set_input_files, dispatch change
+    # STRATEGY 1: Make hidden file inputs visible (+ parents), set_input_files, dispatch change+input
     try:
         count = await page.evaluate("""() => {
             const inputs = document.querySelectorAll('input[type="file"]');
             for (const inp of inputs) {
+                // Unhide the input itself
+                inp.removeAttribute('hidden');
                 inp.style.cssText = 'display:block!important;visibility:visible!important;opacity:1!important;position:relative!important;width:200px!important;height:30px!important;z-index:99999!important;';
+                // Unhide parent containers (Greenhouse wraps in hidden divs)
+                let el = inp.parentElement;
+                for (let depth = 0; el && depth < 5; depth++, el = el.parentElement) {
+                    const s = getComputedStyle(el);
+                    if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') {
+                        el.style.display = 'block';
+                        el.style.visibility = 'visible';
+                        el.style.opacity = '1';
+                    }
+                    if (el.hasAttribute('hidden')) el.removeAttribute('hidden');
+                }
+                // Remove accept restriction so any file type works
+                if (inp.hasAttribute('accept')) inp.removeAttribute('accept');
             }
             return inputs.length;
         }""")
@@ -233,18 +255,10 @@ async def upload_file_robust(page: Page, file_path: str, event_callback=None) ->
                 }
             }""")
             await asyncio.sleep(3)
-            has = await page.evaluate("() => { for (const i of document.querySelectorAll('input[type=\"file\"]')) { if (i.files && i.files.length > 0) return i.files[0].name; } return ''; }")
+            has = await _verify_upload(page)
             if has:
-                # Final verification: check for upload confirmation UI
-                verify = await page.evaluate("""() => {
-                    for (const sel of ['.filename', '.file-name', '.resume-filename', '.attachment-filename', '[data-automation-id="file-upload-item"]', '[class*="upload-success"]', '[class*="attachment"]']) {
-                        const el = document.querySelector(sel);
-                        if (el && el.offsetParent !== null && el.innerText.trim()) return el.innerText.trim();
-                    }
-                    return '';
-                }""")
                 if event_callback:
-                    await event_callback("Upload", "success", f"Uploaded via file input: {has}" + (f" (confirmed: {verify})" if verify else ""))
+                    await event_callback("Upload", "success", f"Strategy 1 (file input): {has}")
                 return True
     except Exception as e:
         if event_callback:
@@ -256,8 +270,9 @@ async def upload_file_robust(page: Page, file_path: str, event_callback=None) ->
         'a:has-text("Select files")', 'button:has-text("Select files")',
         'a:has-text("Attach")', 'button:has-text("Attach")',
         'a:has-text("Upload")', 'button:has-text("Upload")',
-        'a:has-text("Choose File")', 'label:has-text("Attach")',
-        'a.attachment-link',
+        'a:has-text("Choose File")', 'button:has-text("Choose File")',
+        'label:has-text("Attach")', 'label:has-text("Upload")',
+        'a.attachment-link', '[class*="upload"] a', '[class*="upload"] button',
     ]:
         try:
             link = page.locator(sel).first
@@ -268,22 +283,19 @@ async def upload_file_robust(page: Page, file_path: str, event_callback=None) ->
             chooser = await fc.value
             await chooser.set_files(abs_path)
             await asyncio.sleep(5)
-            # Final verification: check for upload confirmation UI
-            verify = await page.evaluate("""() => {
-                for (const s of ['.filename', '.file-name', '.resume-filename', '.attachment-filename', '[data-automation-id="file-upload-item"]', '[class*="upload-success"]', '[class*="attachment"]']) {
-                    const e = document.querySelector(s);
-                    if (e && e.offsetParent !== null && e.innerText.trim()) return e.innerText.trim();
-                }
-                return '';
-            }""")
+            has = await _verify_upload(page)
             if event_callback:
-                await event_callback("Upload", "success", f"Uploaded via file chooser: {sel[:40]}" + (f" (confirmed: {verify})" if verify else ""))
+                await event_callback("Upload", "success", f"Strategy 2 (file chooser): {sel[:40]}" + (f" ({has})" if has else ""))
             return True
         except Exception:
             continue
 
     # STRATEGY 3: Click drop zone + file chooser
-    for sel in ['[data-automation-id="file-upload-drop-zone"]', '[class*="dropzone"]', '[class*="drop-zone"]']:
+    for sel in [
+        '[data-automation-id="file-upload-drop-zone"]',
+        '[class*="dropzone"]', '[class*="drop-zone"]', '[class*="drop_zone"]',
+        '[class*="file-upload"]', '[class*="resume-upload"]',
+    ]:
         try:
             zone = page.locator(sel).first
             if not await zone.is_visible(timeout=1500):
@@ -293,21 +305,14 @@ async def upload_file_robust(page: Page, file_path: str, event_callback=None) ->
             chooser = await fc.value
             await chooser.set_files(abs_path)
             await asyncio.sleep(5)
-            # Final verification: check for upload confirmation UI
-            verify = await page.evaluate("""() => {
-                for (const s of ['.filename', '.file-name', '.resume-filename', '.attachment-filename', '[data-automation-id="file-upload-item"]', '[class*="upload-success"]', '[class*="attachment"]']) {
-                    const e = document.querySelector(s);
-                    if (e && e.offsetParent !== null && e.innerText.trim()) return e.innerText.trim();
-                }
-                return '';
-            }""")
+            has = await _verify_upload(page)
             if event_callback:
-                await event_callback("Upload", "success", f"Uploaded via drop zone: {sel[:40]}" + (f" (confirmed: {verify})" if verify else ""))
+                await event_callback("Upload", "success", f"Strategy 3 (drop zone): {sel[:40]}" + (f" ({has})" if has else ""))
             return True
         except Exception:
             continue
 
-    # STRATEGY 4: Programmatic drag-and-drop
+    # STRATEGY 4: Programmatic drag-and-drop via JS
     try:
         import base64
         with open(abs_path, "rb") as f:
@@ -319,29 +324,53 @@ async def upload_file_robust(page: Page, file_path: str, event_callback=None) ->
             for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
             const ext = name.split('.').pop().toLowerCase();
             const mimeMap = {pdf:'application/pdf', doc:'application/msword', docx:'application/vnd.openxmlformats-officedocument.wordprocessingml.document', txt:'text/plain', rtf:'application/rtf'};
-            const file = new File([bytes], name, {type: mimeMap[ext] || 'application/octet-stream'});
+            const mime = mimeMap[ext] || 'application/octet-stream';
+            const file = new File([bytes], name, {type: mime});
             const dt = new DataTransfer();
             dt.items.add(file);
+
+            // Try setting file input directly
+            let inputOk = false;
             const fi = document.querySelector('input[type="file"]');
-            if (fi) { fi.files = dt.files; fi.dispatchEvent(new Event('change', {bubbles: true})); }
-            const zone = document.querySelector('[data-automation-id="file-upload-drop-zone"], [class*="dropzone"]');
-            if (zone) {
-                zone.dispatchEvent(new DragEvent('dragenter', {dataTransfer: dt, bubbles: true}));
-                zone.dispatchEvent(new DragEvent('dragover', {dataTransfer: dt, bubbles: true}));
-                zone.dispatchEvent(new DragEvent('drop', {dataTransfer: dt, bubbles: true}));
+            if (fi) {
+                fi.files = dt.files;
+                fi.dispatchEvent(new Event('change', {bubbles: true}));
+                fi.dispatchEvent(new Event('input', {bubbles: true}));
+                inputOk = fi.files.length > 0;
             }
-            return fi || zone ? 'ok' : 'no target';
+
+            // Try drag-drop on all candidate zones
+            let dropOk = false;
+            const zoneSels = [
+                '[data-automation-id="file-upload-drop-zone"]',
+                '[class*="dropzone"]', '[class*="drop-zone"]',
+                '[class*="file-upload"]', '[class*="resume-upload"]',
+            ];
+            for (const zs of zoneSels) {
+                const zone = document.querySelector(zs);
+                if (!zone) continue;
+                const rect = zone.getBoundingClientRect();
+                const cx = rect.left + rect.width / 2;
+                const cy = rect.top + rect.height / 2;
+                const evtInit = {dataTransfer: dt, bubbles: true, cancelable: true, clientX: cx, clientY: cy};
+                zone.dispatchEvent(new DragEvent('dragenter', evtInit));
+                zone.dispatchEvent(new DragEvent('dragover', evtInit));
+                zone.dispatchEvent(new DragEvent('drop', evtInit));
+                dropOk = true;
+            }
+
+            return inputOk || dropOk ? 'ok' : 'no target';
         }""", [b64, fname])
         if dropped == "ok":
             await asyncio.sleep(5)
-            result = await page.evaluate("() => { for (const s of ['.filename','.file-name','.resume-filename','.attachment-filename','[data-automation-id=\"file-upload-item\"]','[class*=\"upload-success\"]','[class*=\"attachment\"]']) { const e = document.querySelector(s); if (e && e.offsetParent !== null && e.innerText.trim()) return e.innerText.trim(); } return ''; }")
+            result = await _verify_upload(page)
             if result:
                 if event_callback:
-                    await event_callback("Upload", "success", f"Drag-drop worked: {result}")
+                    await event_callback("Upload", "success", f"Strategy 4 (drag-drop): {result}")
                 return True
     except Exception as e:
         if event_callback:
-            await event_callback("Upload", "info", f"Drag-drop failed: {e}")
+            await event_callback("Upload", "info", f"Strategy 4 failed: {e}")
 
     if event_callback:
         await event_callback("Upload", "error", "All upload strategies failed. Upload manually in browser.")
