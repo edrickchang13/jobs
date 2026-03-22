@@ -627,6 +627,132 @@ JS_EXTRACT_FIELDS = """
         });
     }
 
+    // === role="combobox" and role="listbox" custom dropdowns ===
+    const comboboxes = form.querySelectorAll('[role="combobox"], [role="listbox"]');
+    for (const el of comboboxes) {
+        if (el.offsetParent === null) continue;
+        // Skip if already captured via React Select or Workday
+        const already = fields.some(f => {
+            try { return el.matches(f.selector) || el.closest(f.selector); } catch(e) { return false; }
+        });
+        if (already) continue;
+        const container = el.closest('.field, .form-group, .application-field, li, [class*="formField"]') || el.parentElement;
+        const lbl = container ? container.querySelector('label') : null;
+        const lblText = lbl ? lbl.innerText.trim() : (el.getAttribute('aria-label') || '');
+        const input = el.querySelector('input') || (el.tagName === 'INPUT' ? el : null);
+        fields.push({
+            selector: el.id ? '#' + CSS.escape(el.id) : '[role="' + el.getAttribute('role') + '"]',
+            tag: el.tagName.toLowerCase(),
+            type: 'custom-dropdown',
+            name: el.getAttribute('name') || (input ? input.name : '') || '',
+            label: lblText,
+            required: el.getAttribute('aria-required') === 'true',
+            value: input ? input.value : el.innerText.trim().substring(0, 100),
+            placeholder: input ? (input.placeholder || '') : '',
+            options: [],
+        });
+    }
+
+    // === intl-tel-input (ITI) phone country dropdowns ===
+    const itiContainers = form.querySelectorAll('.iti, [class*="intl-tel"], .iti__flag-container');
+    for (const el of itiContainers) {
+        if (el.offsetParent === null) continue;
+        const flagBtn = el.querySelector('.iti__selected-flag, .iti__flag-container');
+        if (!flagBtn) continue;
+        const already = fields.some(f => {
+            try { return el.contains(document.querySelector(f.selector)); } catch(e) { return false; }
+        });
+        if (already) continue;
+        fields.push({
+            selector: '.iti__selected-flag',
+            tag: 'div',
+            type: 'iti-country',
+            name: 'phone_country',
+            label: 'Phone Country',
+            required: false,
+            value: flagBtn.getAttribute('title') || '',
+            placeholder: '',
+            options: [],
+        });
+    }
+
+    // === Upload zones with labels containing "resume" or "cv" ===
+    const uploadLabels = form.querySelectorAll('label, .field-label, .upload-label, [class*="upload"], [class*="dropzone"], [class*="file-upload"], [data-automation-id*="upload"], [data-automation-id*="file"]');
+    for (const el of uploadLabels) {
+        if (el.offsetParent === null) continue;
+        const text = (el.innerText || '').toLowerCase();
+        if (!text.match(/resume|cv|cover.?letter|transcript|upload.*file|attach/i)) continue;
+        // Check if there's already a file input captured nearby
+        const container = el.closest('.field, .form-group, li, .application-field, [class*="upload"]') || el.parentElement;
+        const fileInput = container ? container.querySelector('input[type="file"]') : null;
+        if (fileInput) continue; // Already captured by standard input scan
+        const already = fields.some(f => f.type === 'file' && f.label.toLowerCase().includes('resume'));
+        if (already) continue;
+        const btn = container ? container.querySelector('button, a, [role="button"]') : null;
+        fields.push({
+            selector: btn ? getSelector(btn) : getSelector(el),
+            tag: 'div',
+            type: 'upload-zone',
+            name: 'resume_upload',
+            label: el.innerText.trim().substring(0, 80),
+            required: true,
+            value: '',
+            placeholder: '',
+            options: [],
+        });
+    }
+
+    // === Workday formField-* wrapper divs (interactive ones not yet captured) ===
+    const wdWrappers = form.querySelectorAll('[data-automation-id^="formField-"]');
+    for (const el of wdWrappers) {
+        if (el.offsetParent === null) continue;
+        const dataid = el.getAttribute('data-automation-id');
+        // Skip if already captured
+        if (fields.some(f => f.selector === '[data-automation-id="' + dataid + '"]')) continue;
+        // Only add if it has interactive content
+        const hasInteractive = el.querySelector('input, textarea, select, button, [role="button"], [role="combobox"], [role="listbox"]');
+        if (!hasInteractive) continue;
+        const label = el.querySelector('label');
+        const labelText = label ? label.innerText.trim() : dataid.replace('formField-', '').replace(/-/g, ' ');
+        const btn = el.querySelector('button');
+        const input = el.querySelector('input');
+        fields.push({
+            selector: '[data-automation-id="' + dataid + '"]',
+            tag: 'div',
+            type: btn ? 'workday-dropdown' : (input ? input.type : 'workday-field'),
+            name: dataid,
+            label: labelText,
+            required: el.querySelector('[required]') !== null || el.querySelector('[aria-required="true"]') !== null,
+            value: btn ? btn.innerText.trim() : (input ? input.value : ''),
+            placeholder: input ? (input.placeholder || '') : '',
+            options: [],
+        });
+    }
+
+    // === Interactive [data-automation-id] elements (buttons, inputs, dropdowns) ===
+    const wdInteractive = form.querySelectorAll('[data-automation-id]:is(button, input, select, textarea, [role="button"], [role="combobox"])');
+    for (const el of wdInteractive) {
+        if (el.offsetParent === null) continue;
+        const dataid = el.getAttribute('data-automation-id') || '';
+        // Skip non-form elements
+        if (['click_filter', 'uiAction', 'Apply'].some(s => dataid.includes(s))) continue;
+        // Skip if already captured
+        if (fields.some(f => f.selector.includes(dataid))) continue;
+        const container = el.closest('[data-automation-id^="formField-"]') || el.parentElement;
+        const label = container ? container.querySelector('label') : null;
+        fields.push({
+            selector: '[data-automation-id="' + dataid + '"]',
+            tag: el.tagName.toLowerCase(),
+            type: el.tagName === 'BUTTON' || el.getAttribute('role') === 'button' ? 'workday-dropdown' : (el.type || 'text'),
+            name: dataid,
+            label: label ? label.innerText.trim() : dataid.replace(/-/g, ' '),
+            required: el.required || el.getAttribute('aria-required') === 'true',
+            value: el.value || el.innerText.trim().substring(0, 100),
+            placeholder: el.placeholder || '',
+            options: [],
+        });
+    }
+
     return fields;
 }
 """
@@ -642,11 +768,15 @@ def _get_llm_client():
 def _parse_json_response(text: str) -> list:
     """Parse JSON from LLM response, handling markdown fences and think tags."""
     # Strip <think>...</think> tags aggressively (Qwen 3) - handle partial, nested, unclosed
-    text = re.sub(r'<think>[\s\S]*?</think>', '', text, flags=re.DOTALL)
+    # First pass: remove complete think blocks (greedy to handle nested)
+    while '<think>' in text and '</think>' in text:
+        text = re.sub(r'<think>[\s\S]*?</think>', '', text, flags=re.DOTALL)
     # Handle unclosed <think> tags (model cut off mid-think)
     text = re.sub(r'<think>[\s\S]*$', '', text, flags=re.DOTALL)
     # Handle orphan </think> at start
     text = re.sub(r'^[\s\S]*?</think>', '', text, flags=re.DOTALL)
+    # Strip any remaining think tags
+    text = re.sub(r'</?think>', '', text)
     # Strip markdown code fences
     text = re.sub(r'```json\s*', '', text)
     text = re.sub(r'```\s*', '', text)
@@ -854,8 +984,12 @@ Write the cover letter. Do NOT use "Dear Hiring Manager" or other generic opener
         ],
     )
     raw = response.choices[0].message.content
-    # Strip think tags
-    raw = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL)
+    # Strip think tags aggressively
+    while '<think>' in raw and '</think>' in raw:
+        raw = re.sub(r'<think>[\s\S]*?</think>', '', raw, flags=re.DOTALL)
+    raw = re.sub(r'<think>[\s\S]*$', '', raw, flags=re.DOTALL)
+    raw = re.sub(r'^[\s\S]*?</think>', '', raw, flags=re.DOTALL)
+    raw = re.sub(r'</?think>', '', raw)
     return raw.strip()
 
 
@@ -2052,18 +2186,19 @@ def _is_dropdown_match(option_text: str, target_value: str) -> bool:
 
     # Check aliases
     aliases = {
-        "united states": ["us", "usa", "united states of america", "u.s.", "u.s.a.", "united states (us)"],
+        "united states": ["us", "usa", "united states of america", "u.s.", "u.s.a.", "united states (us)", "united states of america (usa)", "us (+1)"],
         "no": ["none", "n/a", "not applicable"],
         "yes": ["y"],
-        "male": ["man", "m", "he/him"],
-        "female": ["woman", "f", "she/her"],
-        "job board": ["online", "internet", "website", "web", "other", "job site", "jobs board"],
-        "linkedin": ["job board", "online", "internet", "other"],
-        "asian": ["asian or pacific islander", "asian american", "asian (not hispanic)"],
-        "bachelor": ["bachelor's", "bachelors", "bachelor's degree", "4-year degree", "undergraduate"],
-        "i do not wish to answer": ["prefer not to say", "decline to self-identify", "prefer not to answer", "decline", "choose not to disclose"],
-        "i am not a protected veteran": ["not a veteran", "non-veteran", "i am not a veteran", "not a protected veteran", "i am not"],
-        "california": ["ca"],
+        "male": ["man", "m", "he/him", "he / him", "he/him/his"],
+        "female": ["woman", "f", "she/her", "she / her", "she/her/hers"],
+        "job board": ["online", "internet", "website", "web", "other", "job site", "jobs board", "linkedin", "online job board"],
+        "linkedin": ["job board", "online", "internet", "other", "online job board", "job site"],
+        "asian": ["asian or pacific islander", "asian american", "asian (not hispanic)", "asian / pacific islander", "asian or asian american"],
+        "bachelor": ["bachelor's", "bachelors", "bachelor's degree", "4-year degree", "undergraduate", "bachelor of science", "bs", "b.s."],
+        "i do not wish to answer": ["prefer not to say", "decline to self-identify", "prefer not to answer", "decline", "choose not to disclose", "i don't wish to answer", "prefer not to disclose", "i choose not to disclose"],
+        "i am not a protected veteran": ["not a veteran", "non-veteran", "i am not a veteran", "not a protected veteran", "i am not", "i am not a protected veteran (or) i am not a veteran", "no, i am not a protected veteran"],
+        "california": ["ca", "calif", "calif."],
+        "no, i don't have a disability": ["no disability", "i do not have a disability", "no, i don't have a disability, or a history/record of having a disability", "none"],
     }
 
     # Collect all acceptable matches
@@ -2246,14 +2381,18 @@ async def _handle_custom_dropdown(page, selector: str, value: str, event_callbac
 
         clicked = await page.evaluate("""(targetValue) => {
             const aliases = {
-                "united states": ["us", "usa", "united states of america"],
-                "job board": ["online", "internet", "website", "other", "linkedin"],
-                "linkedin": ["job board", "online", "internet", "other"],
-                "asian": ["asian or pacific islander", "asian american"],
-                "no": ["none", "n/a"],
-                "california": ["ca"],
-                "i do not wish to answer": ["prefer not to say", "decline to self-identify", "decline"],
-                "i am not a protected veteran": ["not a veteran", "i am not a veteran"],
+                "united states": ["us", "usa", "united states of america", "u.s.", "u.s.a.", "united states (us)", "us (+1)"],
+                "job board": ["online", "internet", "website", "other", "linkedin", "online job board", "job site"],
+                "linkedin": ["job board", "online", "internet", "other", "online job board"],
+                "asian": ["asian or pacific islander", "asian american", "asian (not hispanic)", "asian or asian american"],
+                "no": ["none", "n/a", "not applicable"],
+                "california": ["ca", "calif"],
+                "male": ["man", "he/him", "he / him", "he/him/his"],
+                "female": ["woman", "she/her", "she / her"],
+                "bachelor": ["bachelor's", "bachelors", "bachelor's degree", "4-year degree", "undergraduate"],
+                "i do not wish to answer": ["prefer not to say", "decline to self-identify", "decline", "prefer not to answer", "choose not to disclose", "i don't wish to answer"],
+                "i am not a protected veteran": ["not a veteran", "i am not a veteran", "not a protected veteran", "non-veteran", "no, i am not a protected veteran"],
+                "no, i don't have a disability": ["no disability", "i do not have a disability", "none"],
             };
             const target = targetValue.toLowerCase().trim();
             let acceptable = [target];
