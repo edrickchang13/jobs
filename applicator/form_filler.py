@@ -1822,8 +1822,11 @@ async def _handle_workday_auth(page, event_callback=None) -> bool:
         }}""")
 
     # Terms/privacy/consent checkboxes — use robust Workday handler
-    from applicator.workday_handler import check_workday_checkbox
-    await check_workday_checkbox(page, event_callback)
+    from applicator.workday_handler import check_workday_consent
+    checkbox_ok = await check_workday_consent(page, event_callback)
+    if not checkbox_ok:
+        await _log("Checkbox not confirmed. Create Account may fail.")
+
 
     await page.wait_for_timeout(500)
 
@@ -2271,7 +2274,13 @@ async def _handle_phone_country(page_or_frame, target_country: str = "United Sta
 
 
 async def _handle_resume_upload(page_or_frame, resume_path: str, event_callback=None) -> bool:
-    """Robust resume upload handling for Greenhouse, Lever, Workday etc."""
+    """Robust resume upload — delegates to workday_handler.upload_file_robust."""
+    try:
+        from applicator.workday_handler import upload_file_robust
+        return await upload_file_robust(page_or_frame, resume_path, event_callback)
+    except Exception:
+        pass
+    # Fallback if import fails
     if not resume_path or not os.path.exists(resume_path):
         if event_callback:
             await event_callback("Fill Form", "error", f"Resume not found: {resume_path}")

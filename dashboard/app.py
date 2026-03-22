@@ -1040,10 +1040,13 @@ async def continue_application_endpoint():
                     await vp.fill(pw, timeout=3000)
             except Exception:
                 pass
-            # Check ALL checkboxes (privacy, terms, consent) using robust handler
-            from applicator.workday_handler import check_workday_checkbox
-            await check_workday_checkbox(page, event_callback=lambda s, st, d: add_event(s, st, d))
-            await page.wait_for_timeout(1000)
+            # Check consent checkboxes — click the click_filter inside them
+            from applicator.workday_handler import check_workday_consent
+            checkbox_ok = await check_workday_consent(page, event_callback=lambda s, st, d: add_event(s, st, d))
+
+            if not checkbox_ok and state.get("hasCreateAccount"):
+                add_event("Continue", "error", "Checkbox not checked. Please check it manually, then click Continue.")
+                return JSONResponse({"status": "ok", "action": "checkbox_failed"})
 
             # Click appropriate button
             clicked = False

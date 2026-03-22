@@ -11,140 +11,271 @@ from pathlib import Path
 from playwright.async_api import Page
 
 
-async def check_workday_checkbox(page: Page, event_callback=None) -> bool:
-    """Check ALL unchecked Workday checkboxes (privacy, terms, consent).
-    Handles custom components with click_filter overlays."""
-    checked_any = False
+async def check_workday_consent(page: Page, event_callback=None, max_wait_seconds=15) -> bool:
+    """Check Workday consent checkboxes by clicking the click_filter overlay inside them.
 
-    # STRATEGY 1: role="checkbox" with aria-checked="false" — set directly + click
-    try:
-        result = await page.evaluate("""() => {
-            const checked = [];
-            document.querySelectorAll('[role="checkbox"][aria-checked="false"]').forEach(el => {
-                if (el.offsetParent !== null) {
-                    el.setAttribute('aria-checked', 'true');
-                    el.click();
-                    el.dispatchEvent(new Event('change', {bubbles: true}));
-                    checked.push(el.getAttribute('data-automation-id') || 'role-cb');
-                }
-            });
-            return checked;
+    Workday puts a transparent div[data-automation-id="click_filter"] on top of every
+    interactive element. This IS the intended click target — Workday's event delegation
+    listens for clicks on click_filter and updates framework state. Clicking the checkbox
+    element directly bypasses this and the state never changes.
+    """
+
+    if event_callback:
+        await event_callback("Checkbox", "info", "Waiting for consent checkbox...")
+
+    # Step 1: Wait for checkbox to appear
+    for i in range(max_wait_seconds * 2):
+        has = await page.evaluate("""() => {
+            for (const cb of document.querySelectorAll('[role="checkbox"]'))
+                if (cb.offsetParent !== null) return true;
+            return false;
         }""")
-        if result:
-            checked_any = True
+        if has:
             if event_callback:
-                await event_callback("Fill Form", "info", f"Checked role=checkbox: {result}")
-    except Exception:
-        pass
+                await event_callback("Checkbox", "info", f"Checkbox appeared after {i * 0.5}s")
+            break
+        await asyncio.sleep(0.5)
+    else:
+        if event_callback:
+            await event_callback("Checkbox", "info", "No checkbox found — may not be required")
+        return True  # No checkbox = nothing to check = proceed
 
-    # STRATEGY 2: Hidden input[type=checkbox] — set .checked = true
-    try:
-        result2 = await page.evaluate("""() => {
-            const checked = [];
-            document.querySelectorAll('input[type="checkbox"]').forEach(el => {
-                if (!el.checked) {
-                    el.checked = true;
-                    el.dispatchEvent(new Event('change', {bubbles: true}));
-                    el.dispatchEvent(new Event('click', {bubbles: true}));
-                    checked.push(el.name || el.id || 'input-cb');
-                }
+    # Step 2: Wait for Workday to finish rendering + attach event handlers
+    await asyncio.sleep(2)
+
+    # Step 3: Click the click_filter INSIDE each unchecked checkbox
+    result = await page.evaluate("""() => {
+        const results = [];
+        for (const cb of document.querySelectorAll('[role="checkbox"]')) {
+            if (cb.offsetParent === null) continue;
+            if (cb.getAttribute('aria-checked') === 'true') continue;
+
+            // Find the click_filter overlay inside this checkbox
+            const filter = cb.querySelector('[data-automation-id="click_filter"]');
+            const target = filter || cb.querySelector('div');
+            if (!target) continue;
+
+            const rect = target.getBoundingClientRect();
+            const x = rect.left + rect.width / 2;
+            const y = rect.top + rect.height / 2;
+            const opts = {bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, screenX: x, screenY: y};
+
+            target.dispatchEvent(new PointerEvent('pointerdown', opts));
+            target.dispatchEvent(new MouseEvent('mousedown', opts));
+            target.dispatchEvent(new PointerEvent('pointerup', opts));
+            target.dispatchEvent(new MouseEvent('mouseup', opts));
+            target.dispatchEvent(new MouseEvent('click', opts));
+
+            results.push({
+                method: filter ? 'click_filter' : 'child_div',
+                dataId: cb.getAttribute('data-automation-id') || '',
+                after: cb.getAttribute('aria-checked'),
             });
-            return checked;
-        }""")
-        if result2:
-            checked_any = True
-            if event_callback:
-                await event_callback("Fill Form", "info", f"Checked input[checkbox]: {result2}")
-    except Exception:
-        pass
+        }
+        return results;
+    }""")
 
-    # STRATEGY 3: Click container label (not the overlay)
-    if not checked_any:
-        try:
-            result3 = await page.evaluate("""() => {
-                const checked = [];
-                const sels = '[data-automation-id*="checkbox"], [data-automation-id*="Checkbox"], ' +
-                    '[data-automation-id*="agreement"], [data-automation-id*="consent"], ' +
-                    '[data-automation-id*="acknowledge"], [data-automation-id*="privacy"]';
-                document.querySelectorAll(sels).forEach(container => {
-                    if (container.offsetParent === null) return;
-                    const label = container.querySelector('label, span:not([data-automation-id="click_filter"])');
-                    if (label && label.offsetParent !== null) {
-                        label.click();
-                        checked.push(container.getAttribute('data-automation-id') || 'label-click');
-                    }
-                });
-                return checked;
-            }""")
-            if result3:
-                checked_any = True
-                if event_callback:
-                    await event_callback("Fill Form", "info", f"Checked via label: {result3}")
-        except Exception:
-            pass
+    if event_callback:
+        await event_callback("Checkbox", "info", f"Click filter results: {result}")
 
-    # STRATEGY 4: Playwright force click (bypasses overlays)
-    if not checked_any:
-        try:
-            cbs = page.locator('[role="checkbox"], [data-automation-id*="checkbox" i], [data-automation-id*="agreement" i]')
-            count = await cbs.count()
-            for i in range(count):
-                cb = cbs.nth(i)
-                if await cb.is_visible(timeout=1000):
-                    aria = await cb.get_attribute("aria-checked")
-                    if aria == "false" or aria is None:
-                        await cb.click(force=True, timeout=3000)
-                        checked_any = True
+    # Step 4: Wait for framework to process
+    await asyncio.sleep(1)
+
+    # Step 5: Verify
+    unchecked = await page.evaluate("""() =>
+        Array.from(document.querySelectorAll('[role="checkbox"][aria-checked="false"]'))
+            .filter(el => el.offsetParent !== null).length
+    """)
+
+    if unchecked == 0:
+        if event_callback:
+            await event_callback("Checkbox", "success", "All checkboxes confirmed checked")
+        return True
+
+    # Step 6: Fallback — Playwright mouse.click at exact center coordinates
+    if event_callback:
+        await event_callback("Checkbox", "info", "click_filter didn't work, trying coordinate click...")
+
+    try:
+        cbs = page.locator('[role="checkbox"][aria-checked="false"]')
+        count = await cbs.count()
+        for i in range(count):
+            cb = cbs.nth(i)
+            if await cb.is_visible(timeout=1000):
+                box = await cb.bounding_box()
+                if box:
+                    cx = box['x'] + box['width'] / 2
+                    cy = box['y'] + box['height'] / 2
+                    await page.mouse.click(cx, cy)
+                    await asyncio.sleep(1)
+                    state = await cb.get_attribute("aria-checked")
+                    if state == "true":
                         if event_callback:
-                            await event_callback("Fill Form", "info", f"Force-clicked checkbox {i}")
-        except Exception:
-            pass
+                            await event_callback("Checkbox", "success", f"Checked via mouse.click({cx:.0f},{cy:.0f})")
+    except Exception as e:
+        if event_callback:
+            await event_callback("Checkbox", "info", f"Coordinate click error: {e}")
 
-    # STRATEGY 5: Click any element with privacy/agree text
-    if not checked_any:
-        try:
-            result5 = await page.evaluate("""() => {
-                for (const el of document.querySelectorAll('div, label, span')) {
-                    const t = el.innerText.toLowerCase();
-                    if ((t.includes('privacy') || t.includes('agree') || t.includes('acknowledge') || t.includes('reviewed'))
-                        && el.offsetParent !== null && el.getBoundingClientRect().height < 100) {
-                        el.click();
-                        return 'clicked: ' + t.substring(0, 60);
+    # Step 7: Final check
+    await asyncio.sleep(0.5)
+    still_unchecked = await page.evaluate("""() =>
+        Array.from(document.querySelectorAll('[role="checkbox"][aria-checked="false"]'))
+            .filter(el => el.offsetParent !== null).length
+    """)
+
+    if still_unchecked == 0:
+        if event_callback:
+            await event_callback("Checkbox", "success", "All Workday checkboxes checked")
+        return True
+    else:
+        if event_callback:
+            await event_callback("Checkbox", "error",
+                f"{still_unchecked} checkbox(es) still unchecked. Please check manually, then click Continue.")
+        return False
+
+
+# Keep old name as alias for backwards compatibility
+check_workday_checkbox = check_workday_consent
+
+
+async def upload_file_robust(page: Page, file_path: str, event_callback=None) -> bool:
+    """Upload a file using multiple strategies. Works on Workday, Greenhouse, Lever."""
+    if not file_path or not os.path.exists(file_path):
+        if event_callback:
+            await event_callback("Upload", "error", f"File not found: {file_path}")
+        return False
+
+    abs_path = os.path.abspath(file_path)
+    fname = os.path.basename(abs_path)
+    if event_callback:
+        await event_callback("Upload", "info", f"Uploading: {fname}")
+
+    # Check if already uploaded
+    already = await page.evaluate("""() => {
+        for (const sel of ['.filename','.file-name','[class*="upload-success"]','[data-automation-id="file-upload-item"]','[class*="attachment"]']) {
+            const el = document.querySelector(sel);
+            if (el && el.offsetParent !== null && el.innerText.trim()) return el.innerText.trim();
+        }
+        for (const fi of document.querySelectorAll('input[type="file"]')) {
+            if (fi.files && fi.files.length > 0) return fi.files[0].name;
+        }
+        return '';
+    }""")
+    if already:
+        if event_callback:
+            await event_callback("Upload", "info", f"Already uploaded: {already}")
+        return True
+
+    # STRATEGY 1: Make hidden file inputs visible, set_input_files, dispatch change
+    try:
+        count = await page.evaluate("""() => {
+            const inputs = document.querySelectorAll('input[type="file"]');
+            for (const inp of inputs) {
+                inp.style.cssText = 'display:block!important;visibility:visible!important;opacity:1!important;position:relative!important;width:200px!important;height:30px!important;z-index:99999!important;';
+            }
+            return inputs.length;
+        }""")
+        if count > 0:
+            await asyncio.sleep(0.5)
+            fi = page.locator('input[type="file"]').first
+            await fi.set_input_files(abs_path, timeout=10000)
+            await asyncio.sleep(1)
+            await page.evaluate("""() => {
+                for (const inp of document.querySelectorAll('input[type="file"]')) {
+                    if (inp.files && inp.files.length > 0) {
+                        inp.dispatchEvent(new Event('change', {bubbles: true}));
+                        inp.dispatchEvent(new Event('input', {bubbles: true}));
                     }
                 }
-                return '';
             }""")
-            if result5:
-                checked_any = True
+            await asyncio.sleep(3)
+            has = await page.evaluate("() => { for (const i of document.querySelectorAll('input[type=\"file\"]')) { if (i.files && i.files.length > 0) return i.files[0].name; } return ''; }")
+            if has:
                 if event_callback:
-                    await event_callback("Fill Form", "info", f"Privacy click: {result5}")
-        except Exception:
-            pass
+                    await event_callback("Upload", "success", f"Uploaded via file input: {has}")
+                return True
+    except Exception as e:
+        if event_callback:
+            await event_callback("Upload", "info", f"Strategy 1 failed: {e}")
 
-    # STRATEGY 6: Focus + Space key
-    if not checked_any:
+    # STRATEGY 2: Click "Select files" / "Attach" link + file chooser
+    for sel in [
+        '[data-automation-id="file-upload-drop-zone"] a',
+        'a:has-text("Select files")', 'button:has-text("Select files")',
+        'a:has-text("Attach")', 'button:has-text("Attach")',
+        'a:has-text("Upload")', 'button:has-text("Upload")',
+        'a:has-text("Choose File")', 'label:has-text("Attach")',
+        'a.attachment-link',
+    ]:
         try:
-            await page.evaluate("""() => {
-                const cb = document.querySelector('[role="checkbox"], [data-automation-id*="checkbox" i]');
-                if (cb) cb.focus();
-            }""")
-            await page.keyboard.press("Space")
-            await page.wait_for_timeout(500)
-            is_checked = await page.evaluate("""() => {
-                const cb = document.querySelector('[role="checkbox"]');
-                return cb ? cb.getAttribute('aria-checked') : 'none';
-            }""")
-            if is_checked == "true":
-                checked_any = True
-                if event_callback:
-                    await event_callback("Fill Form", "info", "Checked via Space key")
+            link = page.locator(sel).first
+            if not await link.is_visible(timeout=1500):
+                continue
+            async with page.expect_file_chooser(timeout=8000) as fc:
+                await link.click(force=True, timeout=5000)
+            chooser = await fc.value
+            await chooser.set_files(abs_path)
+            await asyncio.sleep(5)
+            if event_callback:
+                await event_callback("Upload", "success", f"Uploaded via file chooser: {sel[:40]}")
+            return True
         except Exception:
-            pass
+            continue
 
-    if not checked_any and event_callback:
-        await event_callback("Fill Form", "warning", "Could not check any checkbox — may need manual click")
+    # STRATEGY 3: Click drop zone + file chooser
+    for sel in ['[data-automation-id="file-upload-drop-zone"]', '[class*="dropzone"]', '[class*="drop-zone"]']:
+        try:
+            zone = page.locator(sel).first
+            if not await zone.is_visible(timeout=1500):
+                continue
+            async with page.expect_file_chooser(timeout=8000) as fc:
+                await zone.click(force=True, timeout=5000)
+            chooser = await fc.value
+            await chooser.set_files(abs_path)
+            await asyncio.sleep(5)
+            if event_callback:
+                await event_callback("Upload", "success", f"Uploaded via drop zone: {sel[:40]}")
+            return True
+        except Exception:
+            continue
 
-    return checked_any
+    # STRATEGY 4: Programmatic drag-and-drop
+    try:
+        import base64
+        with open(abs_path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode()
+        dropped = await page.evaluate("""(args) => {
+            const [b64, name] = args;
+            const bin = atob(b64);
+            const bytes = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+            const file = new File([bytes], name, {type: 'application/pdf'});
+            const dt = new DataTransfer();
+            dt.items.add(file);
+            const fi = document.querySelector('input[type="file"]');
+            if (fi) { fi.files = dt.files; fi.dispatchEvent(new Event('change', {bubbles: true})); }
+            const zone = document.querySelector('[data-automation-id="file-upload-drop-zone"], [class*="dropzone"]');
+            if (zone) {
+                zone.dispatchEvent(new DragEvent('dragenter', {dataTransfer: dt, bubbles: true}));
+                zone.dispatchEvent(new DragEvent('dragover', {dataTransfer: dt, bubbles: true}));
+                zone.dispatchEvent(new DragEvent('drop', {dataTransfer: dt, bubbles: true}));
+            }
+            return fi || zone ? 'ok' : 'no target';
+        }""", [b64, fname])
+        if dropped == "ok":
+            await asyncio.sleep(5)
+            result = await page.evaluate("() => { for (const s of ['.filename','.file-name','[data-automation-id=\"file-upload-item\"]']) { const e = document.querySelector(s); if (e && e.innerText.trim()) return e.innerText.trim(); } return ''; }")
+            if result:
+                if event_callback:
+                    await event_callback("Upload", "success", f"Drag-drop worked: {result}")
+                return True
+    except Exception as e:
+        if event_callback:
+            await event_callback("Upload", "info", f"Drag-drop failed: {e}")
+
+    if event_callback:
+        await event_callback("Upload", "error", "All upload strategies failed. Upload manually in browser.")
+    return False
 
 
 def _load_personal_info() -> dict:
@@ -215,58 +346,25 @@ async def handle_my_experience(page: Page, resume_path: str, event_callback=None
 
     # --- Resume Upload ---
     if resume_path and os.path.exists(resume_path):
-        uploaded = False
-
-        # Strategy 1: Make hidden file input visible
-        try:
-            count = await page.evaluate("""() => {
-                const inputs = document.querySelectorAll('input[type="file"]');
-                for (const inp of inputs) {
-                    inp.style.display = 'block'; inp.style.visibility = 'visible';
-                    inp.style.opacity = '1'; inp.style.position = 'relative';
-                    inp.style.height = '30px'; inp.style.width = '200px'; inp.style.zIndex = '99999';
+        # Scroll to Resume/CV section
+        await page.evaluate("""() => {
+            for (const h of document.querySelectorAll('h3, h4, [class*="header"]')) {
+                if (h.innerText.toLowerCase().includes('resume') || h.innerText.toLowerCase().includes('cv')) {
+                    h.scrollIntoView({behavior: 'smooth', block: 'center'});
+                    return;
                 }
-                return inputs.length;
-            }""")
-            if count > 0:
-                await page.locator('input[type="file"]').first.set_input_files(resume_path, timeout=10000)
-                await page.wait_for_timeout(5000)
-                uploaded = True
-                filled += 1
-                if event_callback:
-                    await event_callback("Fill Form", "success", "Resume uploaded via file input")
-        except Exception as e:
+            }
+            window.scrollTo(0, document.body.scrollHeight / 2);
+        }""")
+        await asyncio.sleep(1)
+
+        if await upload_file_robust(page, resume_path, event_callback):
+            filled += 1
             if event_callback:
-                await event_callback("Fill Form", "info", f"File input failed: {e}")
-
-        # Strategy 2: Click "Select files" link + file chooser
-        if not uploaded:
-            for sel in [
-                '[data-automation-id="file-upload-drop-zone"] a',
-                'a:has-text("Select files")',
-                'button:has-text("Select files")',
-                '[data-automation-id="file-upload-drop-zone"]',
-            ]:
-                try:
-                    link = page.locator(sel).first
-                    if await link.is_visible(timeout=2000):
-                        async with page.expect_file_chooser(timeout=10000) as fc:
-                            await link.click(timeout=5000)
-                        chooser = await fc.value
-                        await chooser.set_files(resume_path)
-                        await page.wait_for_timeout(5000)
-                        uploaded = True
-                        filled += 1
-                        if event_callback:
-                            await event_callback("Fill Form", "success", f"Resume uploaded via {sel[:40]}")
-                        break
-                except Exception:
-                    continue
-
-        if not uploaded:
+                await event_callback("Upload", "info", "Waiting for Workday to parse resume...")
+            await asyncio.sleep(5)
+        else:
             errors.append("Resume upload failed on My Experience")
-            if event_callback:
-                await event_callback("Fill Form", "error", "All resume upload strategies failed")
 
     # --- Education ---
     if event_callback:
