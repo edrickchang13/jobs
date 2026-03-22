@@ -2391,99 +2391,208 @@ async def _handle_phone_country(page_or_frame, target_country: str = "United Sta
 
 
 async def _handle_resume_upload(page_or_frame, resume_path: str, event_callback=None) -> bool:
-    """Robust resume upload — delegates to workday_handler.upload_file_robust."""
+    """Robust resume upload — delegates to workday_handler.upload_file_robust.
+
+    Tries 4 strategies in order:
+    1. Make hidden file inputs visible (+ parents), set_input_files, dispatch change+input
+    2. Click "Select files" link, intercept file chooser
+    3. Click drop zone div, intercept file chooser
+    4. Programmatic drag-and-drop via JS DataTransfer
+    """
     try:
         from applicator.workday_handler import upload_file_robust
         return await upload_file_robust(page_or_frame, resume_path, event_callback)
     except Exception:
         pass
-    # Fallback if import fails
+
+    # Fallback if import fails — mirrors upload_file_robust logic
     if not resume_path or not os.path.exists(resume_path):
         if event_callback:
             await event_callback("Fill Form", "error", f"Resume not found: {resume_path}")
         return False
 
+    abs_path = os.path.abspath(resume_path)
+    fname = os.path.basename(abs_path)
+
+    # Helper: check if upload succeeded
+    async def _check_upload():
+        return await page_or_frame.evaluate("""() => {
+            for (const fi of document.querySelectorAll('input[type="file"]')) {
+                if (fi.files && fi.files.length > 0) return fi.files[0].name;
+            }
+            for (const sel of ['.filename', '.file-name', '.resume-filename',
+                               '.attachment-filename', '[data-automation-id="file-upload-item"]',
+                               '[class*="upload-success"]', '[class*="attachment"]']) {
+                const el = document.querySelector(sel);
+                if (el && el.offsetParent !== null && el.innerText.trim()) return el.innerText.trim();
+            }
+            return '';
+        }""")
+
     # Check if already uploaded
-    already = await page_or_frame.evaluate("""() => {
-        for (const sel of ['.filename', '.file-name', '.resume-filename', '.attachment-filename',
-                           '[data-automation-id="file-upload-item"]', '[class*="upload-success"]', '[class*="attachment"]']) {
-            const el = document.querySelector(sel);
-            if (el && el.innerText.trim()) return el.innerText.trim();
-        }
-        for (const fi of document.querySelectorAll('input[type="file"]')) {
-            if (fi.files && fi.files.length > 0) return fi.files[0].name;
-        }
-        return '';
-    }""")
+    already = await _check_upload()
     if already:
         if event_callback:
             await event_callback("Fill Form", "info", f"Resume already uploaded: {already}")
         return True
 
-    # STRATEGY 1: Make hidden file inputs visible and use set_input_files
-    file_count = await page_or_frame.evaluate("document.querySelectorAll('input[type=\"file\"]').length")
-    if event_callback:
-        await event_callback("Fill Form", "info", f"Found {file_count} file input(s)")
+    # STRATEGY 1: Make hidden file inputs visible (+ parents), set_input_files, dispatch events
+    try:
+        file_count = await page_or_frame.evaluate("""() => {
+            const inputs = document.querySelectorAll('input[type="file"]');
+            for (const inp of inputs) {
+                inp.removeAttribute('hidden');
+                inp.style.cssText = 'display:block!important;visibility:visible!important;opacity:1!important;position:relative!important;width:200px!important;height:30px!important;z-index:99999!important;';
+                let el = inp.parentElement;
+                for (let d = 0; el && d < 5; d++, el = el.parentElement) {
+                    const s = getComputedStyle(el);
+                    if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') {
+                        el.style.display = 'block';
+                        el.style.visibility = 'visible';
+                        el.style.opacity = '1';
+                    }
+                    if (el.hasAttribute('hidden')) el.removeAttribute('hidden');
+                }
+                if (inp.hasAttribute('accept')) inp.removeAttribute('accept');
+            }
+            return inputs.length;
+        }""")
+        if event_callback:
+            await event_callback("Fill Form", "info", f"Found {file_count} file input(s)")
 
-    for i in range(file_count):
-        try:
-            context = await page_or_frame.evaluate(f"""() => {{
+        for i in range(file_count):
+            ctx_lower = await page_or_frame.evaluate(f"""() => {{
                 const el = document.querySelectorAll('input[type="file"]')[{i}];
                 if (!el) return '';
-                el.style.display = 'block';
-                el.style.visibility = 'visible';
-                el.style.opacity = '1';
-                el.style.position = 'relative';
-                el.style.width = '200px';
-                el.style.height = '30px';
-                el.style.zIndex = '99999';
                 const parent = el.closest('.field, .application-field, .form-group, li, div[class*="upload"]');
                 if (parent) {{
                     const lbl = parent.querySelector('label, .field-label, h3, h4');
-                    if (lbl) return lbl.innerText.trim();
+                    if (lbl) return lbl.innerText.trim().toLowerCase();
                 }}
                 return '';
             }}""")
 
-            ctx_lower = (context or "").lower()
-            is_resume = "resume" in ctx_lower or "cv" in ctx_lower or i == 0
+            is_resume = "resume" in (ctx_lower or "") or "cv" in (ctx_lower or "") or i == 0
             if not is_resume and file_count > 1:
                 continue
 
             fi = page_or_frame.locator('input[type="file"]').nth(i)
-            await fi.set_input_files(resume_path, timeout=10000)
-            await page_or_frame.wait_for_timeout(2000)
+            await fi.set_input_files(abs_path, timeout=10000)
+            await asyncio.sleep(1)
+            # Dispatch change+input events
+            await page_or_frame.evaluate(f"""() => {{
+                const inp = document.querySelectorAll('input[type="file"]')[{i}];
+                if (inp && inp.files && inp.files.length > 0) {{
+                    inp.dispatchEvent(new Event('change', {{bubbles: true}}));
+                    inp.dispatchEvent(new Event('input', {{bubbles: true}}));
+                }}
+            }}""")
+            await asyncio.sleep(3)
 
-            if event_callback:
-                await event_callback("Fill Form", "success", f"Resume uploaded via file input {i}")
-            return True
-        except Exception as e:
-            if event_callback:
-                await event_callback("Fill Form", "info", f"File input {i} failed: {e}")
-
-    # STRATEGY 2: Click Attach/Upload button and intercept file chooser
-    if file_count == 0:
-        upload_sels = [
-            'button:has-text("Attach")', 'button:has-text("Upload")',
-            'button:has-text("Choose File")', 'a:has-text("Attach")',
-            'a:has-text("Upload")', 'label:has-text("Attach")',
-            'a.attachment-link', '[class*="upload"] button', '[class*="dropzone"]',
-        ]
-        for sel in upload_sels:
-            try:
-                btn = page_or_frame.locator(sel).first
-                if not await btn.is_visible(timeout=1000):
-                    continue
-                async with page_or_frame.expect_file_chooser(timeout=10000) as fc:
-                    await btn.click(timeout=3000)
-                chooser = await fc.value
-                await chooser.set_files(resume_path)
-                await page_or_frame.wait_for_timeout(2000)
+            has = await _check_upload()
+            if has:
                 if event_callback:
-                    await event_callback("Fill Form", "success", "Resume uploaded via file chooser")
+                    await event_callback("Fill Form", "success", f"Strategy 1 (file input {i}): {has}")
                 return True
-            except Exception:
+    except Exception as e:
+        if event_callback:
+            await event_callback("Fill Form", "info", f"Strategy 1 failed: {e}")
+
+    # STRATEGY 2: Click "Select files" / "Attach" link + file chooser
+    for sel in [
+        '[data-automation-id="file-upload-drop-zone"] a',
+        'a:has-text("Select files")', 'button:has-text("Select files")',
+        'button:has-text("Attach")', 'button:has-text("Upload")',
+        'button:has-text("Choose File")', 'a:has-text("Attach")',
+        'a:has-text("Upload")', 'label:has-text("Attach")',
+        'label:has-text("Upload")', 'a.attachment-link',
+        '[class*="upload"] a', '[class*="upload"] button',
+    ]:
+        try:
+            btn = page_or_frame.locator(sel).first
+            if not await btn.is_visible(timeout=1500):
                 continue
+            async with page_or_frame.expect_file_chooser(timeout=8000) as fc:
+                await btn.click(force=True, timeout=5000)
+            chooser = await fc.value
+            await chooser.set_files(abs_path)
+            await asyncio.sleep(5)
+            has = await _check_upload()
+            if event_callback:
+                await event_callback("Fill Form", "success", f"Strategy 2 (file chooser): {sel[:40]}" + (f" ({has})" if has else ""))
+            return True
+        except Exception:
+            continue
+
+    # STRATEGY 3: Click drop zone + file chooser
+    for sel in [
+        '[data-automation-id="file-upload-drop-zone"]',
+        '[class*="dropzone"]', '[class*="drop-zone"]', '[class*="drop_zone"]',
+        '[class*="file-upload"]', '[class*="resume-upload"]',
+    ]:
+        try:
+            zone = page_or_frame.locator(sel).first
+            if not await zone.is_visible(timeout=1500):
+                continue
+            async with page_or_frame.expect_file_chooser(timeout=8000) as fc:
+                await zone.click(force=True, timeout=5000)
+            chooser = await fc.value
+            await chooser.set_files(abs_path)
+            await asyncio.sleep(5)
+            has = await _check_upload()
+            if event_callback:
+                await event_callback("Fill Form", "success", f"Strategy 3 (drop zone): {sel[:40]}" + (f" ({has})" if has else ""))
+            return True
+        except Exception:
+            continue
+
+    # STRATEGY 4: Programmatic drag-and-drop via JS
+    try:
+        import base64
+        with open(abs_path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode()
+        dropped = await page_or_frame.evaluate("""(args) => {
+            const [b64, name] = args;
+            const bin = atob(b64);
+            const bytes = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+            const ext = name.split('.').pop().toLowerCase();
+            const mimeMap = {pdf:'application/pdf', doc:'application/msword', docx:'application/vnd.openxmlformats-officedocument.wordprocessingml.document', txt:'text/plain', rtf:'application/rtf'};
+            const file = new File([bytes], name, {type: mimeMap[ext] || 'application/octet-stream'});
+            const dt = new DataTransfer();
+            dt.items.add(file);
+            let ok = false;
+            const fi = document.querySelector('input[type="file"]');
+            if (fi) {
+                fi.files = dt.files;
+                fi.dispatchEvent(new Event('change', {bubbles: true}));
+                fi.dispatchEvent(new Event('input', {bubbles: true}));
+                ok = fi.files.length > 0;
+            }
+            for (const zs of ['[data-automation-id="file-upload-drop-zone"]','[class*="dropzone"]','[class*="drop-zone"]','[class*="file-upload"]']) {
+                const zone = document.querySelector(zs);
+                if (!zone) continue;
+                const rect = zone.getBoundingClientRect();
+                const cx = rect.left + rect.width / 2;
+                const cy = rect.top + rect.height / 2;
+                const evtInit = {dataTransfer: dt, bubbles: true, cancelable: true, clientX: cx, clientY: cy};
+                zone.dispatchEvent(new DragEvent('dragenter', evtInit));
+                zone.dispatchEvent(new DragEvent('dragover', evtInit));
+                zone.dispatchEvent(new DragEvent('drop', evtInit));
+                ok = true;
+            }
+            return ok ? 'ok' : 'no target';
+        }""", [b64, fname])
+        if dropped == "ok":
+            await asyncio.sleep(5)
+            result = await _check_upload()
+            if result:
+                if event_callback:
+                    await event_callback("Fill Form", "success", f"Strategy 4 (drag-drop): {result}")
+                return True
+    except Exception as e:
+        if event_callback:
+            await event_callback("Fill Form", "info", f"Strategy 4 failed: {e}")
 
     if event_callback:
         await event_callback("Fill Form", "warning", "All resume upload strategies failed")
