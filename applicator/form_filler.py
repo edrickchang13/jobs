@@ -170,18 +170,17 @@ CRITICAL — BUTTONS TO AVOID (DO NOT CLICK THESE EVER):
 These will open OAuth popups or redirects that will FAIL. Always use manual email/password sign-in instead.
 
 4. If you see a Sign In / Create Account page:
-   - IMPORTANT: Each employer has SEPARATE accounts. You likely do NOT have an account yet.
-   - FIRST look for a "Create Account" link or button and click it
-   - On Workday: the Create Account link uses data-automation-id="createAccountLink"
-   - Fill in email: {cred_email} and password: {cred_password}
-   - If there is a "Verify Password" or "Confirm Password" field, enter the same password: {cred_password}
-   - If there is a terms/conditions checkbox, check it
-   - Click the "Create Account" submit button
+   - IMPORTANT: Each employer has SEPARATE accounts.
+   - FIRST try Sign In: enter email: {cred_email} and password: {cred_password}, then click the Sign In button.
    - On Workday: Sign In and Create Account submit buttons are both div[role="button"][data-automation-id="click_filter"] — they differ by aria-label ("Sign In" vs "Create Account")
-   - After account creation, you may be taken to the Sign In page
-   - Enter the SAME email: {cred_email} and password: {cred_password} and click Sign In
+   - If sign-in fails (error message appears like "invalid credentials" or "no account found", or page does not change), THEN try Create Account:
+     - Click the "Create Account" link (on Workday: data-automation-id="createAccountLink")
+     - Fill in email: {cred_email} and password: {cred_password}
+     - If there is a "Verify Password" or "Confirm Password" field, enter the same password: {cred_password}
+     - If there is a terms/conditions checkbox, check it
+     - Click the "Create Account" submit button
+   - CRITICAL: After creating an account, you will land on the Sign In page. You MUST sign in with the SAME email: {cred_email} and password: {cred_password}. NEVER click "Create Account" again after you just created an account. Always sign in.
    - If the page asks you to verify your email: STOP and report "NEEDS_EMAIL_VERIFICATION". Do NOT keep refreshing or clicking. The system will handle email verification automatically.
-   - CRITICAL: If you click Sign In and the page does not change (still shows Sign In), it means the sign-in FAILED. Do NOT keep clicking Sign In. Instead look for "Create Account" link.
    - If account already exists (error message), just sign in with the same credentials.
 
 CRITICAL RULES FOR AVOIDING LOOPS:
@@ -191,6 +190,8 @@ CRITICAL RULES FOR AVOIDING LOOPS:
 - If you tried creating an account and it failed, STOP and report "ACCOUNT_CREATION_FAILED".
 - If you've taken 15+ actions and haven't reached the form yet, STOP and describe what page you're on.
 - If a button click doesn't change the page, do NOT click it again. Try a different button or approach.
+- NEVER go to Create Account if you just created an account. After account creation, ALWAYS sign in.
+- If you see the Sign In page after creating an account, sign in — do NOT navigate to Create Account again.
 
 HANDLING COMMON OBSTACLES:
 - Cookie consent banners: click "Accept" or "Accept All" to dismiss
@@ -1846,6 +1847,9 @@ async def _handle_workday_auth(page, event_callback=None) -> bool:
             return True
 
     # --- Step 3: Sign-in failed. Try Create Account ---
+    # Flag: once we create an account, NEVER go back to Create Account
+    account_just_created = False
+
     await _log("Sign-in didn't work, trying Create Account...")
 
     # Click "Create Account" link in the sign-in popup
@@ -1903,7 +1907,6 @@ async def _handle_workday_auth(page, event_callback=None) -> bool:
     if not checkbox_ok:
         await _log("Checkbox not confirmed. Create Account may fail.")
 
-
     await page.wait_for_timeout(500)
 
     # Submit create account — try BOTH button and click_filter
@@ -1939,12 +1942,13 @@ async def _handle_workday_auth(page, event_callback=None) -> bool:
 
     if submit_clicked:
         await _log("Clicked Create Account submit")
+        account_just_created = True
         await page.wait_for_timeout(8000)
     else:
         await _log("Could not click Create Account submit")
         return False
 
-    # --- Check for "account already exists" ---
+    # --- Check for "account already exists" error ---
     already_exists = await page.evaluate("""() => {
         const t = document.body.innerText.toLowerCase();
         return t.includes('already in use') || t.includes('already exists')
@@ -1953,31 +1957,9 @@ async def _handle_workday_auth(page, event_callback=None) -> bool:
 
     if already_exists:
         await _log("Account already exists, switching to sign in...")
-        # Click signInLink button
-        await _multi_click(
-            [
-                'button[data-automation-id="signInLink"]',
-                'a:has-text("Sign In")',
-                'button:has-text("Sign In")',
-            ]
-        )
-        await page.wait_for_timeout(3000)
-        await _fill_creds()
-        await page.wait_for_timeout(500)
-        await _multi_click(
-            [
-                'div[data-automation-id="click_filter"][aria-label="Sign In"]',
-                'button[data-automation-id="signInSubmitButton"]',
-                'button:has-text("Sign In")',
-            ],
-            force=True,
-        )
-        await page.wait_for_timeout(5000)
-        if await _is_on_form():
-            await _log_ok("Signed in with existing account!")
-            return True
+        account_just_created = True  # Still prevent going back to Create Account
 
-    # --- Step 5: Email verification ---
+    # --- Step 5: Email verification (only if page shows verification prompt) ---
     try:
         page_text = await page.evaluate("document.body.innerText")
         if "verify" in page_text.lower() and "email" in page_text.lower():
@@ -2004,14 +1986,16 @@ async def _handle_workday_auth(page, event_callback=None) -> bool:
     except Exception:
         pass
 
-    # --- Step 6: Sign in after account creation ---
+    # --- Step 6: IMMEDIATELY sign in after account creation ---
+    # After Create Account submit (or "already exists"), we should now be on Sign In.
+    # Do NOT check for createAccountLink — go straight to sign in.
     try:
-        email_vis = await page.locator('input[data-automation-id="email"]').is_visible(timeout=3000)
+        email_vis = await page.locator('input[data-automation-id="email"]').is_visible(timeout=5000)
     except Exception:
         email_vis = False
 
     if email_vis:
-        await _log("Signing in after account creation...")
+        await _log("Sign-in form visible after account creation. Signing in...")
         await _fill_creds()
         await page.wait_for_timeout(500)
         await _multi_click(
@@ -2023,6 +2007,32 @@ async def _handle_workday_auth(page, event_callback=None) -> bool:
             force=True,
         )
         await page.wait_for_timeout(5000)
+
+        if await _is_on_form():
+            await _log_ok("Signed in after account creation!")
+            return True
+
+        # If still not on form, try clicking signInLink first then sign in
+        if account_just_created:
+            await _log("Still not on form. Trying signInLink...")
+            await _multi_click(
+                [
+                    'button[data-automation-id="signInLink"]',
+                    'a:has-text("Sign In")',
+                ],
+            )
+            await page.wait_for_timeout(3000)
+            await _fill_creds()
+            await page.wait_for_timeout(500)
+            await _multi_click(
+                [
+                    'div[data-automation-id="click_filter"][aria-label="Sign In"]',
+                    'button[data-automation-id="signInSubmitButton"]',
+                    'button:has-text("Sign In")',
+                ],
+                force=True,
+            )
+            await page.wait_for_timeout(5000)
 
     if await _is_on_form():
         await _log_ok("Auth completed, on application form!")
