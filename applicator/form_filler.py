@@ -93,10 +93,14 @@ def _build_known_values(info: dict) -> str:
         ("highest_education", "Highest level of education / education level"),
         ("reason_for_leaving", "Reason for leaving current position"),
     ]
+    # Keys where empty string is meaningful (tells LLM to leave blank)
+    always_include = {"current_company", "currently_employed"}
     for key, label in mappings:
         value = info.get(key, "")
         if value:
             lines.append(f'- {label}: "{value}"')
+        elif key in always_include:
+            lines.append(f'- {label}: "" (leave blank)')
     # Always add referral rule
     lines.append('- Referred by employee: ALWAYS "No" - never say the candidate was referred')
     return "\n".join(lines)
@@ -871,6 +875,8 @@ FIELD-SPECIFIC RULES:
 - Graduation year / "what year will you graduate": "2028"
 - Internship or co-op experience: "No" or "0" (candidate has no prior internship/co-op experience)
 - Currently employed / previous employer: "No"
+- "Current company" / "Current organization" / "Current employer": ALWAYS leave blank (action "skip"). The candidate is NOT currently employed.
+- For location / "Current location" fields: use "Santa Clara, CA". If it is an autocomplete dropdown, type "Santa Clara" and select the suggestion.
 - Years of experience: "0"
 - For any referral question: ALWAYS answer "No" - the candidate was NOT referred by an employee
 - For "how did you hear about us": "{how_heard}"
