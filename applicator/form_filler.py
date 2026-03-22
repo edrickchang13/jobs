@@ -768,8 +768,11 @@ FIELD-SPECIFIC RULES:
 - Phone country / country code dropdowns: select "United States" or "US (+1)" or the closest match
 - Graduation year / "what year will you graduate": "2028"
 - Internship or co-op experience: "No" or "0" (candidate has no prior internship/co-op experience)
-- Currently employed / previous employer: "No"
+- Currently employed / current company / current organization / current employer: The candidate is NOT currently employed. LEAVE BLANK. Do not type anything.
+- "Are you currently employed": "No"
+- Previous employer / Has had previous job: "No"
 - Years of experience: "0"
+- Location / Current location / City: "Santa Clara, CA". For autocomplete location fields, type "Santa Clara" and select the suggestion containing "Santa Clara".
 - For any referral question: ALWAYS answer "No" - the candidate was NOT referred by an employee
 - For "how did you hear about us": "{how_heard}"
 - For open-ended text questions (why this company, why interested, tell us about yourself, etc.): write authentic answers connecting the candidate's experience to {company} and the {role} role. Keep under 150 words.
