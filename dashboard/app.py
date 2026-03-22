@@ -1426,6 +1426,35 @@ async def _run_application(url: str, company: str, role: str):
             except Exception:
                 active_context = None
 
+        # --- Recovery: if agent returned incomplete on a Workday auth page ---
+        is_workday = "workday" in url.lower() or "myworkdayjobs" in url.lower()
+        if not completed and page and is_workday:
+            from applicator.form_filler import _detect_workday_page_state, _handle_workday_auth
+            state = await _detect_workday_page_state(page)
+            if state == "auth":
+                add_event("Recovery", "info", "Still on auth page after agent. Running auth handler...")
+                auth_ok = await _handle_workday_auth(page, on_event)
+                if auth_ok:
+                    import asyncio as _aio
+                    await _aio.sleep(3)
+                    state = await _detect_workday_page_state(page)
+                    add_event("Recovery", "info", f"After auth: state={state}")
+                if state == "form":
+                    add_event("Recovery", "info", "Auth succeeded. Running Workday form handler...")
+                    from applicator.workday_handler import handle_workday_application
+                    wd_result = await handle_workday_application(
+                        page=page, resume_path=resume_path,
+                        company=company, role=role,
+                        job_description=jd,
+                        event_callback=on_event,
+                        screenshot_callback=on_screenshot,
+                    )
+                    wd_filled = wd_result.get("filled", 0)
+                    wd_errors = wd_result.get("errors", [])
+                    add_event("Recovery", "success" if not wd_errors else "info",
+                        f"Workday form: {wd_filled} filled, {wd_result.get('failed', 0)} failed")
+                    completed = wd_filled > 0
+
         # Step 5: Final screenshot for review
         add_event("Screenshot & Review", "start", "Capturing final state...")
 

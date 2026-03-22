@@ -1929,15 +1929,33 @@ async def _handle_workday_auth(page, event_callback=None) -> bool:
     async def _is_on_form() -> bool:
         try:
             return await page.evaluate("""() => {
-                // Look for Workday application form markers
-                const hasApplyFlow = document.querySelector('[data-automation-id="applyFlowPage"]') !== null;
-                const hasNextBtn = document.querySelector('[data-automation-id="pageFooterNextButton"]') !== null;
-                const hasFormField = document.querySelector('input[name="legalName--firstName"]') !== null
-                    || document.querySelector('[data-automation-id="formField-legalName--firstName"]') !== null
-                    || document.querySelector('[data-automation-id="file-upload-drop-zone"]') !== null;
-                // Make sure we're NOT looking at a sign-in popup overlay
-                const hasAuthPopup = document.querySelector('[data-automation-id="popUpDialog"] [data-automation-id="signInContent"]') !== null;
-                return (hasApplyFlow || hasNextBtn || hasFormField) && !hasAuthPopup;
+                function isVis(sel) {
+                    const el = document.querySelector(sel);
+                    if (!el) return false;
+                    const r = el.getBoundingClientRect();
+                    return r.width > 0 && r.height > 0;
+                }
+
+                // Auth indicators — if ANY are visible, we are NOT on the form
+                if (isVis('input[data-automation-id="email"]')
+                    || isVis('input[data-automation-id="password"]')
+                    || isVis('[data-automation-id="signInSubmitButton"]')
+                    || isVis('[data-automation-id="createAccountSubmitButton"]')
+                    || isVis('[data-automation-id="createAccountLink"]')) {
+                    return false;
+                }
+                // Also check for Sign In + Create Account text appearing together
+                const bodyText = document.body.innerText || '';
+                if (bodyText.includes('Sign In') && bodyText.includes('Create Account')) {
+                    return false;
+                }
+
+                // Form indicators — need at least one real form field
+                const hasFormField = isVis('input[name="legalName--firstName"]')
+                    || isVis('[data-automation-id="formField-legalName--firstName"]')
+                    || isVis('[data-automation-id="file-upload-drop-zone"]')
+                    || isVis('[data-automation-id="progressBar"]');
+                return hasFormField;
             }""")
         except Exception:
             return False
