@@ -385,7 +385,7 @@ async def click_next(page: Page, event_callback=None) -> bool:
             btn = page.locator(sel).first
             if await btn.is_visible(timeout=2000):
                 await btn.scroll_into_view_if_needed(timeout=3000)
-                await page.wait_for_timeout(500)
+                await asyncio.sleep(0.5)
                 try:
                     await btn.click(timeout=5000)
                 except Exception:
@@ -393,7 +393,7 @@ async def click_next(page: Page, event_callback=None) -> bool:
                         const el = document.querySelector(s);
                         if (el) el.click();
                     }""", sel)
-                await page.wait_for_timeout(3000)
+                await asyncio.sleep(3)
                 if event_callback:
                     await event_callback("Navigate", "info", "Clicked Next/Continue")
                 return True
@@ -469,7 +469,7 @@ async def handle_my_experience(page: Page, resume_path: str, event_callback=None
         }""")
 
         if edu_clicked:
-            await page.wait_for_timeout(3000)
+            await asyncio.sleep(3.0)
 
             # Fill education fields
             school = info.get('school', 'Santa Clara University')
@@ -483,7 +483,7 @@ async def handle_my_experience(page: Page, resume_path: str, event_callback=None
                     if await el.is_visible(timeout=2000):
                         await el.click(timeout=2000)
                         await page.keyboard.type(school, delay=50)
-                        await page.wait_for_timeout(1500)
+                        await asyncio.sleep(1.5)
                         # Click first autocomplete suggestion
                         try:
                             opt = page.locator('[role="option"], li[class*="option"]').first
@@ -504,10 +504,10 @@ async def handle_my_experience(page: Page, resume_path: str, event_callback=None
                     el = page.locator(sel).first
                     if await el.is_visible(timeout=2000):
                         await el.click(timeout=3000)
-                        await page.wait_for_timeout(1000)
+                        await asyncio.sleep(1.0)
                         # Type to filter
                         await page.keyboard.type("Bachelor", delay=50)
-                        await page.wait_for_timeout(800)
+                        await asyncio.sleep(0.8)
                         opt = page.locator('[role="option"]:has-text("Bachelor"), li:has-text("Bachelor")').first
                         if await opt.is_visible(timeout=2000):
                             await opt.click(timeout=3000)
@@ -537,7 +537,7 @@ async def handle_my_experience(page: Page, resume_path: str, event_callback=None
                     btn = page.locator(sel).first
                     if await btn.is_visible(timeout=1000):
                         await btn.click(timeout=3000)
-                        await page.wait_for_timeout(2000)
+                        await asyncio.sleep(2.0)
                         if event_callback:
                             await event_callback("Fill Form", "info", "Saved education entry")
                         break
@@ -567,7 +567,7 @@ async def handle_my_experience(page: Page, resume_path: str, event_callback=None
                 return false;
             }""")
             if websites_clicked:
-                await page.wait_for_timeout(2000)
+                await asyncio.sleep(2.0)
                 for sel in ['[data-automation-id="website"]', 'input[aria-label*="URL" i]', 'input[placeholder*="http" i]']:
                     try:
                         el = page.locator(sel).first
@@ -583,7 +583,7 @@ async def handle_my_experience(page: Page, resume_path: str, event_callback=None
                         btn = page.locator(sel).first
                         if await btn.is_visible(timeout=1000):
                             await btn.click(timeout=3000)
-                            await page.wait_for_timeout(1000)
+                            await asyncio.sleep(1.0)
                             break
                     except Exception:
                         continue
@@ -650,7 +650,7 @@ async def handle_workday_application(
     all_errors = []
 
     for step_num in range(max_steps):
-        await page.wait_for_timeout(2000)
+        await asyncio.sleep(2.0)
 
         if screenshot_callback:
             try:
@@ -684,7 +684,7 @@ async def handle_workday_application(
             from applicator.form_filler import JS_EXTRACT_FIELDS, map_fields_to_profile, fill_form
             for i in range(5):
                 await page.evaluate(f"window.scrollTo(0, {i * 500})")
-                await page.wait_for_timeout(200)
+                await asyncio.sleep(0.2)
             await page.evaluate("window.scrollTo(0, 0)")
             fields = await page.evaluate(JS_EXTRACT_FIELDS)
             if fields:
@@ -711,11 +711,11 @@ async def handle_workday_application(
         # Click Next
         if not await click_next(page, event_callback):
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            await page.wait_for_timeout(1000)
+            await asyncio.sleep(1.0)
             if not await click_next(page, event_callback):
                 all_errors.append(f"Stuck on step: {current_step}")
                 break
 
-        await page.wait_for_timeout(3000)
+        await asyncio.sleep(3.0)
 
     return {"filled": total_filled, "failed": total_failed, "skipped": 0, "errors": all_errors}

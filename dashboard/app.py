@@ -1085,7 +1085,7 @@ async def continue_application_endpoint():
                 }""")
                 add_event("Continue", "info", "Clicked auth button via JS")
 
-            await page.wait_for_timeout(5000)
+            await asyncio.sleep(5.0)
             try:
                 ss = await page.screenshot(type="png")
                 latest_screenshot_b64 = base64.b64encode(ss).decode("utf-8")
@@ -1098,14 +1098,14 @@ async def continue_application_endpoint():
             if still_on_create:
                 add_event("Continue", "info", "Still on Create Account page. Retrying checkbox + submit...")
                 await check_workday_consent(page, event_callback=lambda s, st, d: add_event(s, st, d))
-                await page.wait_for_timeout(1000)
+                await asyncio.sleep(1.0)
                 # Try clicking again with JS
                 await page.evaluate("""() => {
                     const btn = document.querySelector('[data-automation-id="createAccountSubmitButton"]')
                         || document.querySelector('div[data-automation-id="click_filter"][aria-label="Create Account"]');
                     if (btn) btn.click();
                 }""")
-                await page.wait_for_timeout(5000)
+                await asyncio.sleep(5.0)
                 try:
                     ss = await page.screenshot(type="png")
                     latest_screenshot_b64 = base64.b64encode(ss).decode("utf-8")
@@ -1243,7 +1243,7 @@ async def email_verify_endpoint():
 
         elif result["success"] and result["method"] == "link":
             add_event("Email Verify", "success", "Verification link clicked. Refreshing...")
-            await page.wait_for_timeout(3000)
+            await asyncio.sleep(3.0)
             try:
                 await page.reload(wait_until="domcontentloaded", timeout=15000)
             except Exception:

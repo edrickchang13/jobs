@@ -292,9 +292,9 @@ Fill ALL fields. Do not skip any required field. Be thorough and check each page
                         if result["method"] == "code" and result["code"]:
                             await enter_verification_code(page, result["code"], event_callback)
                         elif result["method"] == "link":
-                            await page.wait_for_timeout(3000)
+                            await asyncio.sleep(3.0)
                             await page.reload()
-                            await page.wait_for_timeout(5000)
+                            await asyncio.sleep(5.0)
                         stuck.reset()
                         if event_callback:
                             await event_callback("Stuck Detection", "success", "Email verification handled!")
@@ -303,7 +303,7 @@ Fill ALL fields. Do not skip any required field. Be thorough and check each page
                             await event_callback("Stuck Detection", "warning",
                                 "Auto-verify failed. Waiting 60s for manual verification...")
                         for _ in range(60):
-                            await page.wait_for_timeout(1000)
+                            await asyncio.sleep(1.0)
                             new_text = await page.evaluate("document.body.innerText.substring(0, 500)")
                             if not stuck.is_verification_page(new_text):
                                 stuck.reset()
@@ -317,14 +317,14 @@ Fill ALL fields. Do not skip any required field. Be thorough and check each page
                             f"Loop detected: {stuck.stuck_reason[:150]}")
                     # Try recovery: Escape, scroll, click Continue/Next
                     await page.keyboard.press("Escape")
-                    await page.wait_for_timeout(500)
+                    await asyncio.sleep(0.5)
                     for sel in ['button:has-text("Continue")', 'button:has-text("Next")',
                                 'button:has-text("Skip")', 'a:has-text("Continue")']:
                         try:
                             btn = page.locator(sel).first
                             if await btn.is_visible(timeout=1000):
                                 await btn.click()
-                                await page.wait_for_timeout(2000)
+                                await asyncio.sleep(2.0)
                                 stuck.reset()
                                 if event_callback:
                                     await event_callback("Stuck Detection", "info", f"Recovery: clicked {sel}")
@@ -790,7 +790,7 @@ async def _dismiss_cookie_banners(page: Page):
             btn = page.locator(selector).first
             if await btn.is_visible(timeout=500):
                 await btn.click(timeout=2000)
-                await page.wait_for_timeout(500)
+                await asyncio.sleep(0.5)
                 return True
         except Exception:
             continue
@@ -921,7 +921,7 @@ async def _handle_icims_auth(page, email, password, first_name, last_name, event
             submit = target.locator('button[type="submit"], input[type="submit"], .iCIMS_PrimaryButton')
             if await submit.first.is_visible(timeout=2000):
                 await submit.first.click()
-                await page.wait_for_timeout(5000)
+                await asyncio.sleep(5.0)
 
             # Check if we landed on the form
             inputs = await target.evaluate("document.querySelectorAll('input, textarea, select').length")
@@ -941,7 +941,7 @@ async def _handle_icims_auth(page, email, password, first_name, last_name, event
         create_link = target.locator('a:has-text("Create"), a:has-text("Register"), a:has-text("Sign Up"), button:has-text("Create")')
         if await create_link.first.is_visible(timeout=3000):
             await create_link.first.click()
-            await page.wait_for_timeout(3000)
+            await asyncio.sleep(3.0)
 
         # Fill account creation fields
         for selector, value in [
@@ -969,7 +969,7 @@ async def _handle_icims_auth(page, email, password, first_name, last_name, event
         submit = target.locator('button[type="submit"], input[type="submit"], .iCIMS_PrimaryButton')
         if await submit.first.is_visible(timeout=2000):
             await submit.first.click()
-            await page.wait_for_timeout(5000)
+            await asyncio.sleep(5.0)
 
         if event_callback:
             await event_callback("Navigate", "success", "iCIMS: Account created")
@@ -998,7 +998,7 @@ async def _handle_taleo_auth(page, email, password, first_name, last_name, event
             submit = page.locator('button[type="submit"], input[type="submit"], a:has-text("Sign In"), button:has-text("Sign In"), button:has-text("Log In")')
             if await submit.first.is_visible(timeout=2000):
                 await submit.first.click()
-                await page.wait_for_timeout(5000)
+                await asyncio.sleep(5.0)
 
             # Check if signed in
             still_login = await page.locator('input[type="password"]').first.is_visible(timeout=2000)
@@ -1017,7 +1017,7 @@ async def _handle_taleo_auth(page, email, password, first_name, last_name, event
         create_link = page.locator('a:has-text("New User"), a:has-text("Create"), a:has-text("Register")')
         if await create_link.first.is_visible(timeout=3000):
             await create_link.first.click()
-            await page.wait_for_timeout(3000)
+            await asyncio.sleep(3.0)
 
         for selector, value in [
             ('input[name*="first" i], input[id*="first" i]', first_name),
@@ -1043,7 +1043,7 @@ async def _handle_taleo_auth(page, email, password, first_name, last_name, event
         submit = page.locator('button[type="submit"], input[type="submit"]')
         if await submit.first.is_visible(timeout=2000):
             await submit.first.click()
-            await page.wait_for_timeout(5000)
+            await asyncio.sleep(5.0)
 
         if event_callback:
             await event_callback("Navigate", "success", "Taleo: Account created")
@@ -1071,7 +1071,7 @@ async def _handle_successfactors_auth(page, email, password, first_name, last_na
             submit = page.locator('button[type="submit"], input[type="submit"], button:has-text("Sign In"), button:has-text("Log In")')
             if await submit.first.is_visible(timeout=2000):
                 await submit.first.click()
-                await page.wait_for_timeout(5000)
+                await asyncio.sleep(5.0)
 
             still_login = await page.locator('input[type="password"]').first.is_visible(timeout=2000)
             if not still_login:
@@ -1089,7 +1089,7 @@ async def _handle_successfactors_auth(page, email, password, first_name, last_na
         create_link = page.locator('a:has-text("Create"), a:has-text("Register"), a:has-text("Join"), button:has-text("Create")')
         if await create_link.first.is_visible(timeout=3000):
             await create_link.first.click()
-            await page.wait_for_timeout(3000)
+            await asyncio.sleep(3.0)
 
         for selector, value in [
             ('input[name*="first" i], input[id*="first" i]', first_name),
@@ -1123,7 +1123,7 @@ async def _handle_successfactors_auth(page, email, password, first_name, last_na
         submit = page.locator('button[type="submit"], input[type="submit"]')
         if await submit.first.is_visible(timeout=2000):
             await submit.first.click()
-            await page.wait_for_timeout(5000)
+            await asyncio.sleep(5.0)
 
         # Handle email verification if required
         page_text = await page.evaluate("document.body.innerText")
@@ -1132,15 +1132,15 @@ async def _handle_successfactors_auth(page, email, password, first_name, last_na
                 page, sender_filter="successfactors", event_callback=event_callback
             )
             if verified:
-                await page.wait_for_timeout(3000)
+                await asyncio.sleep(3.0)
                 await page.reload(wait_until="domcontentloaded")
-                await page.wait_for_timeout(5000)
+                await asyncio.sleep(5.0)
             else:
                 if event_callback:
                     await event_callback("Navigate", "warning",
                         "Auto-verify failed. Please verify your email manually.")
                 for _ in range(90):
-                    await page.wait_for_timeout(1000)
+                    await asyncio.sleep(1.0)
                     try:
                         page_text = await page.evaluate("document.body.innerText")
                         if "verify" not in page_text.lower():
@@ -1183,7 +1183,7 @@ async def _handle_workday_apply(page, resume_path, event_callback=None, screensh
         btn = page.locator('[data-automation-id="legalNoticeAcceptButton"]')
         if await btn.is_visible(timeout=2000):
             await btn.click()
-            await page.wait_for_timeout(1000)
+            await asyncio.sleep(1.0)
     except Exception:
         pass
 
@@ -1195,7 +1195,7 @@ async def _handle_workday_apply(page, resume_path, event_callback=None, screensh
         apply_btn = page.locator('[data-automation-id="adventureButton"], a:has-text("Apply"), button:has-text("Apply")')
         if await apply_btn.first.is_visible(timeout=5000):
             await apply_btn.first.click()
-            await page.wait_for_timeout(5000)
+            await asyncio.sleep(5.0)
             if event_callback:
                 await event_callback("Navigate", "info", "Workday: Clicked Apply")
     except Exception:
@@ -1214,7 +1214,7 @@ async def _handle_workday_apply(page, resume_path, event_callback=None, screensh
         manual = page.locator('[data-automation-id="applyManually"]')
         if await manual.is_visible(timeout=5000):
             await manual.click()
-            await page.wait_for_timeout(5000)
+            await asyncio.sleep(5.0)
             if event_callback:
                 await event_callback("Navigate", "info", "Workday: Clicked Apply Manually")
     except Exception:
@@ -1247,7 +1247,7 @@ async def _handle_workday_apply(page, resume_path, event_callback=None, screensh
                 const btn = document.querySelector('[data-automation-id="signInSubmitButton"]');
                 if (btn) btn.click();
             }""")
-            await page.wait_for_timeout(5000)
+            await asyncio.sleep(5.0)
         except Exception:
             pass
 
@@ -1283,7 +1283,7 @@ async def _handle_workday_apply(page, resume_path, event_callback=None, screensh
             )
             if await create_link.first.is_visible(timeout=5000):
                 await create_link.first.click()
-                await page.wait_for_timeout(3000)
+                await asyncio.sleep(3.0)
                 if event_callback:
                     await event_callback("Navigate", "info", "Workday: On Create Account form")
             else:
@@ -1332,7 +1332,7 @@ async def _handle_workday_apply(page, resume_path, event_callback=None, screensh
                     || document.querySelector('button[type="submit"]');
                 if (btn) btn.click();
             }""")
-            await page.wait_for_timeout(8000)
+            await asyncio.sleep(8.0)
 
             if screenshot_callback:
                 ss = await _take_screenshot(page)
@@ -1361,7 +1361,7 @@ async def _handle_workday_apply(page, resume_path, event_callback=None, screensh
                 const btn = document.querySelector('[data-automation-id="signInSubmitButton"]');
                 if (btn) btn.click();
             }""")
-            await page.wait_for_timeout(5000)
+            await asyncio.sleep(5.0)
         except Exception:
             pass
 
@@ -1382,14 +1382,14 @@ async def _handle_workday_apply(page, resume_path, event_callback=None, screensh
                     page, sender_filter="workday", event_callback=event_callback
                 )
                 if verified:
-                    await page.wait_for_timeout(3000)
+                    await asyncio.sleep(3.0)
                 else:
                     if event_callback:
                         await event_callback("Navigate", "warning",
                             "Auto-verify failed. Please verify manually in your email, then come back here.")
                     # Wait for manual verification
                     for _ in range(120):
-                        await page.wait_for_timeout(1000)
+                        await asyncio.sleep(1.0)
                         try:
                             page_text = await page.evaluate("document.body.innerText")
                             if "verify" not in page_text.lower():
@@ -1413,7 +1413,7 @@ async def _handle_workday_apply(page, resume_path, event_callback=None, screensh
                         const btn = document.querySelector('[data-automation-id="signInSubmitButton"]');
                         if (btn) btn.click();
                     }""")
-                    await page.wait_for_timeout(5000)
+                    await asyncio.sleep(5.0)
                 except Exception:
                     pass
 
@@ -1422,7 +1422,7 @@ async def _handle_workday_apply(page, resume_path, event_callback=None, screensh
                     sign_in = page.locator('button:has-text("Sign In"), a:has-text("Sign In"), [data-automation-id="utilityButtonSignIn"]')
                     if await sign_in.first.is_visible(timeout=3000):
                         await sign_in.first.click()
-                        await page.wait_for_timeout(5000)
+                        await asyncio.sleep(5.0)
                         # Fill credentials again if we're on a sign-in form
                         email_field = page.locator('[data-automation-id="email"]')
                         if await email_field.is_visible(timeout=3000):
@@ -1434,7 +1434,7 @@ async def _handle_workday_apply(page, resume_path, event_callback=None, screensh
                                 const btn = document.querySelector('[data-automation-id="signInSubmitButton"]');
                                 if (btn) btn.click();
                             }""")
-                            await page.wait_for_timeout(5000)
+                            await asyncio.sleep(5.0)
                 except Exception:
                     pass
 
@@ -1461,46 +1461,46 @@ async def _handle_workday_apply(page, resume_path, event_callback=None, screensh
             # Navigate back to the original job URL
             if job_url:
                 await page.goto(job_url, wait_until="domcontentloaded", timeout=30000)
-                await page.wait_for_timeout(5000)
+                await asyncio.sleep(5.0)
                 # Accept cookies again
                 try:
                     btn = page.locator('[data-automation-id="legalNoticeAcceptButton"]')
                     if await btn.is_visible(timeout=2000):
                         await btn.click()
-                        await page.wait_for_timeout(1000)
+                        await asyncio.sleep(1.0)
                 except Exception:
                     pass
                 # Click Apply again
                 apply_btn = page.locator('[data-automation-id="adventureButton"], a:has-text("Apply")')
                 if await apply_btn.first.is_visible(timeout=5000):
                     await apply_btn.first.click()
-                    await page.wait_for_timeout(5000)
+                    await asyncio.sleep(5.0)
             else:
                 await page.go_back()
-                await page.wait_for_timeout(3000)
+                await asyncio.sleep(3.0)
 
             # Choose apply method again if prompted
             try:
                 manual = page.locator('[data-automation-id="applyManually"]')
                 if await manual.is_visible(timeout=3000):
                     await manual.click()
-                    await page.wait_for_timeout(5000)
+                    await asyncio.sleep(5.0)
             except Exception:
                 pass
             try:
                 autofill = page.locator('[data-automation-id="autofillWithResume"]')
                 if await autofill.is_visible(timeout=3000):
                     await autofill.click()
-                    await page.wait_for_timeout(3000)
+                    await asyncio.sleep(3.0)
                     # Upload resume
                     try:
                         file_input = page.locator('input[type="file"]')
                         await file_input.set_input_files(resume_path, timeout=10000)
-                        await page.wait_for_timeout(5000)
+                        await asyncio.sleep(5.0)
                         filled_total += 1
                         try:
                             await page.evaluate("""document.querySelector('[data-automation-id="pageFooterNextButton"]').click()""")
-                            await page.wait_for_timeout(5000)
+                            await asyncio.sleep(5.0)
                         except Exception:
                             pass
                     except Exception:
@@ -1513,7 +1513,7 @@ async def _handle_workday_apply(page, resume_path, event_callback=None, screensh
     # Step 4: Process each page of the multi-step form
     max_pages = 10
     for page_num in range(max_pages):
-        await page.wait_for_timeout(2000)
+        await asyncio.sleep(2.0)
 
         if screenshot_callback:
             ss = await _take_screenshot(page)
@@ -1541,9 +1541,9 @@ async def _handle_workday_apply(page, resume_path, event_callback=None, screensh
         # Scroll to load all content
         for i in range(5):
             await page.evaluate(f"window.scrollTo(0, {i * 900})")
-            await page.wait_for_timeout(300)
+            await asyncio.sleep(0.3)
         await page.evaluate("window.scrollTo(0, 0)")
-        await page.wait_for_timeout(500)
+        await asyncio.sleep(0.5)
 
         # Extract fields using data-automation-id
         fields_on_page = await page.evaluate("""() => {
@@ -1648,7 +1648,7 @@ async def _handle_workday_apply(page, resume_path, event_callback=None, screensh
                         const btn = document.querySelector('[data-automation-id="pageFooterNextButton"]') || document.querySelector('[data-automation-id="bottom-navigation-next-button"]');
                         if (btn) btn.click();
                     }""")
-                await page.wait_for_timeout(3000)
+                await asyncio.sleep(3.0)
             else:
                 break  # No next button - we're done
         except Exception:
@@ -1797,7 +1797,7 @@ async def _handle_workday_auth(page, event_callback=None) -> bool:
         )
         if clicked:
             await _log("Clicked Sign In nav button")
-            await page.wait_for_timeout(3000)
+            await asyncio.sleep(3.0)
         else:
             await _log("Could not click Sign In nav")
 
@@ -1814,7 +1814,7 @@ async def _handle_workday_auth(page, event_callback=None) -> bool:
 
     await _log("Sign-in form visible. Trying sign in...")
     await _fill_creds()
-    await page.wait_for_timeout(500)
+    await asyncio.sleep(0.5)
 
     # Click Sign In submit - try all known patterns
     sign_in_clicked = await _multi_click(
@@ -1841,7 +1841,7 @@ async def _handle_workday_auth(page, event_callback=None) -> bool:
 
     if sign_in_clicked:
         await _log("Clicked Sign In submit")
-        await page.wait_for_timeout(5000)
+        await asyncio.sleep(5.0)
         if await _is_on_form():
             await _log_ok("Signed in successfully!")
             return True
@@ -1880,7 +1880,7 @@ async def _handle_workday_auth(page, event_callback=None) -> bool:
         return False
 
     await _log("Clicked Create Account link")
-    await page.wait_for_timeout(3000)
+    await asyncio.sleep(3.0)
 
     # --- Step 4: Fill create account form ---
     await _fill_creds()
@@ -1907,7 +1907,7 @@ async def _handle_workday_auth(page, event_callback=None) -> bool:
     if not checkbox_ok:
         await _log("Checkbox not confirmed. Create Account may fail.")
 
-    await page.wait_for_timeout(500)
+    await asyncio.sleep(0.5)
 
     # Submit create account — try BOTH button and click_filter
     submit_clicked = await _multi_click(
@@ -1943,7 +1943,7 @@ async def _handle_workday_auth(page, event_callback=None) -> bool:
     if submit_clicked:
         await _log("Clicked Create Account submit")
         account_just_created = True
-        await page.wait_for_timeout(8000)
+        await asyncio.sleep(8.0)
     else:
         await _log("Could not click Create Account submit")
         return False
@@ -1968,15 +1968,15 @@ async def _handle_workday_auth(page, event_callback=None) -> bool:
                 page, sender_filter="workday", event_callback=event_callback
             )
             if verified:
-                await page.wait_for_timeout(3000)
+                await asyncio.sleep(3.0)
                 await page.reload(wait_until="domcontentloaded")
-                await page.wait_for_timeout(5000)
+                await asyncio.sleep(5.0)
             else:
                 if event_callback:
                     await event_callback("Navigate", "warning",
                         "Auto-verify failed. Waiting up to 90s for manual verification...")
                 for _ in range(90):
-                    await page.wait_for_timeout(1000)
+                    await asyncio.sleep(1.0)
                     try:
                         t = await page.evaluate("document.body.innerText")
                         if "verify" not in t.lower():
@@ -1997,7 +1997,7 @@ async def _handle_workday_auth(page, event_callback=None) -> bool:
     if email_vis:
         await _log("Sign-in form visible after account creation. Signing in...")
         await _fill_creds()
-        await page.wait_for_timeout(500)
+        await asyncio.sleep(0.5)
         await _multi_click(
             [
                 'div[data-automation-id="click_filter"][aria-label="Sign In"]',
@@ -2006,7 +2006,7 @@ async def _handle_workday_auth(page, event_callback=None) -> bool:
             ],
             force=True,
         )
-        await page.wait_for_timeout(5000)
+        await asyncio.sleep(5.0)
 
         if await _is_on_form():
             await _log_ok("Signed in after account creation!")
@@ -2021,9 +2021,9 @@ async def _handle_workday_auth(page, event_callback=None) -> bool:
                     'a:has-text("Sign In")',
                 ],
             )
-            await page.wait_for_timeout(3000)
+            await asyncio.sleep(3.0)
             await _fill_creds()
-            await page.wait_for_timeout(500)
+            await asyncio.sleep(0.5)
             await _multi_click(
                 [
                     'div[data-automation-id="click_filter"][aria-label="Sign In"]',
@@ -2032,7 +2032,7 @@ async def _handle_workday_auth(page, event_callback=None) -> bool:
                 ],
                 force=True,
             )
-            await page.wait_for_timeout(5000)
+            await asyncio.sleep(5.0)
 
     if await _is_on_form():
         await _log_ok("Auth completed, on application form!")
@@ -2162,13 +2162,13 @@ async def _handle_custom_dropdown(page, selector: str, value: str, event_callbac
             wd_btn = page.locator(f'{selector} button, {selector} [data-automation-id="searchBox"]').first
             if await wd_btn.is_visible(timeout=2000):
                 await wd_btn.click(timeout=3000)
-                await page.wait_for_timeout(800)
+                await asyncio.sleep(0.8)
                 # Type in search box if available
                 wd_search = page.locator('[data-automation-id="searchBox"] input, input[data-automation-id="searchBox"]').first
                 try:
                     if await wd_search.is_visible(timeout=1000):
                         await wd_search.fill(value, timeout=3000)
-                        await page.wait_for_timeout(800)
+                        await asyncio.sleep(0.8)
                 except Exception:
                     pass
                 # Click matching option
@@ -2195,7 +2195,7 @@ async def _handle_custom_dropdown(page, selector: str, value: str, event_callbac
         el = page.locator(selector).first
         await el.scroll_into_view_if_needed(timeout=3000)
         await el.click(timeout=3000)
-        await page.wait_for_timeout(800)
+        await asyncio.sleep(0.8)
 
         # Check for a search/filter input inside the dropdown
         search_selectors = [
@@ -2211,7 +2211,7 @@ async def _handle_custom_dropdown(page, selector: str, value: str, event_callbac
                 search_input = page.locator(search_sel).first
                 if await search_input.is_visible(timeout=500):
                     await search_input.fill(value, timeout=3000)
-                    await page.wait_for_timeout(800)
+                    await asyncio.sleep(0.8)
                     # Click the first visible matching option
                     for opt_sel in ['[role="option"]', 'li', '[class*="option"]']:
                         try:
@@ -2250,7 +2250,7 @@ async def _handle_custom_dropdown(page, selector: str, value: str, event_callbac
         try:
             el = page.locator(selector).first
             await el.click(timeout=2000)
-            await page.wait_for_timeout(500)
+            await asyncio.sleep(0.5)
         except Exception:
             pass
 
@@ -2293,7 +2293,7 @@ async def _handle_custom_dropdown(page, selector: str, value: str, event_callbac
         }""", value)
 
         if clicked:
-            await page.wait_for_timeout(500)
+            await asyncio.sleep(0.5)
             return True
     except Exception:
         pass
@@ -2301,13 +2301,13 @@ async def _handle_custom_dropdown(page, selector: str, value: str, event_callbac
     # Strategy 4: type into the dropdown element and press Enter
     try:
         await page.keyboard.press("Escape")
-        await page.wait_for_timeout(300)
+        await asyncio.sleep(0.3)
         el = page.locator(selector).first
         await el.click(timeout=2000)
         await page.keyboard.type(value, delay=50)
-        await page.wait_for_timeout(1000)
+        await asyncio.sleep(1.0)
         await page.keyboard.press("Enter")
-        await page.wait_for_timeout(500)
+        await asyncio.sleep(0.5)
         return True
     except Exception:
         pass
@@ -2350,14 +2350,14 @@ async def _handle_phone_country(page_or_frame, target_country: str = "United Sta
         # Click flag to open dropdown
         flag_btn = page_or_frame.locator('.iti__selected-flag').first
         await flag_btn.click(timeout=3000)
-        await page_or_frame.wait_for_timeout(500)
+        await asyncio.sleep(0.5)
 
         # Try search box if available
         try:
             search = page_or_frame.locator('.iti__search-input, .iti__country-list input').first
             if await search.is_visible(timeout=1000):
                 await search.fill("United States")
-                await page_or_frame.wait_for_timeout(500)
+                await asyncio.sleep(0.5)
         except Exception:
             pass
 
@@ -2462,7 +2462,7 @@ async def _handle_resume_upload(page_or_frame, resume_path: str, event_callback=
 
             fi = page_or_frame.locator('input[type="file"]').nth(i)
             await fi.set_input_files(resume_path, timeout=10000)
-            await page_or_frame.wait_for_timeout(2000)
+            await asyncio.sleep(2.0)
 
             if event_callback:
                 await event_callback("Fill Form", "success", f"Resume uploaded via file input {i}")
@@ -2488,7 +2488,7 @@ async def _handle_resume_upload(page_or_frame, resume_path: str, event_callback=
                     await btn.click(timeout=3000)
                 chooser = await fc.value
                 await chooser.set_files(resume_path)
-                await page_or_frame.wait_for_timeout(2000)
+                await asyncio.sleep(2.0)
                 if event_callback:
                     await event_callback("Fill Form", "success", "Resume uploaded via file chooser")
                 return True
@@ -2535,12 +2535,12 @@ async def fill_form(
                         await loc.click(timeout=3000)
                         await loc.fill("", timeout=2000)  # Clear first
                         await page.keyboard.type(value, delay=80)
-                        await page.wait_for_timeout(1500)
+                        await asyncio.sleep(1.5)
                         # Try pressing ArrowDown + Enter to accept autocomplete suggestion
                         await page.keyboard.press("ArrowDown")
-                        await page.wait_for_timeout(300)
+                        await asyncio.sleep(0.3)
                         await page.keyboard.press("Enter")
-                        await page.wait_for_timeout(500)
+                        await asyncio.sleep(0.5)
                         # If autocomplete cleared the value, just set it directly
                         current = await loc.input_value()
                         if not current:
@@ -2754,7 +2754,7 @@ async def fill_application(
     # Navigate
     await page.goto(url, wait_until="domcontentloaded", timeout=30000)
     # Wait a bit for JS rendering
-    await page.wait_for_timeout(3000)
+    await asyncio.sleep(3.0)
 
     if event_callback:
         await event_callback("Navigate", "success", "Page loaded")
@@ -2786,7 +2786,7 @@ async def fill_application(
                 "CAPTCHA detected - please solve it in the browser window. Waiting up to 2 minutes...")
         # Wait for user to solve CAPTCHA manually (up to 120s)
         for _ in range(120):
-            await page.wait_for_timeout(1000)
+            await asyncio.sleep(1.0)
             still_captcha = await _check_for_captcha(page)
             if not still_captcha:
                 break
@@ -2807,12 +2807,12 @@ async def fill_application(
     while scroll_pos < page_height:
         scroll_pos += viewport_height
         await page.evaluate(f"window.scrollTo(0, {scroll_pos})")
-        await page.wait_for_timeout(500)
+        await asyncio.sleep(0.5)
         # Page might grow as we scroll
         page_height = await page.evaluate("document.body.scrollHeight")
-    await page.wait_for_timeout(1000)
+    await asyncio.sleep(1.0)
     await page.evaluate("window.scrollTo(0, 0)")
-    await page.wait_for_timeout(500)
+    await asyncio.sleep(0.5)
 
     # Extract form fields - try main page first, then iframes
     if event_callback:
@@ -2872,7 +2872,7 @@ async def fill_application(
         ]
         # Scroll down to find apply button
         await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        await page.wait_for_timeout(1000)
+        await asyncio.sleep(1.0)
 
         for sel in apply_selectors:
             try:
@@ -2886,7 +2886,7 @@ async def fill_application(
                         apply_clicked = True
                         if event_callback:
                             await event_callback("Extract Fields", "info", f"Navigated to application form: {page.url[:60]}")
-                        await page.wait_for_timeout(5000)
+                        await asyncio.sleep(5.0)
                         # Dismiss cookies on the new page too
                         await _dismiss_cookie_banners(page)
                     else:
@@ -2894,7 +2894,7 @@ async def fill_application(
                         apply_clicked = True
                         if event_callback:
                             await event_callback("Extract Fields", "info", "Clicked Apply button, waiting for form...")
-                        await page.wait_for_timeout(5000)
+                        await asyncio.sleep(5.0)
                     break
             except Exception:
                 continue
@@ -2907,7 +2907,7 @@ async def fill_application(
                     await event_callback("Extract Fields", "info",
                         "CAPTCHA on application page - please solve it. Waiting up to 2 minutes...")
                 for _ in range(120):
-                    await page.wait_for_timeout(1000)
+                    await asyncio.sleep(1.0)
                     still_captcha = await _check_for_captcha(page)
                     if not still_captcha:
                         break
@@ -2917,7 +2917,7 @@ async def fill_application(
                             break
                     except Exception:
                         pass
-                await page.wait_for_timeout(2000)
+                await asyncio.sleep(2.0)
                 if event_callback:
                     await event_callback("Extract Fields", "info", "Continuing after CAPTCHA")
 
@@ -2934,7 +2934,7 @@ async def fill_application(
                         submit = page.locator('#enterEmailSubmitButton, button[type="submit"], input[type="submit"]')
                         if await submit.first.is_visible(timeout=2000):
                             await submit.first.click()
-                            await page.wait_for_timeout(5000)
+                            await asyncio.sleep(5.0)
                         # Check for password field (existing account)
                         pw_field = page.locator('input[type="password"]')
                         if await pw_field.first.is_visible(timeout=3000):
@@ -2944,7 +2944,7 @@ async def fill_application(
                                 submit2 = page.locator('button[type="submit"], input[type="submit"]')
                                 if await submit2.first.is_visible(timeout=2000):
                                     await submit2.first.click()
-                                    await page.wait_for_timeout(5000)
+                                    await asyncio.sleep(5.0)
                         if event_callback:
                             await event_callback("Extract Fields", "info", f"Logged in, now at: {page.url[:60]}")
             except Exception:
@@ -2969,7 +2969,7 @@ async def fill_application(
     if len(fields) == 0:
         if event_callback:
             await event_callback("Extract Fields", "info", "No fields yet, waiting for JS to render...")
-        await page.wait_for_timeout(5000)
+        await asyncio.sleep(5.0)
         fields = await page.evaluate(JS_EXTRACT_FIELDS)
         form_context = page
         # Check iframes again
@@ -3070,17 +3070,17 @@ async def fill_application(
             summary = await fill_form(form_context, mappings, resume_path, transcript_path, event_callback, screenshot_callback, page)
         else:
             # Re-extract fields and check which are still empty
-            await page.wait_for_timeout(1500)
+            await asyncio.sleep(1.5)
 
             # Scroll to load any lazy content
             page_height = await form_context.evaluate("document.body.scrollHeight") if hasattr(form_context, 'evaluate') else await page.evaluate("document.body.scrollHeight")
             for i in range(0, page_height, 900):
                 target = form_context if hasattr(form_context, 'evaluate') else page
                 await target.evaluate(f"window.scrollTo(0, {i})")
-                await page.wait_for_timeout(300)
+                await asyncio.sleep(0.3)
             target = form_context if hasattr(form_context, 'evaluate') else page
             await target.evaluate("window.scrollTo(0, 0)")
-            await page.wait_for_timeout(500)
+            await asyncio.sleep(0.5)
 
             re_fields = await form_context.evaluate(JS_EXTRACT_FIELDS)
 
@@ -3141,7 +3141,7 @@ async def fill_application(
 
     # Final screenshot
     await page.evaluate("window.scrollTo(0, 0)")
-    await page.wait_for_timeout(500)
+    await asyncio.sleep(0.5)
     if screenshot_callback:
         ss = await _take_screenshot(page)
         await screenshot_callback(ss)

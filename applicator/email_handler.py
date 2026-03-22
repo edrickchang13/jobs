@@ -269,13 +269,13 @@ async def enter_verification_code(page: Page, code: str, event_callback=None) ->
                         btn = page.locator(ss).first
                         if await btn.is_visible(timeout=1000):
                             await btn.click()
-                            await page.wait_for_timeout(5000)
+                            await asyncio.sleep(5)
                             return True
                     except:
                         continue
 
                 await page.keyboard.press("Enter")
-                await page.wait_for_timeout(5000)
+                await asyncio.sleep(5)
                 return True
         except:
             continue
