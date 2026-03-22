@@ -1057,10 +1057,27 @@ async def continue_application_endpoint():
         current_url = page.url
         print(f">>> page alive, url: {current_url[:80]}")
     except Exception as e:
-        print(f">>> page dead: {e}")
-        active_page = None
-        add_event("Continue", "error", "Browser page closed. Start a new application.")
-        return JSONResponse({"status": "error", "message": "Browser page closed"})
+        print(f">>> page dead ({e}), trying _bu_browser refresh...")
+        # Page ref is stale — try getting a fresh one from _bu_browser
+        page = None
+        try:
+            from applicator.form_filler import _bu_browser
+            if _bu_browser:
+                page = await _bu_browser.get_current_page()
+                if page:
+                    active_page = page
+                    try:
+                        active_context = page.context
+                    except Exception:
+                        pass
+                    current_url = page.url
+                    print(f">>> refreshed page from _bu_browser: {current_url[:80]}")
+        except Exception as e2:
+            print(f">>> _bu_browser refresh also failed: {e2}")
+        if not page:
+            active_page = None
+            add_event("Continue", "error", "Browser page closed. Start a new application.")
+            return JSONResponse({"status": "error", "message": "Browser page closed"})
 
     # Screenshot
     try:
@@ -1240,18 +1257,24 @@ async def continue_application_endpoint():
             add_event("Continue", "info", f"After auth: {page.url[:80]}. Click Continue again to proceed.")
             return JSONResponse({"status": "ok", "action": "auth"})
 
+        # --- Resume path for all form-filling below ---
+        resume_path = uploaded_resume or ""
+        if not resume_path:
+            for p in [
+                str(Path(__file__).parent.parent / "uploads" / "EdrickChang_Resume.pdf"),
+                r"C:\Users\Owner\jobs\uploads\EdrickChang_Resume.pdf",
+                r"C:\Users\Owner\Downloads\EdrickChang_Resume.pdf",
+                str(Path(os.path.expanduser("~/Downloads/EdrickChang.pdf"))),
+            ]:
+                if os.path.exists(p):
+                    resume_path = p
+                    break
+        print(f">>> /continue resume_path: {resume_path}")
+
         # --- WORKDAY WIZARD ---
         if state.get("isWorkday") and (state.get("hasProgressBar") or state.get("activeStep")):
             step = state.get("activeStep", "Unknown")
             add_event("Continue", "info", f"Workday wizard step: {step}. Running handler...")
-
-            resume_path = uploaded_resume or ""
-            if not resume_path:
-                for c in [Path(__file__).parent.parent / "uploads" / "EdrickChang_Resume.pdf",
-                           Path(os.path.expanduser("~/Downloads/EdrickChang.pdf"))]:
-                    if c.exists():
-                        resume_path = str(c.resolve())
-                        break
 
             from applicator.workday_handler import handle_workday_application
             async def on_evt(s, st, d=""):
@@ -1270,14 +1293,6 @@ async def continue_application_endpoint():
         # --- REGULAR FORM ---
         if state.get("visibleFields", 0) > 3:
             add_event("Continue", "info", f"Form with {state['visibleFields']} fields. Filling...")
-
-            resume_path = uploaded_resume or ""
-            if not resume_path:
-                for c in [Path(__file__).parent.parent / "uploads" / "EdrickChang_Resume.pdf",
-                           Path(os.path.expanduser("~/Downloads/EdrickChang.pdf"))]:
-                    if c.exists():
-                        resume_path = str(c.resolve())
-                        break
 
             from applicator.form_filler import JS_EXTRACT_FIELDS, map_fields_to_profile, fill_form
             fields = await page.evaluate(JS_EXTRACT_FIELDS)
@@ -1557,26 +1572,70 @@ async def _run_application(url: str, company: str, role: str):
                 add_event("Screenshot & Review", "info", f"Screenshot save failed: {e}")
 
         summary = result.get("summary", {})
+        agent_steps = summary.get("steps", 0)
         # completed may already be True from Workday handler above
         if not completed:
             completed = result.get("completed", False)
 
-        if completed:
+        # Verify completion: check if the page still has empty required fields
+        has_empty_fields = False
+        if page and completed:
+            try:
+                empty_count = await page.evaluate("""() => {
+                    const inputs = Array.from(document.querySelectorAll('input:not([type="hidden"]):not([type="submit"]):not([type="button"]),textarea,select'));
+                    return inputs.filter(el => el.offsetParent !== null && !el.value && !el.disabled).length;
+                }""")
+                has_empty_fields = empty_count > 2
+                if has_empty_fields:
+                    add_event("Verify", "warning", f"Agent said done but {empty_count} empty fields remain (after {agent_steps} steps)")
+            except Exception:
+                pass
+
+        # If agent "completed" too fast or left empty fields, don't trust it — run deterministic filler
+        if page and (has_empty_fields or (completed and agent_steps < 5)):
+            add_event("Fallback Filler", "info", "Agent finished too quickly or left empty fields. Running deterministic form filler...")
+            try:
+                from applicator.form_filler import JS_EXTRACT_FIELDS, map_fields_to_profile, fill_form
+                fields = await page.evaluate(JS_EXTRACT_FIELDS)
+                if fields:
+                    mappings = map_fields_to_profile(fields, jd, company, role)
+                    async def fallback_evt(s, st, d=""):
+                        add_event(s, st, d)
+                    fb_result = await fill_form(page, mappings, resume_path, event_callback=fallback_evt, screenshot_page=page)
+                    fb_filled = fb_result.get("filled", 0)
+                    fb_failed = fb_result.get("failed", 0)
+                    add_event("Fallback Filler", "success" if fb_filled > 0 else "warning",
+                        f"Deterministic filler: {fb_filled} filled, {fb_failed} failed")
+                    if fb_filled > 0:
+                        completed = True
+                    # Take post-fill screenshot
+                    try:
+                        ss = await page.screenshot(type="png")
+                        latest_screenshot_b64 = base64.b64encode(ss).decode("utf-8")
+                        screenshot_version += 1
+                    except Exception:
+                        pass
+                else:
+                    add_event("Fallback Filler", "info", "No extractable fields found for fallback filler.")
+            except Exception as e:
+                add_event("Fallback Filler", "error", f"Fallback filler failed: {e}")
+            # Don't auto-mark as applied after fallback — let user review
+            completed = False
+
+        if completed and not has_empty_fields and agent_steps >= 5:
             add_event("Screenshot & Review", "success", "Ready for review.")
             add_event("Pipeline Complete", "success",
-                      f"Agent completed in {summary.get('steps', 0)} steps. "
+                      f"Agent completed in {agent_steps} steps. "
                       f"Auto-marked as applied.")
-
-            # Only auto-mark as applied if the agent actually completed
             from database.tracker import mark_applied
             mark_applied(url, company, role)
         else:
-            add_event("Screenshot & Review", "warning", "Agent did NOT complete the application.")
+            add_event("Screenshot & Review", "warning", "Agent did NOT fully complete the application.")
             final_result = summary.get("final_result", "")
             error = summary.get("error", "")
-            detail = final_result or error or "Agent stopped without completing the form"
-            add_event("Pipeline Incomplete", "error",
-                      f"NOT marked as applied. {detail[:200]}")
+            detail = final_result or error or "Form may need manual review"
+            add_event("Pipeline Incomplete", "info",
+                      f"NOT auto-marked as applied. {detail[:200]}. Click Continue to fill remaining fields.")
 
         # Keep browser open so user can review and manually submit/retry
         add_event("Pipeline Complete", "info", "Browser stays open. Use Continue to analyze page, or Get Email Code for verification.")
@@ -1590,6 +1649,22 @@ async def _run_application(url: str, company: str, role: str):
         add_event("Pipeline Error", "error", f"{e}")
         add_event("Pipeline Error", "info", f"Traceback: {tb[:1500]}")
     finally:
+        # Try to preserve page reference even after errors
+        if not active_page:
+            try:
+                from applicator.form_filler import _bu_browser
+                if _bu_browser:
+                    recovered = await _bu_browser.get_current_page()
+                    if recovered:
+                        active_page = recovered
+                        try:
+                            active_context = recovered.context
+                        except Exception:
+                            pass
+                        print(f">>> finally: recovered active_page from _bu_browser: {recovered.url[:60]}")
+            except Exception as e:
+                print(f">>> finally: could not recover page: {e}")
+        print(f">>> finally: active_page={active_page}")
         pipeline_running = False
 
 
