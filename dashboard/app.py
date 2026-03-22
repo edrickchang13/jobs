@@ -1089,7 +1089,7 @@ async def continue_application_endpoint():
                 "() => !!document.querySelector('[data-automation-id=\"createAccountSubmitButton\"]')")
             if still_on_create:
                 add_event("Continue", "info", "Still on Create Account page. Retrying checkbox + submit...")
-                await check_workday_checkbox(page, event_callback=lambda s, st, d: add_event(s, st, d))
+                await check_workday_consent(page, event_callback=lambda s, st, d: add_event(s, st, d))
                 await page.wait_for_timeout(1000)
                 # Try clicking again with JS
                 await page.evaluate("""() => {
@@ -1120,12 +1120,13 @@ async def continue_application_endpoint():
             step = state.get("activeStep", "Unknown")
             add_event("Continue", "info", f"Workday wizard step: {step}. Running handler...")
 
-            resume_path = ""
-            for c in [Path(__file__).parent.parent / "uploads" / "EdrickChang_Resume.pdf",
-                       Path(os.path.expanduser("~/Downloads/EdrickChang.pdf"))]:
-                if c.exists():
-                    resume_path = str(c.resolve())
-                    break
+            resume_path = uploaded_resume or ""
+            if not resume_path:
+                for c in [Path(__file__).parent.parent / "uploads" / "EdrickChang_Resume.pdf",
+                           Path(os.path.expanduser("~/Downloads/EdrickChang.pdf"))]:
+                    if c.exists():
+                        resume_path = str(c.resolve())
+                        break
 
             from applicator.workday_handler import handle_workday_application
             async def on_evt(s, st, d=""):
@@ -1145,12 +1146,13 @@ async def continue_application_endpoint():
         if state.get("visibleFields", 0) > 3:
             add_event("Continue", "info", f"Form with {state['visibleFields']} fields. Filling...")
 
-            resume_path = ""
-            for c in [Path(__file__).parent.parent / "uploads" / "EdrickChang_Resume.pdf",
-                       Path(os.path.expanduser("~/Downloads/EdrickChang.pdf"))]:
-                if c.exists():
-                    resume_path = str(c.resolve())
-                    break
+            resume_path = uploaded_resume or ""
+            if not resume_path:
+                for c in [Path(__file__).parent.parent / "uploads" / "EdrickChang_Resume.pdf",
+                           Path(os.path.expanduser("~/Downloads/EdrickChang.pdf"))]:
+                    if c.exists():
+                        resume_path = str(c.resolve())
+                        break
 
             from applicator.form_filler import JS_EXTRACT_FIELDS, map_fields_to_profile, fill_form
             fields = await page.evaluate(JS_EXTRACT_FIELDS)

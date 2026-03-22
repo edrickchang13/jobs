@@ -41,7 +41,7 @@ async def check_workday_consent(page: Page, event_callback=None, max_wait_second
         return True  # No checkbox = nothing to check = proceed
 
     # Step 2: Wait for Workday to finish rendering + attach event handlers
-    await asyncio.sleep(2)
+    await asyncio.sleep(3)
 
     # Step 3: Click the click_filter INSIDE each unchecked checkbox
     result = await page.evaluate("""() => {
@@ -58,7 +58,7 @@ async def check_workday_consent(page: Page, event_callback=None, max_wait_second
             const rect = target.getBoundingClientRect();
             const x = rect.left + rect.width / 2;
             const y = rect.top + rect.height / 2;
-            const opts = {bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, screenX: x, screenY: y};
+            const opts = {bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, screenX: x, screenY: y, pointerId: 1};
 
             target.dispatchEvent(new PointerEvent('pointerdown', opts));
             target.dispatchEvent(new MouseEvent('mousedown', opts));
@@ -102,6 +102,25 @@ async def check_workday_consent(page: Page, event_callback=None, max_wait_second
         for i in range(count):
             cb = cbs.nth(i)
             if await cb.is_visible(timeout=1000):
+                # Try clicking the click_filter child specifically via Playwright mouse.click
+                filter_div = page.locator('[role="checkbox"][aria-checked="false"]').nth(i).locator('[data-automation-id="click_filter"]')
+                try:
+                    if await filter_div.is_visible(timeout=500):
+                        box = await filter_div.bounding_box()
+                        if box:
+                            cx = box['x'] + box['width'] / 2
+                            cy = box['y'] + box['height'] / 2
+                            await page.mouse.click(cx, cy)
+                            await asyncio.sleep(1)
+                            state = await cb.get_attribute("aria-checked")
+                            if state == "true":
+                                if event_callback:
+                                    await event_callback("Checkbox", "success", f"Checked via click_filter mouse.click({cx:.0f},{cy:.0f})")
+                                continue
+                except Exception:
+                    pass
+
+                # Fallback: click checkbox itself
                 box = await cb.bounding_box()
                 if box:
                     cx = box['x'] + box['width'] / 2
@@ -191,8 +210,16 @@ async def upload_file_robust(page: Page, file_path: str, event_callback=None) ->
             await asyncio.sleep(3)
             has = await page.evaluate("() => { for (const i of document.querySelectorAll('input[type=\"file\"]')) { if (i.files && i.files.length > 0) return i.files[0].name; } return ''; }")
             if has:
+                # Final verification: check for upload confirmation UI
+                verify = await page.evaluate("""() => {
+                    for (const sel of ['.filename', '.file-name', '.resume-filename', '.attachment-filename', '[data-automation-id="file-upload-item"]', '[class*="upload-success"]', '[class*="attachment"]']) {
+                        const el = document.querySelector(sel);
+                        if (el && el.offsetParent !== null && el.innerText.trim()) return el.innerText.trim();
+                    }
+                    return '';
+                }""")
                 if event_callback:
-                    await event_callback("Upload", "success", f"Uploaded via file input: {has}")
+                    await event_callback("Upload", "success", f"Uploaded via file input: {has}" + (f" (confirmed: {verify})" if verify else ""))
                 return True
     except Exception as e:
         if event_callback:
@@ -216,8 +243,16 @@ async def upload_file_robust(page: Page, file_path: str, event_callback=None) ->
             chooser = await fc.value
             await chooser.set_files(abs_path)
             await asyncio.sleep(5)
+            # Final verification: check for upload confirmation UI
+            verify = await page.evaluate("""() => {
+                for (const s of ['.filename', '.file-name', '.resume-filename', '.attachment-filename', '[data-automation-id="file-upload-item"]', '[class*="upload-success"]', '[class*="attachment"]']) {
+                    const e = document.querySelector(s);
+                    if (e && e.offsetParent !== null && e.innerText.trim()) return e.innerText.trim();
+                }
+                return '';
+            }""")
             if event_callback:
-                await event_callback("Upload", "success", f"Uploaded via file chooser: {sel[:40]}")
+                await event_callback("Upload", "success", f"Uploaded via file chooser: {sel[:40]}" + (f" (confirmed: {verify})" if verify else ""))
             return True
         except Exception:
             continue
@@ -233,8 +268,16 @@ async def upload_file_robust(page: Page, file_path: str, event_callback=None) ->
             chooser = await fc.value
             await chooser.set_files(abs_path)
             await asyncio.sleep(5)
+            # Final verification: check for upload confirmation UI
+            verify = await page.evaluate("""() => {
+                for (const s of ['.filename', '.file-name', '.resume-filename', '.attachment-filename', '[data-automation-id="file-upload-item"]', '[class*="upload-success"]', '[class*="attachment"]']) {
+                    const e = document.querySelector(s);
+                    if (e && e.offsetParent !== null && e.innerText.trim()) return e.innerText.trim();
+                }
+                return '';
+            }""")
             if event_callback:
-                await event_callback("Upload", "success", f"Uploaded via drop zone: {sel[:40]}")
+                await event_callback("Upload", "success", f"Uploaded via drop zone: {sel[:40]}" + (f" (confirmed: {verify})" if verify else ""))
             return True
         except Exception:
             continue
@@ -249,7 +292,9 @@ async def upload_file_robust(page: Page, file_path: str, event_callback=None) ->
             const bin = atob(b64);
             const bytes = new Uint8Array(bin.length);
             for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-            const file = new File([bytes], name, {type: 'application/pdf'});
+            const ext = name.split('.').pop().toLowerCase();
+            const mimeMap = {pdf:'application/pdf', doc:'application/msword', docx:'application/vnd.openxmlformats-officedocument.wordprocessingml.document', txt:'text/plain', rtf:'application/rtf'};
+            const file = new File([bytes], name, {type: mimeMap[ext] || 'application/octet-stream'});
             const dt = new DataTransfer();
             dt.items.add(file);
             const fi = document.querySelector('input[type="file"]');
@@ -264,7 +309,7 @@ async def upload_file_robust(page: Page, file_path: str, event_callback=None) ->
         }""", [b64, fname])
         if dropped == "ok":
             await asyncio.sleep(5)
-            result = await page.evaluate("() => { for (const s of ['.filename','.file-name','[data-automation-id=\"file-upload-item\"]']) { const e = document.querySelector(s); if (e && e.innerText.trim()) return e.innerText.trim(); } return ''; }")
+            result = await page.evaluate("() => { for (const s of ['.filename','.file-name','.resume-filename','.attachment-filename','[data-automation-id=\"file-upload-item\"]','[class*=\"upload-success\"]','[class*=\"attachment\"]']) { const e = document.querySelector(s); if (e && e.offsetParent !== null && e.innerText.trim()) return e.innerText.trim(); } return ''; }")
             if result:
                 if event_callback:
                     await event_callback("Upload", "success", f"Drag-drop worked: {result}")

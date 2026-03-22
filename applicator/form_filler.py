@@ -555,6 +555,78 @@ JS_EXTRACT_FIELDS = """
         fields.push(field);
     }
 
+    // === Workday data-automation-id fields ===
+    const wdFields = form.querySelectorAll('[data-automation-id]');
+    for (const el of wdFields) {
+        const dataid = el.getAttribute('data-automation-id') || '';
+        if (!dataid.startsWith('formField-') && !dataid.startsWith('multiSelectContainer')
+            && dataid !== 'countryDropdown' && dataid !== 'phone'
+            && !dataid.startsWith('legalCountry') && !dataid.startsWith('addressSection'))
+            continue;
+        if (el.offsetParent === null) continue;
+        // Skip if we already captured an input inside this container
+        const hasInput = el.querySelector('input, textarea, select');
+        const alreadyCaptured = hasInput && fields.some(f => el.contains(document.querySelector(f.selector)));
+        if (alreadyCaptured) continue;
+
+        const label = el.querySelector('label');
+        const labelText = label ? label.innerText.trim() : '';
+        const btn = el.querySelector('button');
+        const btnText = btn ? btn.innerText.trim() : '';
+        const input = el.querySelector('input');
+        fields.push({
+            selector: '[data-automation-id="' + dataid + '"]',
+            tag: 'div',
+            type: btn ? 'workday-dropdown' : (input ? input.type : 'workday-field'),
+            name: dataid,
+            label: labelText || dataid.replace('formField-', '').replace(/-/g, ' '),
+            required: el.querySelector('[required]') !== null || el.querySelector('[aria-required="true"]') !== null,
+            value: btnText || (input ? input.value : ''),
+            placeholder: input ? (input.placeholder || '') : '',
+            options: [],
+        });
+    }
+
+    // === React Select dropdowns ===
+    const reactSelects = form.querySelectorAll('[class*="react-select"], [class*="css-"][role="combobox"]');
+    for (const el of reactSelects) {
+        if (el.offsetParent === null) continue;
+        const container = el.closest('.field, .form-group, .application-field, li') || el.parentElement;
+        const label = container ? container.querySelector('label') : null;
+        const labelText = label ? label.innerText.trim() : (el.getAttribute('aria-label') || '');
+        const valueEl = el.querySelector('[class*="singleValue"], [class*="placeholder"]');
+        fields.push({
+            selector: el.id ? '#' + CSS.escape(el.id) : '[class*="react-select"]',
+            tag: 'div',
+            type: 'react-select',
+            name: el.getAttribute('name') || '',
+            label: labelText,
+            required: el.getAttribute('aria-required') === 'true',
+            value: valueEl ? valueEl.innerText.trim() : '',
+            placeholder: '',
+            options: [],
+        });
+    }
+
+    // === contenteditable divs ===
+    const editables = form.querySelectorAll('[contenteditable="true"]');
+    for (const el of editables) {
+        if (el.offsetParent === null) continue;
+        const parent = el.closest('.field, .form-group, li, .application-field') || el.parentElement;
+        const label = parent ? parent.querySelector('label') : null;
+        fields.push({
+            selector: el.id ? '#' + CSS.escape(el.id) : '[contenteditable="true"]',
+            tag: 'div',
+            type: 'contenteditable',
+            name: el.getAttribute('name') || el.getAttribute('data-placeholder') || '',
+            label: label ? label.innerText.trim() : (el.getAttribute('aria-label') || ''),
+            required: el.getAttribute('aria-required') === 'true',
+            value: el.innerText.trim(),
+            placeholder: el.getAttribute('data-placeholder') || el.getAttribute('placeholder') || '',
+            options: [],
+        });
+    }
+
     return fields;
 }
 """
@@ -569,8 +641,12 @@ def _get_llm_client():
 
 def _parse_json_response(text: str) -> list:
     """Parse JSON from LLM response, handling markdown fences and think tags."""
-    # Strip <think>...</think> tags (Qwen 3)
-    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+    # Strip <think>...</think> tags aggressively (Qwen 3) - handle partial, nested, unclosed
+    text = re.sub(r'<think>[\s\S]*?</think>', '', text, flags=re.DOTALL)
+    # Handle unclosed <think> tags (model cut off mid-think)
+    text = re.sub(r'<think>[\s\S]*$', '', text, flags=re.DOTALL)
+    # Handle orphan </think> at start
+    text = re.sub(r'^[\s\S]*?</think>', '', text, flags=re.DOTALL)
     # Strip markdown code fences
     text = re.sub(r'```json\s*', '', text)
     text = re.sub(r'```\s*', '', text)
@@ -673,7 +749,7 @@ REMEMBER: Fill EVERY field. Only use "skip" for optional cover letter / addition
         model="gemini-2.5-flash",
         max_tokens=8000,
         messages=[
-            {"role": "system", "content": "You return only valid JSON arrays. No markdown, no explanation."},
+            {"role": "system", "content": "You return only valid JSON arrays. No markdown, no explanation. /no_think"},
             {"role": "user", "content": prompt},
         ],
     )
@@ -2063,6 +2139,47 @@ async def _handle_custom_dropdown(page, selector: str, value: str, event_callbac
     except Exception:
         pass
 
+    # Strategy 1.5: Workday button-based dropdowns (data-automation-id)
+    try:
+        is_workday_dd = await page.evaluate(f"""() => {{
+            const el = document.querySelector('{selector}');
+            if (!el) return false;
+            const dataid = el.getAttribute('data-automation-id') || '';
+            return dataid.startsWith('formField-') || dataid.startsWith('multiSelectContainer') || !!el.querySelector('[data-automation-id="searchBox"]');
+        }}""")
+        if is_workday_dd:
+            # Click the dropdown button to open
+            wd_btn = page.locator(f'{selector} button, {selector} [data-automation-id="searchBox"]').first
+            if await wd_btn.is_visible(timeout=2000):
+                await wd_btn.click(timeout=3000)
+                await page.wait_for_timeout(800)
+                # Type in search box if available
+                wd_search = page.locator('[data-automation-id="searchBox"] input, input[data-automation-id="searchBox"]').first
+                try:
+                    if await wd_search.is_visible(timeout=1000):
+                        await wd_search.fill(value, timeout=3000)
+                        await page.wait_for_timeout(800)
+                except Exception:
+                    pass
+                # Click matching option
+                for opt_sel in ['[data-automation-id*="promptOption"]', '[role="option"]', '[data-automation-id="menuItem"]']:
+                    try:
+                        opts = page.locator(opt_sel)
+                        count = await opts.count()
+                        for i in range(min(count, 15)):
+                            opt = opts.nth(i)
+                            if await opt.is_visible(timeout=300):
+                                text = await opt.inner_text()
+                                if _is_dropdown_match(text, value):
+                                    await opt.click(timeout=3000)
+                                    if event_callback:
+                                        await event_callback("Fill Form", "info", f"Workday dropdown: {text[:50]}")
+                                    return True
+                    except Exception:
+                        continue
+    except Exception:
+        pass
+
     # Strategy 2: click to open, then search/type in filter input
     try:
         el = page.locator(selector).first
@@ -2289,7 +2406,7 @@ async def _handle_resume_upload(page_or_frame, resume_path: str, event_callback=
     # Check if already uploaded
     already = await page_or_frame.evaluate("""() => {
         for (const sel of ['.filename', '.file-name', '.resume-filename', '.attachment-filename',
-                           '[data-automation-id="file-upload-item"]', '[class*="upload-success"]']) {
+                           '[data-automation-id="file-upload-item"]', '[class*="upload-success"]', '[class*="attachment"]']) {
             const el = document.querySelector(sel);
             if (el && el.innerText.trim()) return el.innerText.trim();
         }
@@ -2552,7 +2669,7 @@ async def fill_form(
             for (const fi of document.querySelectorAll('input[type="file"]')) {
                 if (fi.files && fi.files.length > 0) return true;
             }
-            for (const sel of ['.filename', '.file-name', '.resume-filename', '.attachment-filename']) {
+            for (const sel of ['.filename', '.file-name', '.resume-filename', '.attachment-filename', '[data-automation-id="file-upload-item"]', '[class*="upload-success"]', '[class*="attachment"]']) {
                 const el = document.querySelector(sel);
                 if (el && el.innerText.trim()) return true;
             }
