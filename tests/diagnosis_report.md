@@ -1,16 +1,18 @@
 # Diagnosis Report
-Generated: 2026-03-21 20:37:12
-Duration: 44s
+Generated: 2026-03-21 21:46:36
+Duration: 11s
 
-## ALL TESTS PASSED
+## TESTS FAILED: 1 of 1
 
-1 test(s) passed.
+- **Lever - Direct Apply Form**
 
-## PASS: Lever - Direct Apply Form
+---
+
+## FAIL: Lever - Direct Apply Form
 
 ### [pass] Navigate
 Loaded: https://jobs.lever.co/aofl/4b91076d-8937-4dbc-a502-a7d6a66e2e19/apply
-Screenshot: `C:\Users\Owner\jobs\tests\screenshots\Lever - Direct Apply Form_01_loaded.png`
+Screenshot: `C:\Users\Owner\jobs-upload\tests\screenshots\Lever - Direct Apply Form_01_loaded.png`
 
 ### [pass] Extract Fields
 36 fields extracted
@@ -127,199 +129,16 @@ Screenshot: `C:\Users\Owner\jobs\tests\screenshots\Lever - Direct Apply Form_01_
 ### [info] Field
 [select-one  ] eeo veteran                              required=False sel=[name="eeo[veteran]"]
 
-### [pass] LLM Mapping
-21 mappings
-
-### [info] Mapping
-upload_file  | resume                              | 'resume'
-
-### [info] Mapping
-fill         | Full name
-✱                         | 'Edrick Chang'
-
-### [info] Mapping
-click        | [name="pronouns"][label="He/him ::  | ''
-
-### [info] Mapping
-fill         | Email
-✱                             | 'eachang@scu.edu'
-
-### [info] Mapping
-fill         | Phone
-✱                             | '(408) 806-6495'
-
-### [info] Mapping
-fill         | Current location
-✱                  | 'San Jose, CA'
-
-### [info] Mapping
-fill         | Current company                     | ''
-
-### [info] Mapping
-fill         | LinkedIn URL                        | 'https://linkedin.com/in/edrickchang'
-
-### [info] Mapping
-fill         | GitHub URL                          | 'https://github.com/edrickchang'
-
-### [info] Mapping
-fill         | Portfolio URL                       | ''
-
-### [info] Mapping
-fill         | Other website                       | ''
-
-### [info] Mapping
-click        | [name="cards[7a24a6c6-2117-4412-bda | ''
-
-### [info] Mapping
-click        | [name="cards[7a24a6c6-2117-4412-bda | ''
-
-### [info] Mapping
-click        | [name="cards[81cb37d2-a188-494e-9e6 | ''
-
-### [info] Mapping
-click        | [name="cards[81cb37d2-a188-494e-9e6 | ''
-
-### [info] Mapping
-click        | [name="cards[b5d46307-d512-4507-873 | ''
-
-### [info] Mapping
-fill         | cards b5d46307 d512 4507 873d 8aa9b | ''
-
-### [info] Mapping
-skip         | ADDITIONAL INFORMATION              | ''
-
-### [info] Mapping
-select       | eeo gender                          | 'Male'
-
-### [info] Mapping
-select       | eeo race                            | 'Asian (Not Hispanic or Latino)'
-
-### [info] Mapping
-select       | eeo veteran                         | 'I am not a veteran'
-
-### [info] Fill Form
-Starting fill...
-Screenshot: `C:\Users\Owner\jobs\tests\screenshots\Lever - Direct Apply Form_03_before_fill.png`
-
-### [pass] Fill Result
-Filled: 20, Failed: 0
-Screenshot: `C:\Users\Owner\jobs\tests\screenshots\Lever - Direct Apply Form_04_after_fill.png`
-
-### [pass] Verify
-OK: Resume/CV
-✱
-EDRICKCHANG_RESUME.PDF
-Could = 'C:\fakepath\EdrickChang_Resume.pdf'
-
-### [pass] Verify
-OK: Full name
-✱ = 'Edrick Chang'
-
-### [pass] Verify
-OK: He/him = 'He/him'
-
-### [pass] Verify
-OK: She/her = 'She/her'
-
-### [pass] Verify
-OK: They/them = 'They/them'
-
-### [pass] Verify
-OK: Xe/xem = 'Xe/xem'
-
-### [pass] Verify
-OK: Ze/hir = 'Ze/hir'
-
-### [pass] Verify
-OK: Ey/em = 'Ey/em'
-
-### [pass] Verify
-OK: Hir/hir = 'Hir/hir'
-
-### [pass] Verify
-OK: Fae/faer = 'Fae/faer'
-
-### [pass] Verify
-OK: Hu/hu = 'Hu/hu'
-
-### [pass] Verify
-OK: Use name only = 'Use name only'
-
-### [pass] Verify
-OK: Custom = 'Custom'
-
-### [pass] Verify
-OK: Email
-✱ = 'eachang@scu.edu'
-
-### [pass] Verify
-OK: Phone
-✱ = '(408) 806-6495'
-
-### [pass] Verify
-OK: LinkedIn URL = 'https://linkedin.com/in/edrickchang'
-
-### [pass] Verify
-OK: GitHub URL = 'https://github.com/edrickchang'
-
-### [pass] Verify
-OK: Yes = 'Yes'
-
-### [pass] Verify
-OK: No = 'No'
-
-### [pass] Verify
-OK: Yes = 'Yes'
-
-### [pass] Verify
-OK: No = 'No'
-
-### [pass] Verify
-OK: Yes = 'Yes'
-
-### [pass] Verify
-OK: No = 'No'
-
-### [pass] Verify
-OK: Yes = 'Yes'
-
-### [pass] Verify
-OK: No = 'No'
-
-### [pass] Verify
-OK: Yes = 'Yes'
-
-### [pass] Verify
-OK: No = 'No'
-
-### [pass] Verify
-OK: Gender
-Select ...
-Male
-Female
-Decline to = 'Male'
-
-### [pass] Verify
-OK: Race
-Select ...
-Hispanic or Latino
-White = 'Asian (Not Hispanic or Latino)'
-
-### [pass] Verify
-OK: Veteran status
-Select ...
-I am a veteran = 'I am not a veteran'
-
-### [info] Verify
-Location field may have autocomplete value: Current location
-✱
-
-### [pass] Verify
-Resume: EdrickChang_Resume.pdf
-
-### [pass] RESULT
-ALL CHECKS PASSED
-Screenshot: `C:\Users\Owner\jobs\tests\screenshots\Lever - Direct Apply Form_05_final.png`
+### [error] LLM Mapping
+CRASHED: The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable
+Traceback (most recent call last):
+  File "C:\Users\Owner\jobs-upload\tests\self_heal.py", line 163, in run_test
+    mappings = map_fields_to_profile(fields, "Software engineering internship", company, role)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Owner\jobs-upload\applicator\form_filler.py", line 670, in map_fields_to_profile
+    client = _get_llm_client()
+             ^^^^^^^^^^^^^^^^^
+  File "C:\Users\Owner\jobs-upload\ap
 
 ---
 
