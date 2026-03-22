@@ -481,6 +481,10 @@ JS_EXTRACT_FIELDS = """
     function getSelector(el) {
         // Prefer name (most reliable for form fields)
         if (el.name) {
+            // For radio/checkbox, include value to make selector unique
+            if ((el.type === 'radio' || el.type === 'checkbox') && el.value) {
+                return '[name="' + el.name + '"][value="' + el.value.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"]';
+            }
             return '[name="' + el.name + '"]';
         }
         if (el.id) return '#' + CSS.escape(el.id);
@@ -543,12 +547,34 @@ JS_EXTRACT_FIELDS = """
             }));
         }
 
-        // For radio/checkbox, get the label for this specific option
+        // For radio/checkbox, find the actual question text and option text
         if (type === 'radio' || type === 'checkbox') {
             const wrapper = el.closest('li, div, label');
-            if (wrapper) {
-                const text = wrapper.innerText.trim();
-                if (text) field.label = field.label + ' :: ' + text;
+            const optionText = wrapper ? wrapper.innerText.trim() : '';
+
+            // Walk up to find question text (a sibling branch that doesn't contain the radio)
+            let questionText = '';
+            let ancestor = el;
+            for (let i = 0; i < 10 && ancestor; i++) {
+                ancestor = ancestor.parentElement;
+                if (!ancestor || ancestor === document.body || ancestor === form) break;
+                for (const child of ancestor.children) {
+                    if (child.contains(el)) continue;
+                    // Skip sibling field groups that contain other inputs
+                    if (child.querySelector && child.querySelector('input, select, textarea')) continue;
+                    const t = (child.innerText || '').trim();
+                    if (t.length > 10 && t !== 'Yes' && t !== 'No' && t !== optionText) {
+                        questionText = t.substring(0, 200);
+                        break;
+                    }
+                }
+                if (questionText) break;
+            }
+
+            if (questionText) {
+                field.label = questionText + ' :: ' + optionText;
+            } else if (optionText && optionText !== field.label) {
+                field.label = field.label + ' :: ' + optionText;
             }
         }
 
@@ -2685,7 +2711,11 @@ async def fill_form(
                                 const el = document.querySelector(sel);
                                 if (el) {
                                     el.focus();
-                                    el.value = val;
+                                    if (el.contentEditable === 'true') {
+                                        el.textContent = val;
+                                    } else {
+                                        el.value = val;
+                                    }
                                     el.dispatchEvent(new Event('input', {bubbles: true}));
                                     el.dispatchEvent(new Event('change', {bubbles: true}));
                                     el.dispatchEvent(new Event('blur', {bubbles: true}));
@@ -2731,9 +2761,28 @@ async def fill_form(
                     except Exception:
                         pass
                 if not click_ok:
+                    # Fallback: try by name + value (for radio/checkbox with [name="x"][value="y"] selectors)
+                    try:
+                        import re as _re
+                        name_match = _re.search(r'\[name="([^"]*)"\]', selector)
+                        value_match = _re.search(r'\[value="([^"]*)"\]', selector)
+                        if name_match and value_match:
+                            click_ok = await page.evaluate("""(args) => {
+                                const [fieldName, fieldValue] = args;
+                                const inputs = document.querySelectorAll('input');
+                                for (const inp of inputs) {
+                                    if (inp.name === fieldName && inp.value === fieldValue) {
+                                        inp.click();
+                                        return true;
+                                    }
+                                }
+                                return false;
+                            }""", [name_match.group(1), value_match.group(1)])
+                    except Exception:
+                        pass
+                if not click_ok:
                     # Last resort: try by label text (for radio/checkbox)
                     try:
-                        # Extract label from composite selector like [name="x"][label="Yes :: Yes"]
                         import re as _re
                         label_match = _re.search(r'label="([^"]*)"', selector)
                         if label_match:
@@ -2741,7 +2790,6 @@ async def fill_form(
                             name_match = _re.search(r'name="([^"]*)"', selector)
                             if name_match:
                                 field_name = name_match.group(1)
-                                # Find the radio/checkbox by name and label text
                                 click_ok = await page.evaluate("""(args) => {
                                     const [fieldName, labelText] = args;
                                     const inputs = document.querySelectorAll('input[name="' + fieldName + '"]');
