@@ -1377,28 +1377,6 @@ async def _run_application(url: str, company: str, role: str):
             except Exception:
                 active_context = None
 
-        # Workday multi-step: if agent finished but didn't complete, try dedicated handler
-        if page and not completed and ("workday" in url.lower() or "myworkdayjobs" in url.lower()):
-            add_event("Workday Handler", "info", "Agent didn't fully complete. Trying dedicated Workday multi-step handler...")
-            try:
-                from applicator.workday_handler import handle_workday_application
-                wd_result = await handle_workday_application(
-                    page=page,
-                    resume_path=resume_path,
-                    company=company,
-                    role=role,
-                    job_description=jd,
-                    event_callback=on_event,
-                    screenshot_callback=on_screenshot,
-                )
-                wd_filled = wd_result.get("filled", 0)
-                wd_failed = wd_result.get("failed", 0)
-                add_event("Workday Handler", "info", f"Workday handler: filled {wd_filled}, failed {wd_failed}")
-                if wd_filled > 0:
-                    completed = True
-            except Exception as e:
-                add_event("Workday Handler", "error", f"Workday handler error: {str(e)[:200]}")
-
         # Step 5: Final screenshot for review
         add_event("Screenshot & Review", "start", "Capturing final state...")
 

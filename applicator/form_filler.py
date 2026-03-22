@@ -107,6 +107,53 @@ _browser = None
 _bu_browser = None  # browser-use browser instance
 
 
+async def _detect_workday_page_state(page) -> str:
+    """Detect what Workday page we're on: auth, form, verify, success, upload, unknown."""
+    try:
+        return await page.evaluate("""() => {
+            const t = document.body.innerText.toLowerCase();
+
+            // Auth page (sign in or create account)
+            if (document.querySelector('[data-automation-id="signInContent"]')
+                || document.querySelector('[data-automation-id="createAccountLink"]')
+                || document.querySelector('[data-automation-id="signInSubmitButton"]')
+                || document.querySelector('[data-automation-id="createAccountSubmitButton"]')
+                || document.querySelector('input[data-automation-id="password"]')) {
+                return 'auth';
+            }
+
+            // Form page (application wizard with progress bar or form fields)
+            if (document.querySelector('[data-automation-id="applyFlowPage"]')
+                || document.querySelector('[data-automation-id="pageFooterNextButton"]')
+                || document.querySelector('[data-automation-id="progressBar"]')
+                || document.querySelector('[data-automation-id="bottom-navigation-next-button"]')) {
+                return 'form';
+            }
+
+            // Verification
+            if (['verify your email', 'verification code', 'check your email',
+                 'check your inbox', 'enter the code'].some(k => t.includes(k))) {
+                return 'verify';
+            }
+
+            // Success
+            if (['application submitted', 'thank you for applying',
+                 'application received', 'successfully submitted'].some(k => t.includes(k))) {
+                return 'success';
+            }
+
+            // Resume upload page (before auth)
+            if (document.querySelector('[data-automation-id="file-upload-drop-zone"]')
+                && !document.querySelector('[data-automation-id="progressBar"]')) {
+                return 'upload';
+            }
+
+            return 'unknown';
+        }""")
+    except Exception:
+        return "unknown"
+
+
 async def fill_with_browser_agent(
     url: str,
     company: str,
@@ -117,10 +164,13 @@ async def fill_with_browser_agent(
     screenshot_callback=None,
     transcript_path: str = "",
 ) -> dict:
-    """Use browser-use AI agent to fill job applications.
+    """Fully autonomous job application pipeline.
 
-    The agent sees the page visually and decides what to click/type,
-    making it much more robust than DOM extraction for complex portals.
+    Phase 1: Browser-use agent navigates to URL, clicks Apply, uploads resume (max 15 steps)
+    Phase 2: Deterministic code handles auth (_handle_workday_auth) with real Playwright clicks
+    Phase 3: Deterministic code fills multi-step form (handle_workday_application)
+
+    Zero user intervention required.
     """
     global _bu_browser
 
@@ -133,11 +183,12 @@ async def fill_with_browser_agent(
     ats_creds = creds.get(ats_key or "workday", creds.get("workday", {}))
     cred_email = ats_creds.get("email", "")
     cred_password = ats_creds.get("password", "")
+    is_workday = "workday" in url.lower() or "myworkdayjobs" in url.lower()
 
     if event_callback:
-        await event_callback("Navigate", "info", f"Starting browser-use agent (ATS: {ats_key or 'unknown'})")
+        await event_callback("Navigate", "info", f"Starting pipeline (ATS: {ats_key or 'unknown'})")
 
-    # Set up LLM - use Gemini via OpenAI-compatible endpoint through browser-use's ChatOpenAI
+    # Set up LLM
     from browser_use import Agent, Browser
     from browser_use.llm import ChatOpenAI
 
@@ -150,111 +201,52 @@ async def fill_with_browser_agent(
 
     _bu_browser = Browser(headless=False, keep_alive=True, disable_security=True)
 
-    task = f"""You are filling out a job application for {company} - {role}.
+    # ====================================================================
+    # PHASE 1: Agent ONLY navigates + clicks Apply. Does NOT handle auth.
+    # ====================================================================
+    task = f"""You are starting a job application for {company} - {role}.
 
 URL: {url}
 
-STEP-BY-STEP INSTRUCTIONS:
-{f"""1. Navigate to the URL above
+YOUR TASK IS LIMITED — do ONLY these steps, then STOP:
+
+1. Navigate to the URL above
 2. Click "Apply" or "Apply Now" button. On Workday sites the button may be a link with text "Apply" inside an element with data-uxi-element-id="Apply_adventureButton".
-3. If you see options like "Apply Manually" / "Autofill with Resume", click "Apply Manually"
+3. If you see options like "Apply Manually" vs "Autofill with Resume":
+   - Click "Autofill with Resume" (this uploads your PDF, NOT LinkedIn)
+   - If a file upload appears, upload the file at: {resume_path}
+4. If you see a cookie consent banner, click "Accept" or "Accept All"
 
-CRITICAL — BUTTONS TO AVOID (DO NOT CLICK THESE EVER):
-- "Sign in with Google" / "Continue with Google" / Google SSO buttons
-- "Apply with LinkedIn" / "Sign in with LinkedIn" / LinkedIn OAuth buttons
-- "Sign in with Facebook" / "Continue with Facebook"
-- "Sign in with Apple"
-- "Sign in with SSO" / "Single Sign-On"
-- Any OAuth/social login button that opens a popup or redirects to Google/LinkedIn/Facebook/Apple/Microsoft
-- "Autofill with Resume" (on Workday — this uses LinkedIn)
-These will open OAuth popups or redirects that will FAIL. Always use manual email/password sign-in instead.
+STOP CONDITIONS — stop immediately when you see ANY of these:
+- A Sign In or Create Account page (has email/password fields)
+- An application form with fields to fill out
+- An email verification page
+- "Already applied" or "Position has been filled" message
+- A CAPTCHA
 
-4. If you see a Sign In / Create Account page:
-   - IMPORTANT: Each employer has SEPARATE accounts.
-   - FIRST try Sign In: enter email: {cred_email} and password: {cred_password}, then click the Sign In button.
-   - On Workday: Sign In and Create Account submit buttons are both div[role="button"][data-automation-id="click_filter"] — they differ by aria-label ("Sign In" vs "Create Account")
-   - If sign-in fails (error message appears like "invalid credentials" or "no account found", or page does not change), THEN try Create Account:
-     - Click the "Create Account" link (on Workday: data-automation-id="createAccountLink")
-     - Fill in email: {cred_email} and password: {cred_password}
-     - If there is a "Verify Password" or "Confirm Password" field, enter the same password: {cred_password}
-     - If there is a terms/conditions checkbox, check it
-     - Click the "Create Account" submit button
-   - CRITICAL: After creating an account, you will land on the Sign In page. You MUST sign in with the SAME email: {cred_email} and password: {cred_password}. NEVER click "Create Account" again after you just created an account. Always sign in.
-   - If the page asks you to verify your email: STOP and report "NEEDS_EMAIL_VERIFICATION". Do NOT keep refreshing or clicking. The system will handle email verification automatically.
-   - If account already exists (error message), just sign in with the same credentials.
+DO NOT DO ANY OF THESE:
+- Do NOT fill in any form fields (name, email, etc.)
+- Do NOT sign in or create an account
+- Do NOT click any Sign In or Create Account buttons
+- Do NOT click "Apply with LinkedIn" or any OAuth/social login buttons
+- Do NOT click "Sign in with Google/Facebook/Apple/SSO"
 
-CRITICAL RULES FOR AVOIDING LOOPS:
-- NEVER retry the same exact action more than twice. If it didn't work twice, try a completely different approach.
-- If you see the exact same page 3 times in a row, STOP and report what you see.
-- If the page says "verify your email" or "check your inbox", STOP immediately and report "NEEDS_EMAIL_VERIFICATION".
-- If you tried creating an account and it failed, STOP and report "ACCOUNT_CREATION_FAILED".
-- If you've taken 15+ actions and haven't reached the form yet, STOP and describe what page you're on.
-- If a button click doesn't change the page, do NOT click it again. Try a different button or approach.
-- NEVER go to Create Account if you just created an account. After account creation, ALWAYS sign in.
-- If you see the Sign In page after creating an account, sign in — do NOT navigate to Create Account again.
-
-HANDLING COMMON OBSTACLES:
-- Cookie consent banners: click "Accept" or "Accept All" to dismiss
-- "This job is no longer accepting applications" / "Position has been filled": STOP immediately, the job is closed
-- CAPTCHA: STOP and wait, do not try to solve it
-- "Already applied": STOP, you already applied to this job
-- Pop-up overlays / modals blocking the form: close them by clicking X or "Close"
-- Loading spinners: wait up to 10 seconds for them to finish before taking action
-- If a page looks completely blank or broken, wait 5 seconds and try refreshing once
-
-5."""} Once on the application form, fill out ALL fields using this information:
-
-CANDIDATE INFO:
-{known_values}
-
-RESUME: Upload the file at {resume_path}
-{f'TRANSCRIPT: Upload the file at {transcript_path}' if transcript_path else ''}
-
-ADDITIONAL RULES:
-- For "How did you hear about us": select "LinkedIn" or "Job Board" or "Internet"
-- For any referral questions: answer "No"
-- For internship/co-op experience: "No" or "0"
-- For cover letter / additional info fields: skip them (leave blank)
-- For EEO questions: Gender=Male, Race=Asian, Veteran=Not a veteran, Disability=No disability
-- For open-ended questions about why this company/role, write 2-3 sentences connecting the candidate's hackathon experience in AI systems to {company}'s work
-- For phone country: select "United States"
-- For graduation year: 2028
-- DO NOT click Submit at the end. Stop before submitting.
-
-CRITICAL — HOW TO USE DROPDOWN MENUS (especially on Workday):
-Workday dropdowns are NOT native <select> elements. They are custom widgets. To select an option:
-1. CLICK the dropdown button/field to OPEN it (it will show a popup list of options)
-2. WAIT for the dropdown options to appear
-3. If there is a search/filter input inside the dropdown, TYPE the value you want (e.g. type "LinkedIn" or "California")
-4. CLICK the matching option from the list
-5. If the dropdown has a multi-select (shows "0 items selected"), click the option to select it, then click outside to close
-- If clicking the dropdown doesn't open options, try clicking the arrow icon next to it
-- For "How did you hear about us" multi-select: click the field, type "LinkedIn", click the "LinkedIn" option
-- For State dropdown: click the "Select One" button, type "California", click "California" from the list
-- For radio buttons (Yes/No): just click the correct radio button directly
-
-JOB DESCRIPTION:
-{job_description[:1500]}
-
-Fill ALL fields. Do not skip any required field. Be thorough and check each page of the form."""
+The system will handle authentication and form filling automatically after you stop.
+Report what page you're on when you stop."""
 
     agent = Agent(
         task=task,
         llm=llm,
         browser=_bu_browser,
         use_vision=False,
-        max_failures=10,
+        max_failures=5,
         max_actions_per_step=3,
         loop_detection_enabled=True,
-        loop_detection_window=5,
+        loop_detection_window=3,
     )
 
     steps = 0
     agent_error = None
-
-    from applicator.stuck_detector import StuckDetector
-    from applicator.email_handler import handle_email_verification, enter_verification_code
-    stuck = StuckDetector(max_repeats=3)
 
     async def on_step_end(agent_instance: Agent) -> None:
         nonlocal steps
@@ -267,20 +259,91 @@ Fill ALL fields. Do not skip any required field. Be thorough and check each page
             except Exception:
                 pass
         if event_callback:
-            await event_callback("Fill Form", "info", f"Agent step {steps} completed")
+            await event_callback("Agent", "info", f"Navigation step {steps}")
 
-        # Check if stuck
+    history = None
+    try:
+        if event_callback:
+            await event_callback("Agent", "info", "Agent navigating to application page...")
+
+        history = await agent.run(max_steps=15, on_step_end=on_step_end)
+
+        if event_callback:
+            await event_callback("Agent", "info", f"Agent stopped after {steps} steps")
+
+    except Exception as e:
+        agent_error = str(e)
+        if event_callback:
+            await event_callback("Agent", "error", f"Agent error: {str(e)[:150]}")
+
+    # Get page after agent stops
+    page = None
+    browser_pw = None
+    try:
+        page = await _bu_browser.get_current_page()
+    except Exception:
+        pass
+    try:
+        if hasattr(_bu_browser, 'browser') and _bu_browser.browser:
+            browser_pw = _bu_browser.browser
+        elif hasattr(_bu_browser, '_playwright_browser'):
+            browser_pw = _bu_browser._playwright_browser
+    except Exception:
+        pass
+
+    if not page:
+        if event_callback:
+            await event_callback("Pipeline", "error", "No browser page available after agent")
+        return {"browser": browser_pw, "page": None, "completed": False,
+                "summary": {"steps": steps, "error": agent_error or "No page"}}
+
+    # Take screenshot
+    if screenshot_callback:
         try:
-            page = await _bu_browser.get_current_page()
-            if page:
-                current_url = page.url
-                page_text = await page.evaluate("document.body.innerText.substring(0, 1000)")
-                is_stuck = stuck.check(current_url, page_text, f"step {steps}")
+            ss = await page.screenshot(type="png")
+            await screenshot_callback(ss)
+        except Exception:
+            pass
 
-                if is_stuck and stuck.is_verification_page(page_text):
-                    if event_callback:
-                        await event_callback("Stuck Detection", "info", "Email verification detected. Checking email...")
+    # ====================================================================
+    # PHASE 2: Detect page state and handle auth automatically
+    # ====================================================================
+    completed = False
 
+    if is_workday:
+        state = await _detect_workday_page_state(page)
+        if event_callback:
+            await event_callback("Pipeline", "info", f"Page state after agent: {state}")
+
+        # Handle resume upload if we landed on upload page
+        if state == "upload":
+            if event_callback:
+                await event_callback("Pipeline", "info", "Resume upload page detected. Uploading...")
+            from applicator.workday_handler import upload_file_robust
+            await upload_file_robust(page, resume_path, event_callback)
+            await asyncio.sleep(3)
+            state = await _detect_workday_page_state(page)
+            if event_callback:
+                await event_callback("Pipeline", "info", f"After upload: {state}")
+
+        # Handle auth (sign in / create account with real Playwright clicks)
+        if state == "auth":
+            if event_callback:
+                await event_callback("Auth", "info", "Auth page detected. Running deterministic auth handler...")
+            auth_ok = await _handle_workday_auth(page, event_callback)
+            if auth_ok:
+                await asyncio.sleep(3)
+                state = await _detect_workday_page_state(page)
+                if event_callback:
+                    await event_callback("Auth", "success" if state == "form" else "info",
+                        f"After auth: {state}")
+
+            # Handle email verification if needed
+            if state == "verify":
+                if event_callback:
+                    await event_callback("Auth", "info", "Email verification required...")
+                from applicator.email_handler import handle_email_verification, enter_verification_code
+                try:
                     context = page.context
                     result = await handle_email_verification(
                         context=context, original_page=page,
@@ -292,99 +355,89 @@ Fill ALL fields. Do not skip any required field. Be thorough and check each page
                         if result["method"] == "code" and result["code"]:
                             await enter_verification_code(page, result["code"], event_callback)
                         elif result["method"] == "link":
-                            await asyncio.sleep(3.0)
-                            await page.reload()
-                            await asyncio.sleep(5.0)
-                        stuck.reset()
-                        if event_callback:
-                            await event_callback("Stuck Detection", "success", "Email verification handled!")
+                            await asyncio.sleep(3)
+                            try:
+                                await page.reload()
+                            except Exception:
+                                pass
+                            await asyncio.sleep(5)
+                        # After verification, try signing in
+                        state = await _detect_workday_page_state(page)
+                        if state == "auth":
+                            await _handle_workday_auth(page, event_callback)
+                            await asyncio.sleep(3)
+                            state = await _detect_workday_page_state(page)
                     else:
                         if event_callback:
-                            await event_callback("Stuck Detection", "warning",
-                                "Auto-verify failed. Waiting 60s for manual verification...")
-                        for _ in range(60):
-                            await asyncio.sleep(1.0)
-                            new_text = await page.evaluate("document.body.innerText.substring(0, 500)")
-                            if not stuck.is_verification_page(new_text):
-                                stuck.reset()
-                                if event_callback:
-                                    await event_callback("Stuck Detection", "success", "Verification completed!")
+                            await event_callback("Auth", "warning",
+                                "Auto-verify failed. Waiting up to 90s for manual verification...")
+                        for _ in range(90):
+                            await asyncio.sleep(1)
+                            state = await _detect_workday_page_state(page)
+                            if state != "verify":
                                 break
-
-                elif is_stuck:
+                        if state == "auth":
+                            await _handle_workday_auth(page, event_callback)
+                            await asyncio.sleep(3)
+                            state = await _detect_workday_page_state(page)
+                except Exception as e:
                     if event_callback:
-                        await event_callback("Stuck Detection", "warning",
-                            f"Loop detected: {stuck.stuck_reason[:150]}")
-                    # Try recovery: Escape, scroll, click Continue/Next
-                    await page.keyboard.press("Escape")
-                    await asyncio.sleep(0.5)
-                    for sel in ['button:has-text("Continue")', 'button:has-text("Next")',
-                                'button:has-text("Skip")', 'a:has-text("Continue")']:
-                        try:
-                            btn = page.locator(sel).first
-                            if await btn.is_visible(timeout=1000):
-                                await btn.click()
-                                await asyncio.sleep(2.0)
-                                stuck.reset()
-                                if event_callback:
-                                    await event_callback("Stuck Detection", "info", f"Recovery: clicked {sel}")
-                                break
-                        except:
-                            continue
-        except Exception:
-            pass
+                        await event_callback("Auth", "error", f"Verification error: {e}")
 
-    history = None
-    try:
-        if event_callback:
-            await event_callback("Navigate", "info", "Browser-use agent starting...")
+        # ====================================================================
+        # PHASE 3: Fill multi-step Workday form automatically
+        # ====================================================================
+        if state == "form":
+            if event_callback:
+                await event_callback("Form Fill", "info", "On application form. Running Workday form handler...")
+            try:
+                from applicator.workday_handler import handle_workday_application
+                wd_result = await handle_workday_application(
+                    page=page,
+                    resume_path=resume_path,
+                    company=company,
+                    role=role,
+                    job_description=job_description,
+                    event_callback=event_callback,
+                    screenshot_callback=screenshot_callback,
+                )
+                wd_filled = wd_result.get("filled", 0)
+                wd_failed = wd_result.get("failed", 0)
+                wd_errors = wd_result.get("errors", [])
+                if event_callback:
+                    await event_callback("Form Fill", "success" if not wd_errors else "info",
+                        f"Workday form: {wd_filled} filled, {wd_failed} failed")
+                completed = wd_filled > 0
+            except Exception as e:
+                if event_callback:
+                    await event_callback("Form Fill", "error", f"Workday handler error: {e}")
+                import traceback
+                if event_callback:
+                    await event_callback("Form Fill", "info", traceback.format_exc()[:500])
 
-        history = await agent.run(max_steps=50, on_step_end=on_step_end)
+        elif state == "success":
+            completed = True
+            if event_callback:
+                await event_callback("Pipeline", "success", "Application already submitted!")
 
-        if event_callback:
-            await event_callback("Fill Form", "info", f"Agent finished after {steps} steps")
-
-    except Exception as e:
-        agent_error = str(e)
-        if event_callback:
-            await event_callback("Fill Form", "error", f"Agent error: {str(e)[:100]}")
-
-    # Determine if the agent actually completed the task
-    agent_done = False
-    agent_successful = False
-    if history:
-        agent_done = history.is_done()
-        agent_successful = history.is_successful() or False
-        if history.has_errors():
-            error_list = [e for e in history.errors() if e]
-            if error_list and event_callback:
-                await event_callback("Fill Form", "warning", f"Agent errors: {'; '.join(error_list[:3])}")
-
-    if agent_done and agent_successful:
-        if event_callback:
-            await event_callback("Fill Form", "success", f"Agent completed task successfully in {steps} steps")
-    elif agent_done:
-        if event_callback:
-            await event_callback("Fill Form", "warning", f"Agent marked done but may not have succeeded ({steps} steps)")
     else:
-        if event_callback:
-            await event_callback("Fill Form", "warning", f"Agent did NOT complete the task after {steps} steps")
-
-    # Get final page for the dashboard to keep open
-    page = None
-    browser_pw = None
-    try:
-        page = await _bu_browser.get_current_page()
-    except Exception:
-        pass
-    try:
-        # Try to get the underlying Playwright browser for the dashboard
-        if hasattr(_bu_browser, 'browser') and _bu_browser.browser:
-            browser_pw = _bu_browser.browser
-        elif hasattr(_bu_browser, '_playwright_browser'):
-            browser_pw = _bu_browser._playwright_browser
-    except Exception:
-        pass
+        # Non-Workday ATS: check if agent completed the task
+        agent_done = history.is_done() if history else False
+        agent_successful = (history.is_successful() or False) if history else False
+        completed = agent_done and agent_successful
+        if not completed and page:
+            # Try generic form filler for non-Workday
+            try:
+                fields = await page.evaluate(JS_EXTRACT_FIELDS)
+                if fields:
+                    if event_callback:
+                        await event_callback("Form Fill", "info", f"Generic form: {len(fields)} fields found")
+                    mappings = map_fields_to_profile(fields, job_description, company, role)
+                    result = await fill_form(page, mappings, resume_path,
+                        event_callback=event_callback, screenshot_page=page)
+                    completed = result.get("filled", 0) > 0
+            except Exception:
+                pass
 
     # Take final screenshot
     if screenshot_callback and page:
@@ -397,11 +450,11 @@ Fill ALL fields. Do not skip any required field. Be thorough and check each page
     return {
         "browser": browser_pw,
         "page": page,
-        "completed": agent_done and agent_successful,
+        "completed": completed,
         "summary": {
             "steps": steps,
-            "agent_done": agent_done,
-            "agent_successful": agent_successful,
+            "agent_done": history.is_done() if history else False,
+            "agent_successful": (history.is_successful() or False) if history else False,
             "error": agent_error,
             "final_result": history.final_result() if history else None,
         },
