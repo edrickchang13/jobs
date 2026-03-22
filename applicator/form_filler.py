@@ -279,9 +279,12 @@ Report what page you're on when you stop."""
             await event_callback("Agent", "info", f"Agent stopped after {steps} steps")
 
     except Exception as e:
-        agent_error = str(e)
+        import traceback as _tb
+        agent_error = f"{type(e).__name__}: {e}"
+        tb_str = _tb.format_exc()
         if event_callback:
-            await event_callback("Agent", "error", f"Agent error: {str(e)[:150]}")
+            await event_callback("Agent", "error", f"Agent error: {agent_error[:200]}")
+            await event_callback("Agent", "info", f"Traceback: {tb_str[:500]}")
 
     # Get page after agent stops
     page = None

@@ -213,12 +213,19 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         .ats-icims { background: #3a2a1a; color: #fb923c; }
         .ats-ashby { background: #1a2a3a; color: #60a5fa; }
         .ats-unknown { background: #222; color: #888; }
+        .applied-btns { display: flex; gap: 4px; margin-top: 4px; }
         .mark-applied-btn {
             background: #2563eb; color: #fff; border: none;
             padding: 4px 12px; border-radius: 4px; font-size: 11px;
-            cursor: pointer; font-weight: 500; margin-top: 4px; width: 100%;
+            cursor: pointer; font-weight: 500; flex: 1;
         }
         .mark-applied-btn:hover { background: #1d4ed8; }
+        .mark-not-applied-btn {
+            background: #dc2626; color: #fff; border: none;
+            padding: 4px 12px; border-radius: 4px; font-size: 11px;
+            cursor: pointer; font-weight: 500; flex: 1;
+        }
+        .mark-not-applied-btn:hover { background: #b91c1c; }
         .loading-msg { padding: 40px; text-align: center; color: #555; }
 
         /* ===== APPLY TAB ===== */
@@ -457,7 +464,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                         <button id="continueBtn" onclick="continueApplication()" style="flex:1;background:#7c3aed;display:none;padding:8px;border:none;color:#fff;border-radius:6px;cursor:pointer;font-size:13px;">Continue</button>
                         <button id="emailVerifyBtn" onclick="triggerEmailVerify()" style="flex:1;background:#d97706;display:none;padding:8px;border:none;color:#fff;border-radius:6px;cursor:pointer;font-size:13px;">Get Email Code</button>
                     </div>
-                    <button class="mark-applied-btn" onclick="markAsApplied()">Mark as Applied</button>
+                    <div class="applied-btns">
+                        <button class="mark-applied-btn" onclick="markAsApplied()">Applied</button>
+                        <button class="mark-not-applied-btn" onclick="markNotApplied()">Not Applied</button>
+                    </div>
                 </div>
                 <div class="step-pills" id="stepPills">
                     <span class="step-pill" id="pill-jd">1. Extract JD</span>
@@ -809,6 +819,22 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             });
         }
 
+        function markNotApplied() {
+            const url = document.getElementById('jobUrl').value;
+            const company = document.getElementById('company').value;
+            const role = document.getElementById('role').value;
+            if (!url) return;
+            fetch('/api/unapplied', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({url})
+            }).then(r => r.json()).then(() => {
+                appliedUrls.delete(url);
+                applyFilters();
+                addEvent({timestamp: new Date().toLocaleTimeString().slice(0,8), step: 'Applied', status: 'error', detail: 'Marked as NOT applied: ' + company + ' - ' + role});
+            });
+        }
+
         // ===== FILE UPLOADS =====
         function uploadFile(type) {
             const input = document.getElementById(type + 'File');
@@ -885,6 +911,15 @@ async def mark_as_applied(request: Request):
     from database.tracker import mark_applied
     data = await request.json()
     mark_applied(data.get("url", ""), data.get("company", ""), data.get("role", ""))
+    return JSONResponse({"status": "ok"})
+
+
+@app.post("/api/unapplied")
+async def mark_as_not_applied(request: Request):
+    """Remove a job from the applied list."""
+    from database.tracker import unmark_applied
+    data = await request.json()
+    unmark_applied(data.get("url", ""))
     return JSONResponse({"status": "ok"})
 
 

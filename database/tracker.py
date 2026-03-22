@@ -110,6 +110,15 @@ def mark_applied(url: str, company: str = "", role: str = ""):
     conn.close()
 
 
+def unmark_applied(url: str):
+    """Remove a job URL from applied list."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("DELETE FROM applied_jobs WHERE url = ?", (url,))
+    conn.commit()
+    conn.close()
+
+
 def get_applied_urls() -> set:
     """Return set of all applied job URLs."""
     conn = sqlite3.connect(DB_PATH)
