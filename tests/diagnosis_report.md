@@ -1,16 +1,18 @@
 # Diagnosis Report
-Generated: 2026-03-21 20:37:12
-Duration: 44s
+Generated: 2026-03-21 22:23:53
+Duration: 43s
 
-## ALL TESTS PASSED
+## TESTS FAILED: 1 of 1
 
-1 test(s) passed.
+- **Lever - Direct Apply Form**
 
-## PASS: Lever - Direct Apply Form
+---
+
+## FAIL: Lever - Direct Apply Form
 
 ### [pass] Navigate
 Loaded: https://jobs.lever.co/aofl/4b91076d-8937-4dbc-a502-a7d6a66e2e19/apply
-Screenshot: `C:\Users\Owner\jobs\tests\screenshots\Lever - Direct Apply Form_01_loaded.png`
+Screenshot: `C:\Users\Owner\jobs-forms\tests\screenshots\Lever - Direct Apply Form_01_loaded.png`
 
 ### [pass] Extract Fields
 36 fields extracted
@@ -23,37 +25,37 @@ Screenshot: `C:\Users\Owner\jobs\tests\screenshots\Lever - Direct Apply Form_01_
 ✱                              required=True sel=[name="name"]
 
 ### [info] Field
-[checkbox    ] He/him :: He/him                         required=False sel=[name="pronouns"]
+[checkbox    ] Let the employer know what pronouns you  required=False sel=[name="pronouns"]
 
 ### [info] Field
-[checkbox    ] She/her :: She/her                       required=False sel=[name="pronouns"]
+[checkbox    ] Let the employer know what pronouns you  required=False sel=[name="pronouns"]
 
 ### [info] Field
-[checkbox    ] They/them :: They/them                   required=False sel=[name="pronouns"]
+[checkbox    ] Let the employer know what pronouns you  required=False sel=[name="pronouns"]
 
 ### [info] Field
-[checkbox    ] Xe/xem :: Xe/xem                         required=False sel=[name="pronouns"]
+[checkbox    ] Let the employer know what pronouns you  required=False sel=[name="pronouns"]
 
 ### [info] Field
-[checkbox    ] Ze/hir :: Ze/hir                         required=False sel=[name="pronouns"]
+[checkbox    ] Let the employer know what pronouns you  required=False sel=[name="pronouns"]
 
 ### [info] Field
-[checkbox    ] Ey/em :: Ey/em                           required=False sel=[name="pronouns"]
+[checkbox    ] Let the employer know what pronouns you  required=False sel=[name="pronouns"]
 
 ### [info] Field
-[checkbox    ] Hir/hir :: Hir/hir                       required=False sel=[name="pronouns"]
+[checkbox    ] Let the employer know what pronouns you  required=False sel=[name="pronouns"]
 
 ### [info] Field
-[checkbox    ] Fae/faer :: Fae/faer                     required=False sel=[name="pronouns"]
+[checkbox    ] Let the employer know what pronouns you  required=False sel=[name="pronouns"]
 
 ### [info] Field
-[checkbox    ] Hu/hu :: Hu/hu                           required=False sel=[name="pronouns"]
+[checkbox    ] Let the employer know what pronouns you  required=False sel=[name="pronouns"]
 
 ### [info] Field
-[checkbox    ] Use name only :: Use name only           required=False sel=[name="pronouns"]
+[checkbox    ] Let the employer know what pronouns you  required=False sel=[name="pronouns"]
 
 ### [info] Field
-[checkbox    ] Custom :: Custom                         required=False sel=#customPronounsOption
+[checkbox    ] Let the employer know what pronouns you  required=False sel=#customPronounsOption
 
 ### [info] Field
 [email       ] Email
@@ -83,34 +85,34 @@ Screenshot: `C:\Users\Owner\jobs\tests\screenshots\Lever - Direct Apply Form_01_
 [text        ] Other website                            required=False sel=[name="urls[Other]"]
 
 ### [info] Field
-[radio       ] Yes :: Yes                               required=True sel=[name="cards[7a24a6c6-2117-4412-bdae-7fb97e699258]
+[radio       ] Are you available to work part-time (app required=True sel=[name="cards[7a24a6c6-2117-4412-bdae-7fb97e699258]
 
 ### [info] Field
-[radio       ] No :: No                                 required=True sel=[name="cards[7a24a6c6-2117-4412-bdae-7fb97e699258]
+[radio       ] Are you available to work part-time (app required=True sel=[name="cards[7a24a6c6-2117-4412-bdae-7fb97e699258]
 
 ### [info] Field
-[radio       ] Yes :: Yes                               required=True sel=[name="cards[7a24a6c6-2117-4412-bdae-7fb97e699258]
+[radio       ] This is a hybrid internship based at our required=True sel=[name="cards[7a24a6c6-2117-4412-bdae-7fb97e699258]
 
 ### [info] Field
-[radio       ] No :: No                                 required=True sel=[name="cards[7a24a6c6-2117-4412-bdae-7fb97e699258]
+[radio       ] This is a hybrid internship based at our required=True sel=[name="cards[7a24a6c6-2117-4412-bdae-7fb97e699258]
 
 ### [info] Field
-[radio       ] Yes :: Yes                               required=True sel=[name="cards[81cb37d2-a188-494e-9e6d-9c5e195368ce]
+[radio       ] Are you legally authorized to work in th required=True sel=[name="cards[81cb37d2-a188-494e-9e6d-9c5e195368ce]
 
 ### [info] Field
-[radio       ] No :: No                                 required=True sel=[name="cards[81cb37d2-a188-494e-9e6d-9c5e195368ce]
+[radio       ] Are you legally authorized to work in th required=True sel=[name="cards[81cb37d2-a188-494e-9e6d-9c5e195368ce]
 
 ### [info] Field
-[radio       ] Yes :: Yes                               required=True sel=[name="cards[81cb37d2-a188-494e-9e6d-9c5e195368ce]
+[radio       ] Will you now, or in the future, require  required=True sel=[name="cards[81cb37d2-a188-494e-9e6d-9c5e195368ce]
 
 ### [info] Field
-[radio       ] No :: No                                 required=True sel=[name="cards[81cb37d2-a188-494e-9e6d-9c5e195368ce]
+[radio       ] Will you now, or in the future, require  required=True sel=[name="cards[81cb37d2-a188-494e-9e6d-9c5e195368ce]
 
 ### [info] Field
-[radio       ] Yes :: Yes                               required=True sel=[name="cards[b5d46307-d512-4507-873d-8aa9ba0f7b39]
+[radio       ] Were you referred to this position by an required=True sel=[name="cards[b5d46307-d512-4507-873d-8aa9ba0f7b39]
 
 ### [info] Field
-[radio       ] No :: No                                 required=True sel=[name="cards[b5d46307-d512-4507-873d-8aa9ba0f7b39]
+[radio       ] Were you referred to this position by an required=True sel=[name="cards[b5d46307-d512-4507-873d-8aa9ba0f7b39]
 
 ### [info] Field
 [textarea    ] cards b5d46307 d512 4507 873d 8aa9ba0f7b required=False sel=[name="cards[b5d46307-d512-4507-873d-8aa9ba0f7b39]
@@ -138,7 +140,7 @@ fill         | Full name
 ✱                         | 'Edrick Chang'
 
 ### [info] Mapping
-click        | [name="pronouns"][label="He/him ::  | ''
+click        | [name="pronouns"][label*="He/him"]  | ''
 
 ### [info] Mapping
 fill         | Email
@@ -150,10 +152,10 @@ fill         | Phone
 
 ### [info] Mapping
 fill         | Current location
-✱                  | 'San Jose, CA'
+✱                  | 'Santa Clara, CA'
 
 ### [info] Mapping
-fill         | Current company                     | ''
+skip         | Current company                     | ''
 
 ### [info] Mapping
 fill         | LinkedIn URL                        | 'https://linkedin.com/in/edrickchang'
@@ -162,10 +164,10 @@ fill         | LinkedIn URL                        | 'https://linkedin.com/in/ed
 fill         | GitHub URL                          | 'https://github.com/edrickchang'
 
 ### [info] Mapping
-fill         | Portfolio URL                       | ''
+skip         | Portfolio URL                       | ''
 
 ### [info] Mapping
-fill         | Other website                       | ''
+skip         | Other website                       | ''
 
 ### [info] Mapping
 click        | [name="cards[7a24a6c6-2117-4412-bda | ''
@@ -183,7 +185,7 @@ click        | [name="cards[81cb37d2-a188-494e-9e6 | ''
 click        | [name="cards[b5d46307-d512-4507-873 | ''
 
 ### [info] Mapping
-fill         | cards b5d46307 d512 4507 873d 8aa9b | ''
+skip         | cards b5d46307 d512 4507 873d 8aa9b | ''
 
 ### [info] Mapping
 skip         | ADDITIONAL INFORMATION              | ''
@@ -199,17 +201,35 @@ select       | eeo veteran                         | 'I am not a veteran'
 
 ### [info] Fill Form
 Starting fill...
-Screenshot: `C:\Users\Owner\jobs\tests\screenshots\Lever - Direct Apply Form_03_before_fill.png`
+Screenshot: `C:\Users\Owner\jobs-forms\tests\screenshots\Lever - Direct Apply Form_03_before_fill.png`
 
-### [pass] Fill Result
-Filled: 20, Failed: 0
-Screenshot: `C:\Users\Owner\jobs\tests\screenshots\Lever - Direct Apply Form_04_after_fill.png`
+### [fail] Fill Result
+Filled: 10, Failed: 6
+Screenshot: `C:\Users\Owner\jobs-forms\tests\screenshots\Lever - Direct Apply Form_04_after_fill.png`
+
+### [fail] Fill Error
+[name="pronouns"][label*="He/him"]: click failed
+
+### [fail] Fill Error
+[name="cards[7a24a6c6-2117-4412-bdae-7fb97e699258][field0]"]: click failed
+
+### [fail] Fill Error
+[name="cards[7a24a6c6-2117-4412-bdae-7fb97e699258][field1]"]: click failed
+
+### [fail] Fill Error
+[name="cards[81cb37d2-a188-494e-9e6d-9c5e195368ce][field0]"]: click failed
+
+### [fail] Fill Error
+[name="cards[81cb37d2-a188-494e-9e6d-9c5e195368ce][field1]"]: click failed
+
+### [fail] Fill Error
+[name="cards[b5d46307-d512-4507-873d-8aa9ba0f7b39][field0]"]: click failed
 
 ### [pass] Verify
 OK: Resume/CV
 ✱
-EDRICKCHANG_RESUME.PDF
-Could = 'C:\fakepath\EdrickChang_Resume.pdf'
+EDRICKCHANG.PDF
+Couldn't aut = 'C:\fakepath\EdrickChang.pdf'
 
 ### [pass] Verify
 OK: Full name
@@ -315,11 +335,11 @@ Location field may have autocomplete value: Current location
 ✱
 
 ### [pass] Verify
-Resume: EdrickChang_Resume.pdf
+Resume: EdrickChang.pdf
 
-### [pass] RESULT
-ALL CHECKS PASSED
-Screenshot: `C:\Users\Owner\jobs\tests\screenshots\Lever - Direct Apply Form_05_final.png`
+### [fail] RESULT
+SOME CHECKS FAILED
+Screenshot: `C:\Users\Owner\jobs-forms\tests\screenshots\Lever - Direct Apply Form_05_final.png`
 
 ---
 
