@@ -487,7 +487,7 @@ JS_EXTRACT_FIELDS = """
         if (el.name) {
             // For radio/checkbox, include value to make selector unique
             if ((el.type === 'radio' || el.type === 'checkbox') && el.value) {
-                return '[name="' + el.name + '"][value="' + el.value.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"]';
+                return '[name="' + el.name + '"][value="' + el.value + '"]';
             }
             return '[name="' + el.name + '"]';
         }
