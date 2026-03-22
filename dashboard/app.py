@@ -10,6 +10,8 @@ from pathlib import Path
 # Playwright needs ProactorEventLoop on Windows for subprocess spawning.
 # Uvicorn's --reload flag forces SelectorEventLoop which breaks this.
 # We ensure the default (ProactorEventLoop) is used.
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 from fastapi import FastAPI, Request, UploadFile, File
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
