@@ -216,9 +216,7 @@ YOUR TASK IS LIMITED — do ONLY these steps, then STOP:
 
 1. Navigate to the URL above
 2. Click "Apply" or "Apply Now" button. On Workday sites the button may be a link with text "Apply" inside an element with data-uxi-element-id="Apply_adventureButton".
-3. If you see options like "Apply Manually" vs "Autofill with Resume":
-   - Click "Autofill with Resume" (this uploads your PDF, NOT LinkedIn)
-   - If a file upload appears, upload the file at: {resume_path}
+3. If you see options like "Apply Manually" / "Autofill with Resume", ALWAYS click "Apply Manually". Do NOT click "Autofill with Resume" — it opens a file upload that breaks the flow. The deterministic code will handle resume upload later.
 4. If you see a cookie consent banner, click "Accept" or "Accept All"
 
 STOP CONDITIONS — stop immediately when you see ANY of these:
@@ -1713,26 +1711,8 @@ async def _handle_workday_apply(page, resume_path, event_callback=None, screensh
                     await asyncio.sleep(5.0)
             except Exception:
                 pass
-            try:
-                autofill = page.locator('[data-automation-id="autofillWithResume"]')
-                if await autofill.is_visible(timeout=3000):
-                    await autofill.click()
-                    await asyncio.sleep(3.0)
-                    # Upload resume
-                    try:
-                        file_input = page.locator('input[type="file"]')
-                        await file_input.set_input_files(resume_path, timeout=10000)
-                        await asyncio.sleep(5.0)
-                        filled_total += 1
-                        try:
-                            await page.evaluate("""document.querySelector('[data-automation-id="pageFooterNextButton"]').click()""")
-                            await asyncio.sleep(5.0)
-                        except Exception:
-                            pass
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+            # Never click autofillWithResume — it opens a file upload that breaks the flow.
+            # Resume upload happens later on My Experience page via upload_file_robust.
     except Exception:
         pass
 
