@@ -270,34 +270,19 @@ Report what page you're on when you stop."""
         # Check for CAPTCHA on current page and wait for user to solve it
         try:
             page = await agent_instance.browser_session.get_current_page()
-            if page:
-                has_captcha = await page.evaluate("""() => {
-                    const html = document.documentElement.innerHTML.toLowerCase();
-                    return html.includes('recaptcha') || html.includes('hcaptcha') ||
-                           html.includes('captcha-container') || html.includes('g-recaptcha') ||
-                           document.querySelector('iframe[src*="recaptcha"]') !== null ||
-                           document.querySelector('iframe[src*="hcaptcha"]') !== null;
-                }""")
-                if has_captcha:
-                    if event_callback:
-                        await event_callback("CAPTCHA", "warning", "CAPTCHA detected! Please solve it in the browser window. Agent will wait up to 120s...")
-                    # Wait up to 120 seconds, checking every 2 seconds
-                    for _ in range(60):
-                        await asyncio.sleep(2)
-                        still_captcha = await page.evaluate("""() => {
-                            const html = document.documentElement.innerHTML.toLowerCase();
-                            return html.includes('recaptcha') || html.includes('hcaptcha') ||
-                                   html.includes('captcha-container') || html.includes('g-recaptcha') ||
-                                   document.querySelector('iframe[src*="recaptcha"]') !== null ||
-                                   document.querySelector('iframe[src*="hcaptcha"]') !== null;
-                        }""")
-                        if not still_captcha:
-                            if event_callback:
-                                await event_callback("CAPTCHA", "success", "CAPTCHA solved! Continuing...")
-                            break
-                    else:
+            if page and await _check_for_captcha(page):
+                if event_callback:
+                    await event_callback("CAPTCHA", "warning", "CAPTCHA detected! Please solve it. Waiting up to 120s...")
+                # Wait up to 120 seconds, checking every 3 seconds
+                for _ in range(40):
+                    await asyncio.sleep(3)
+                    if not await _check_for_captcha(page):
                         if event_callback:
-                            await event_callback("CAPTCHA", "warning", "CAPTCHA wait timed out after 120s. Continuing anyway...")
+                            await event_callback("CAPTCHA", "success", "CAPTCHA solved! Continuing...")
+                        break
+                else:
+                    if event_callback:
+                        await event_callback("CAPTCHA", "warning", "CAPTCHA wait timed out after 120s. Continuing anyway...")
         except Exception:
             pass
 
@@ -909,7 +894,8 @@ def _parse_json_response(text: str) -> list:
     end = text.rfind(']')
     if start != -1 and end != -1:
         text = text[start:end + 1]
-    return json.loads(text)
+    parsed = json.loads(text)
+    return [item for item in parsed if isinstance(item, dict)]
 
 
 def map_fields_to_profile(
@@ -1054,25 +1040,37 @@ async def _dismiss_cookie_banners(page: Page):
 
 
 async def _check_for_captcha(page: Page) -> bool:
-    """Check if the page has a CAPTCHA that needs manual solving."""
-    captcha_indicators = await page.evaluate("""
+    """Check if the page has a VISIBLE CAPTCHA that needs manual solving.
+
+    Only matches visible captcha iframes/challenge divs, not script tags
+    that merely load recaptcha JS in the background.
+    """
+    return await page.evaluate("""
     () => {
-        const html = document.documentElement.innerHTML.toLowerCase();
-        const hasCaptcha = (
-            html.includes('recaptcha') ||
-            html.includes('hcaptcha') ||
-            html.includes('captcha-container') ||
-            html.includes('g-recaptcha') ||
-            html.includes('h-captcha') ||
-            document.querySelector('iframe[src*="recaptcha"]') !== null ||
-            document.querySelector('iframe[src*="hcaptcha"]') !== null ||
-            document.querySelector('.g-recaptcha') !== null ||
-            document.querySelector('.h-captcha') !== null
+        function isVisible(el) {
+            if (!el) return false;
+            return el.offsetParent !== null || el.offsetWidth > 0 || el.offsetHeight > 0;
+        }
+
+        // Check for visible captcha iframes
+        const captchaIframes = document.querySelectorAll(
+            'iframe[src*="recaptcha"], iframe[src*="hcaptcha"]'
         );
-        return hasCaptcha;
+        for (const iframe of captchaIframes) {
+            if (isVisible(iframe)) return true;
+        }
+
+        // Check for visible captcha challenge divs
+        const captchaDivs = document.querySelectorAll(
+            '.g-recaptcha, .h-captcha, [class*="captcha-container"]'
+        );
+        for (const div of captchaDivs) {
+            if (isVisible(div)) return true;
+        }
+
+        return false;
     }
     """)
-    return captcha_indicators
 
 
 def _load_credentials() -> dict:
