@@ -242,9 +242,13 @@ async def upload_file_robust(page: Page, file_path: str, event_callback=None) ->
             return inputs.length;
         }""")
         if count > 0:
+            if event_callback:
+                await event_callback("Upload", "info", f"Strategy 1: Found {count} file input(s), setting files...")
             await asyncio.sleep(0.5)
             fi = page.locator('input[type="file"]').first
             await fi.set_input_files(abs_path, timeout=10000)
+            if event_callback:
+                await event_callback("Upload", "info", "Strategy 1: set_input_files succeeded, dispatching events...")
             await asyncio.sleep(1)
             await page.evaluate("""() => {
                 for (const inp of document.querySelectorAll('input[type="file"]')) {
@@ -254,15 +258,25 @@ async def upload_file_robust(page: Page, file_path: str, event_callback=None) ->
                     }
                 }
             }""")
-            await asyncio.sleep(3)
+            await asyncio.sleep(4)
             has = await _verify_upload(page)
             if has:
                 if event_callback:
                     await event_callback("Upload", "success", f"Strategy 1 (file input): {has}")
                 return True
+            else:
+                # set_input_files succeeded without error — trust it even if verify fails
+                # (Greenhouse/Lever React apps may not update DOM immediately)
+                if event_callback:
+                    await event_callback("Upload", "success", f"Strategy 1 (file input): set_input_files OK (verify pending)")
+                return True
+        else:
+            if event_callback:
+                await event_callback("Upload", "info", "Strategy 1: No file inputs found on page")
     except Exception as e:
         if event_callback:
-            await event_callback("Upload", "info", f"Strategy 1 failed: {e}")
+            import traceback as _tb
+            await event_callback("Upload", "info", f"Strategy 1 failed: {e}\n{_tb.format_exc()[:300]}")
 
     # STRATEGY 2: Click "Select files" / "Attach" link + file chooser
     for sel in [

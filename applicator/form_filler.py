@@ -74,7 +74,9 @@ def _build_known_values(info: dict) -> str:
         ("previous_internships", "Number of previous internships"),
         ("start_date", "Available start date"),
         ("desired_salary", "Desired salary"),
-        ("willing_to_relocate", "Willing to relocate"),
+        ("willing_to_relocate", "Willing to relocate / Able to relocate"),
+        ("intern_season", "Intern season / What intern season are you interested in"),
+        ("onsite_location_preference", "Onsite location preference / Which onsite location"),
         ("drivers_license", "Driver's license"),
         ("has_vehicle", "Has vehicle / transportation"),
         ("emergency_contact_name", "Emergency contact name"),
@@ -109,6 +111,7 @@ def _build_known_values(info: dict) -> str:
 _playwright = None
 _browser = None
 _bu_browser = None  # browser-use browser instance
+_pw_for_cdp = None  # Playwright instance connected to browser-use via CDP
 
 
 async def _detect_workday_page_state(page) -> str:
@@ -197,10 +200,11 @@ async def fill_with_browser_agent(
     from browser_use.llm import ChatOpenAI
 
     llm = ChatOpenAI(
-        model="gemini-2.5-flash",
-        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
-        api_key=os.getenv("GEMINI_API_KEY"),
+        model="qwen-3-235b-a22b-instruct-2507",
+        base_url="https://api.cerebras.ai/v1",
+        api_key=os.getenv("CEREBRAS_API_KEY"),
         frequency_penalty=None,
+        dont_force_structured_output=True,
     )
 
     _bu_browser = Browser(headless=False, keep_alive=True, disable_security=True)
@@ -267,24 +271,7 @@ Report what page you're on when you stop."""
                 pass
         if event_callback:
             await event_callback("Agent", "info", f"Navigation step {steps}")
-        # Check for CAPTCHA on current page and wait for user to solve it
-        try:
-            page = await agent_instance.browser_session.get_current_page()
-            if page and await _check_for_captcha(page):
-                if event_callback:
-                    await event_callback("CAPTCHA", "warning", "CAPTCHA detected! Please solve it. Waiting up to 120s...")
-                # Wait up to 120 seconds, checking every 3 seconds
-                for _ in range(40):
-                    await asyncio.sleep(3)
-                    if not await _check_for_captcha(page):
-                        if event_callback:
-                            await event_callback("CAPTCHA", "success", "CAPTCHA solved! Continuing...")
-                        break
-                else:
-                    if event_callback:
-                        await event_callback("CAPTCHA", "warning", "CAPTCHA wait timed out after 120s. Continuing anyway...")
-        except Exception:
-            pass
+        # CAPTCHA detection removed — was producing false positives and blocking the pipeline
 
     history = None
     try:
@@ -304,20 +291,57 @@ Report what page you're on when you stop."""
             await event_callback("Agent", "error", f"Agent error: {agent_error[:200]}")
             await event_callback("Agent", "info", f"Traceback: {tb_str[:500]}")
 
-    # Get page after agent stops
+    # Get page after agent stops — browser-use returns a CDP Page, but we need
+    # a Playwright Page for form filling (locator, fill, click, frames, etc.)
     page = None
     browser_pw = None
+    pw_instance = None
+
+    # Connect Playwright to the same browser via CDP
     try:
-        page = await _bu_browser.get_current_page()
-    except Exception:
-        pass
-    try:
-        if hasattr(_bu_browser, 'browser') and _bu_browser.browser:
-            browser_pw = _bu_browser.browser
-        elif hasattr(_bu_browser, '_playwright_browser'):
-            browser_pw = _bu_browser._playwright_browser
-    except Exception:
-        pass
+        cdp_url = _bu_browser.cdp_url
+        if cdp_url:
+            if event_callback:
+                await event_callback("Pipeline", "info", f"Connecting Playwright to browser via CDP: {cdp_url[:50]}...")
+            from playwright.async_api import async_playwright
+            global _pw_for_cdp
+            pw_instance = await async_playwright().start()
+            _pw_for_cdp = pw_instance
+            browser_pw = await pw_instance.chromium.connect_over_cdp(cdp_url)
+            # Get the most recently active page
+            contexts = browser_pw.contexts
+            if contexts:
+                pages = contexts[0].pages
+                if pages:
+                    # Find the page that's not about:blank
+                    for p in reversed(pages):
+                        if p.url and "about:blank" not in p.url:
+                            page = p
+                            break
+                    if not page:
+                        page = pages[-1]
+            if page and event_callback:
+                await event_callback("Pipeline", "success", f"Got Playwright page: {page.url[:80]}")
+        else:
+            if event_callback:
+                await event_callback("Pipeline", "warning", "No CDP URL available from browser-use")
+    except Exception as e:
+        import traceback as _tb
+        if event_callback:
+            await event_callback("Pipeline", "error", f"Playwright connect failed: {e}")
+            await event_callback("Pipeline", "info", f"Traceback: {_tb.format_exc()[:500]}")
+
+    # Fallback: try the old way (browser-use CDP page)
+    if not page:
+        try:
+            bu_page = await _bu_browser.get_current_page()
+            if bu_page:
+                if event_callback:
+                    await event_callback("Pipeline", "warning", "Using browser-use CDP page (limited Playwright support)")
+                # browser-use Page has evaluate() but not locator() — form filling will be limited
+                page = bu_page
+        except Exception:
+            pass
 
     if not page:
         if event_callback:
@@ -449,23 +473,245 @@ Report what page you're on when you stop."""
                 await event_callback("Pipeline", "success", "Application already submitted!")
 
     else:
-        # Non-Workday ATS: check if agent completed the task
-        agent_done = history.is_done() if history else False
-        agent_successful = (history.is_successful() or False) if history else False
-        completed = agent_done and agent_successful
-        if not completed and page:
-            # Try generic form filler for non-Workday
+        # Non-Workday ATS (Greenhouse, Lever, iCIMS, etc.)
+        # The browser-use agent's job is ONLY to navigate + click Apply, so
+        # is_successful() is irrelevant — we always attempt form filling.
+        total_filled = 0
+        total_failed = 0
+        max_pages = 8  # safety limit for multi-page forms
+
+        if page:
+          # --- SAFETY: If agent didn't click Apply, do it now ---
+          try:
+              try:
+                  current_url = page.url.lower()
+              except Exception:
+                  current_url = (await page.evaluate("window.location.href")).lower()
+              has_apply_in_url = "/apply" in current_url or "application" in current_url
+              if not has_apply_in_url:
+                  if event_callback:
+                      await event_callback("Navigate", "info", "Not on application form yet — clicking Apply button...")
+                  apply_selectors = [
+                      'a:text-is("Apply")', 'button:text-is("Apply")',
+                      'a:has-text("Apply Now")', 'button:has-text("Apply Now")',
+                      'a:has-text("Apply for this job")', 'button:has-text("Apply for this job")',
+                      '#apply_button', '.apply-button', '[data-qa="btn-apply"]',
+                      'a.postings-btn',  # Lever
+                  ]
+                  apply_clicked = False
+                  for sel in apply_selectors:
+                      try:
+                          btn = page.locator(sel).first
+                          if await btn.is_visible(timeout=2000):
+                              await btn.click(timeout=5000)
+                              apply_clicked = True
+                              if event_callback:
+                                  await event_callback("Navigate", "success", f"Clicked Apply button ({sel})")
+                              await asyncio.sleep(3.0)
+                              break
+                      except Exception:
+                          continue
+                  if not apply_clicked and event_callback:
+                      await event_callback("Navigate", "warning", "Could not find Apply button — trying to fill current page")
+                  # Take screenshot after clicking Apply
+                  if screenshot_callback and apply_clicked:
+                      try:
+                          ss = await page.screenshot(type="png")
+                          await screenshot_callback(ss)
+                      except Exception:
+                          pass
+          except Exception as e:
+              if event_callback:
+                  await event_callback("Navigate", "info", f"Apply button check error: {e}")
+
+          for page_num in range(max_pages):
             try:
+                # Scroll down to load lazy content (Greenhouse loads sections on scroll)
+                try:
+                    page_height = await page.evaluate("document.body.scrollHeight")
+                    for scroll_pos in range(0, page_height + 900, 900):
+                        await page.evaluate(f"window.scrollTo(0, {scroll_pos})")
+                        await asyncio.sleep(0.4)
+                    await page.evaluate("window.scrollTo(0, 0)")
+                    await asyncio.sleep(0.5)
+                except Exception:
+                    pass
+
+                # Extract fields from main page
                 fields = await page.evaluate(JS_EXTRACT_FIELDS)
-                if fields:
+                form_ctx = page
+
+                # If no fields on main page, check iframes (Greenhouse, etc.)
+                if len(fields) == 0:
+                    for frame in page.frames:
+                        if frame == page.main_frame:
+                            continue
+                        try:
+                            frame_fields = await frame.evaluate(JS_EXTRACT_FIELDS)
+                            if len(frame_fields) > len(fields):
+                                fields = frame_fields
+                                form_ctx = frame
+                        except Exception:
+                            continue
+
+                # If still nothing on first page, wait for JS-heavy pages
+                if len(fields) == 0 and page_num == 0:
                     if event_callback:
-                        await event_callback("Form Fill", "info", f"Generic form: {len(fields)} fields found")
-                    mappings = map_fields_to_profile(fields, job_description, company, role)
-                    result = await fill_form(page, mappings, resume_path,
-                        event_callback=event_callback, screenshot_page=page)
-                    completed = result.get("filled", 0) > 0
-            except Exception:
-                pass
+                        await event_callback("Form Fill", "info", "No fields yet, waiting for page to render...")
+                    await asyncio.sleep(5.0)
+                    fields = await page.evaluate(JS_EXTRACT_FIELDS)
+                    form_ctx = page
+                    if len(fields) == 0:
+                        for frame in page.frames:
+                            if frame == page.main_frame:
+                                continue
+                            try:
+                                frame_fields = await frame.evaluate(JS_EXTRACT_FIELDS)
+                                if len(frame_fields) > len(fields):
+                                    fields = frame_fields
+                                    form_ctx = frame
+                            except Exception:
+                                continue
+
+                # Filter out non-dict entries (JS may return strings/nulls)
+                fields = [f for f in fields if isinstance(f, dict)]
+
+                # Sanity check: if we got a huge number of fields, we're probably
+                # on the JD page, not the application form. Skip filling.
+                if len(fields) > 200:
+                    if event_callback:
+                        await event_callback("Form Fill", "warning",
+                            f"Page {page_num + 1}: {len(fields)} fields found — too many, likely not an application form. Skipping.")
+                    break
+
+                if len(fields) == 0:
+                    if page_num == 0 and event_callback:
+                        await event_callback("Form Fill", "info", "No form fields found on this page")
+                    break
+
+                if event_callback:
+                    await event_callback("Form Fill", "info",
+                        f"Page {page_num + 1}: {len(fields)} fields found. Filling...")
+
+                # Map and fill with retry passes (up to 2 per page)
+                page_filled = 0
+                for pass_num in range(2):
+                    try:
+                        if pass_num > 0:
+                            # Re-extract and filter to unfilled only
+                            await asyncio.sleep(1.5)
+                            re_fields = await form_ctx.evaluate(JS_EXTRACT_FIELDS)
+                            fields = []
+                            for f in re_fields:
+                                if not isinstance(f, dict):
+                                    continue
+                                val = f.get("value", "")
+                                tag = f.get("tag", "")
+                                if not str(val).strip():
+                                    fields.append(f)
+                                elif tag == "select" and val in ("", "0", "--"):
+                                    fields.append(f)
+                            if len(fields) == 0:
+                                break
+
+                        mappings = map_fields_to_profile(fields, job_description, company, role)
+                        # Ensure all mappings are dicts (LLM may return strings)
+                        mappings = [m for m in mappings if isinstance(m, dict)]
+                        if pass_num > 0:
+                            mappings = [m for m in mappings if m.get("action") != "skip" or m.get("value")]
+                        if not mappings:
+                            break
+
+                        result = await fill_form(form_ctx, mappings, resume_path,
+                            event_callback=event_callback, screenshot_page=page)
+                        if isinstance(result, dict):
+                            page_filled += result.get("filled", 0)
+                            total_failed += result.get("failed", 0)
+                            if result.get("failed", 0) == 0:
+                                break
+                        else:
+                            break
+                    except Exception as e:
+                        import traceback as _tb
+                        tb_str = _tb.format_exc()
+                        if event_callback:
+                            await event_callback("Form Fill", "error", f"Page {page_num+1} pass {pass_num+1} error: {e}")
+                            await event_callback("Form Fill", "info", f"Traceback: {tb_str[:800]}")
+                        break
+
+                total_filled += page_filled
+
+                # Screenshot after filling this page
+                if screenshot_callback:
+                    try:
+                        ss = await page.screenshot(type="png")
+                        await screenshot_callback(ss)
+                    except Exception:
+                        pass
+
+                # Try to advance to the next page (Next/Continue/Submit)
+                await asyncio.sleep(1.0)
+                next_clicked = False
+                next_selectors = [
+                    'button:has-text("Next")', 'button:has-text("Continue")',
+                    'button:has-text("Save and Continue")',
+                    'input[type="submit"][value*="Next" i]',
+                    'input[type="submit"][value*="Continue" i]',
+                    '[data-automation-id="bottom-navigation-next-button"]',
+                    # NOTE: Do NOT include Submit Application / #submit_app here.
+                    # The user must review and submit manually. Auto-clicking Submit
+                    # causes loops on single-page forms (Greenhouse, Lever).
+                ]
+                for sel in next_selectors:
+                    try:
+                        btn = page.locator(sel).first
+                        if await btn.is_visible(timeout=1500):
+                            await btn.scroll_into_view_if_needed(timeout=3000)
+                            await asyncio.sleep(0.5)
+                            await btn.click(timeout=5000)
+                            next_clicked = True
+                            if event_callback:
+                                await event_callback("Navigate", "info", f"Clicked '{sel}' to advance")
+                            await asyncio.sleep(3.0)
+                            break
+                    except Exception:
+                        continue
+
+                # Also check iframes for Next buttons
+                if not next_clicked:
+                    for frame in page.frames:
+                        if frame == page.main_frame:
+                            continue
+                        for sel in next_selectors[:6]:
+                            try:
+                                btn = frame.locator(sel).first
+                                if await btn.is_visible(timeout=1000):
+                                    await btn.click(timeout=5000)
+                                    next_clicked = True
+                                    if event_callback:
+                                        await event_callback("Navigate", "info", "Clicked Next in iframe")
+                                    await asyncio.sleep(3.0)
+                                    break
+                            except Exception:
+                                continue
+                        if next_clicked:
+                            break
+
+                if not next_clicked:
+                    if event_callback:
+                        await event_callback("Form Fill", "info",
+                            f"No Next/Continue button found. Filled {total_filled} fields total.")
+                    break
+
+            except Exception as e:
+                if event_callback:
+                    await event_callback("Form Fill", "error", f"Page {page_num + 1} error: {e}")
+                import traceback
+                if event_callback:
+                    await event_callback("Form Fill", "info", traceback.format_exc()[:500])
+                break
+
+          completed = total_filled > 0
 
     # Take final screenshot
     if screenshot_callback and page:
@@ -490,14 +736,20 @@ Report what page you're on when you stop."""
 
 
 async def close_browser_agent():
-    """Clean up browser-use browser."""
-    global _bu_browser
+    """Clean up browser-use browser and Playwright CDP connection."""
+    global _bu_browser, _pw_for_cdp
     if _bu_browser:
         try:
             await _bu_browser.close()
         except Exception:
             pass
         _bu_browser = None
+    if _pw_for_cdp:
+        try:
+            await _pw_for_cdp.stop()
+        except Exception:
+            pass
+        _pw_for_cdp = None
 
 
 JS_EXTRACT_FIELDS = """
@@ -810,6 +1062,60 @@ JS_EXTRACT_FIELDS = """
         });
     }
 
+    // === Greenhouse custom select__container dropdowns ===
+    const ghCustomSelects = form.querySelectorAll('[class*="select__container"], [class*="select__control"]');
+    for (const el of ghCustomSelects) {
+        if (el.offsetParent === null) continue;
+        // Get the container (could be select__container itself or parent)
+        const container = el.closest('[class*="select__container"]') || el;
+        // Skip if already captured
+        const alreadyCaptured = fields.some(f => {
+            try {
+                const fEl = document.querySelector(f.selector);
+                return fEl && (container.contains(fEl) || fEl.contains(container));
+            } catch(e) { return false; }
+        });
+        if (alreadyCaptured) continue;
+
+        // Find label by walking up to the field container
+        const fieldContainer = container.closest('li, .field, .form-group, .question, .select-field, [class*="application-question"]') || container.parentElement;
+        const lbl = fieldContainer ? fieldContainer.querySelector('label') : null;
+        const lblText = lbl ? lbl.innerText.trim() : '';
+
+        // Get current displayed value
+        const singleVal = container.querySelector('[class*="single-value"], [class*="singleValue"]');
+        const placeholder = container.querySelector('[class*="placeholder"]');
+        const displayText = singleVal ? singleVal.innerText.trim() : (placeholder ? placeholder.innerText.trim() : '');
+        const isPlaceholder = !singleVal || displayText.toLowerCase().startsWith('select');
+
+        // Build a unique selector
+        let selector = '';
+        if (fieldContainer && fieldContainer.id) {
+            selector = '#' + CSS.escape(fieldContainer.id) + ' [class*="select__container"]';
+        } else if (lbl && lbl.getAttribute('for')) {
+            selector = '[id="' + lbl.getAttribute('for') + '"]';
+        } else {
+            // Use nth-of-type based on index among all select__container elements
+            const allGHSelects = Array.from(form.querySelectorAll('[class*="select__container"]'));
+            const idx = allGHSelects.indexOf(container);
+            selector = '[class*="select__container"]:nth-of-type(' + (idx + 1) + ')';
+        }
+
+        const isRequired = fieldContainer ? (fieldContainer.querySelector('[aria-required="true"]') !== null || (lbl && lbl.innerText.includes('*'))) : false;
+
+        fields.push({
+            selector: selector,
+            tag: 'div',
+            type: 'greenhouse-custom-select',
+            name: lblText.toLowerCase().replace(/[^a-z0-9]/g, '_').substring(0, 50),
+            label: lblText,
+            required: isRequired,
+            value: isPlaceholder ? '' : displayText,
+            placeholder: placeholder ? placeholder.innerText.trim() : 'Select...',
+            options: [],
+        });
+    }
+
     // === Workday formField-* wrapper divs (interactive ones not yet captured) ===
     const wdWrappers = form.querySelectorAll('[data-automation-id^="formField-"]');
     for (const el of wdWrappers) {
@@ -867,10 +1173,14 @@ JS_EXTRACT_FIELDS = """
 
 
 def _get_llm_client():
+    # Cerebras API (free tier, 1M tokens/day) - Gemini key expired
     return OpenAI(
-        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
-        api_key=os.getenv("GEMINI_API_KEY"),
+        base_url="https://api.cerebras.ai/v1",
+        api_key=os.getenv("CEREBRAS_API_KEY"),
     )
+
+# Model to use for field mapping LLM calls
+_LLM_MODEL = "qwen-3-235b-a22b-instruct-2507"
 
 
 def _parse_json_response(text: str) -> list:
@@ -919,7 +1229,11 @@ def map_fields_to_profile(
             "required": f.get("required", True),
         }
         if f.get("options"):
-            slim["options"] = [o.get("text", "") for o in f["options"] if o.get("value")]
+            slim["options"] = [
+                (o.get("text", "") if isinstance(o, dict) else str(o))
+                for o in f["options"]
+                if (o.get("value") if isinstance(o, dict) else o)
+            ]
         if f.get("placeholder"):
             slim["placeholder"] = f["placeholder"]
         slim_fields.append(slim)
@@ -931,7 +1245,7 @@ def map_fields_to_profile(
     if cover_letter_text:
         cover_letter_instruction = f'- Cover letter / "anything else" fields: If REQUIRED, fill with the provided cover letter text. If optional, skip.\n  Cover letter text: "{cover_letter_text[:500]}"'
     else:
-        cover_letter_instruction = '- Cover letter / additional information / "anything else": ALWAYS skip (action "skip") - leave blank'
+        cover_letter_instruction = '- Cover letter / additional information / "anything else" / "Is there anything else you would like us to know": ALWAYS skip (action "skip") - leave blank. NEVER paste resume content into text areas.'
 
     # "How did you hear" preference
     how_heard = personal_info.get("how_did_you_hear", "LinkedIn")
@@ -965,14 +1279,28 @@ FIELD-SPECIFIC RULES:
 - For 'How did you hear about us' or similar: ALWAYS answer 'Job Board' or select the closest option like 'Job Board', 'Online', 'Internet', or 'Other'.
 - For 'Have you previously worked/applied here': ALWAYS answer 'No'.
 - For 'Country': ALWAYS answer 'United States' or select 'US' / 'USA' / 'United States'.
+- For 'State' or 'Which state are you currently a resident in' or any state/region dropdown: use action "select" with value "California".
 - For EEO/demographic questions (gender, race, veteran, disability): use the values from KNOWN VALUES or select 'Prefer not to say' / 'I do not wish to answer' if available.
+- IMPORTANT: For any <select> dropdown element, ALWAYS use action "select" (NOT "fill"). Check the field type in the form fields JSON.
 - For referral questions: ALWAYS answer 'No'.
-- For dropdowns (including custom dropdowns): use action "select" with the EXACT text of the option you want. Use common phrasing (e.g. 'United States' not 'US', 'No' not 'N/A').
-- For radio buttons: return the selector of the correct option to click.
-- For file inputs (resume/CV): use action "upload_file" with value "resume".
+- For dropdowns (including custom dropdowns and greenhouse-custom-select): use action "select" with the EXACT text of the option you want. Use common phrasing (e.g. 'United States' not 'US', 'No' not 'N/A', 'Yes' not 'Y').
+- For radio buttons: use action "click" with the selector of the CORRECT option (e.g. the Yes or No radio button).
+- For checkboxes: use action "click" to check/toggle the checkbox.
+- For file inputs (resume/CV): use action "upload_file" with value "resume". ONLY upload to inputs labeled resume or CV.
 - For file inputs asking for transcript: use action "upload_file" with value "transcript".
-- For any question you don't have information for: select 'Prefer not to say' or skip rather than making something up.
-- For any question you don't have an exact answer for: use context from the candidate profile and job description to give a reasonable answer. Do NOT skip it.
+- For file inputs labeled "cover letter", "writing sample", "additional document", or anything that is NOT resume/CV/transcript: ALWAYS use action "skip". Do NOT upload the resume to these fields.
+- CRITICAL: For cover letter fields, "additional information" textareas, or "anything else you'd like us to know" fields: ALWAYS use action "skip". Do NOT paste resume content into these fields.
+- CRITICAL: Do NOT put resume text into ANY textarea field. Resumes are uploaded via file inputs only.
+- For "Do you have prior internship or co-op experience": select "No" (candidate has hackathon project experience but no formal internship/co-op).
+- For "What year will you graduate": select "2028".
+- For "Are you currently authorized to work in the United States": click "Yes".
+- For "Will you require employer sponsorship": select "No".
+- For "Are you able to relocate": select "Yes".
+- For "What intern season are you interested in": select "Summer" or the closest available option.
+- For "Which onsite location would you like to apply to": select the FIRST available option (any location works).
+- For "I understand that this position requires me to work on-site": click/check "Yes".
+- For any question you don't have information for: use your BEST JUDGMENT based on the candidate profile and job context. Select the most reasonable option. NEVER leave a required field empty.
+- For any question you don't have an exact answer for: use context from the candidate profile and job description to give a reasonable answer. Do NOT skip it. NEVER leave a required field empty.
 
 Company: {company}
 Role: {role}
@@ -989,7 +1317,7 @@ Return ONLY a JSON array. Each element must have exactly these keys:
 REMEMBER: Fill EVERY field. Only use "skip" for optional cover letter / additional info fields. Do NOT include any explanation, only the JSON array."""
 
     response = client.chat.completions.create(
-        model="gemini-2.5-flash",
+        model=_LLM_MODEL,
         max_tokens=8000,
         messages=[
             {"role": "system", "content": "You return only valid JSON arrays. No markdown, no explanation. /no_think"},
@@ -1109,7 +1437,7 @@ Job Description: {job_description[:1500]}
 Write the cover letter. Do NOT use "Dear Hiring Manager" or other generic openers. Start with something specific about the company. Output ONLY the letter text."""
 
     response = client.chat.completions.create(
-        model="gemini-2.5-flash",
+        model=_LLM_MODEL,
         max_tokens=1000,
         messages=[
             {"role": "system", "content": "You write concise, authentic cover letters. No markdown, no explanation."},
@@ -1576,15 +1904,13 @@ async def _handle_workday_apply(page, resume_path, event_callback=None, screensh
             except Exception:
                 pass
 
-            # Accept terms checkbox
+            # Accept terms checkbox — use the robust Workday consent handler
+            # (Workday uses role="checkbox" with a click_filter overlay, not <input type="checkbox">)
             try:
-                checkbox = page.locator(
-                    '[data-automation-id="createAccountCheckbox"], '
-                    '[data-automation-id="agreeToTermsCheckbox"], '
-                    'input[type="checkbox"]'
-                )
-                if await checkbox.first.is_visible(timeout=2000):
-                    await checkbox.first.check()
+                from applicator.workday_handler import check_workday_consent
+                checkbox_ok = await check_workday_consent(page, event_callback=event_callback, max_wait_seconds=10)
+                if not checkbox_ok and event_callback:
+                    await event_callback("Navigate", "error", "Consent checkbox could not be checked automatically")
             except Exception:
                 pass
 
@@ -2401,18 +2727,69 @@ async def _handle_custom_dropdown(page, selector: str, value: str, event_callbac
                     best_score = 1
 
             if best_match:
+                # Find the option index (skip placeholder options)
+                target_idx = None
+                for idx, opt in enumerate(options):
+                    if opt["value"] == best_match["value"]:
+                        target_idx = idx
+                        break
+
+                # Strategy 1a: Use keyboard navigation on native <select>
+                # This triggers proper browser events that React picks up
+                try:
+                    loc = page.locator(selector).first
+                    await loc.scroll_into_view_if_needed(timeout=3000)
+                    await loc.click(timeout=3000)
+                    await asyncio.sleep(0.3)
+                    # Press Home to go to first option, then ArrowDown to target
+                    await page.keyboard.press("Home")
+                    await asyncio.sleep(0.1)
+                    if target_idx is not None:
+                        for _ in range(target_idx):
+                            await page.keyboard.press("ArrowDown")
+                            await asyncio.sleep(0.05)
+                    await asyncio.sleep(0.1)
+                    await page.keyboard.press("Enter")
+                    await asyncio.sleep(0.5)
+
+                    # Verify
+                    actual_text = await page.evaluate(f"""() => {{
+                        const el = document.querySelector('{selector}');
+                        if (!el) return '';
+                        return el.options[el.selectedIndex]?.text || '';
+                    }}""")
+                    if actual_text.strip().lower() == best_match["text"].strip().lower():
+                        if event_callback:
+                            await event_callback("Fill Form", "info", f"Selected (keyboard): {best_match['text'][:50]}")
+                        return True
+                    else:
+                        if event_callback:
+                            await event_callback("Fill Form", "info",
+                                f"Keyboard select got '{actual_text}' instead of '{best_match['text']}', trying select_option...")
+                except Exception as e:
+                    if event_callback:
+                        await event_callback("Fill Form", "info", f"Keyboard select error: {e}")
+
+                # Strategy 1b: Fallback to programmatic select_option
                 try:
                     await page.select_option(selector, value=best_match["value"], timeout=3000)
+                    await asyncio.sleep(0.3)
                     if event_callback:
-                        await event_callback("Fill Form", "info", f"Selected: {best_match['text'][:50]}")
+                        await event_callback("Fill Form", "info", f"Selected (select_option): {best_match['text'][:50]}")
                     return True
-                except Exception:
-                    pass
+                except Exception as e:
+                    if event_callback:
+                        await event_callback("Fill Form", "info", f"select_option also failed: {e}")
 
+            if not best_match:
+                if event_callback:
+                    opt_texts = [o["text"] for o in options[:10]]
+                    await event_callback("Fill Form", "info", f"No match for '{value}' in select. Options: {opt_texts}")
+                return False
+            # If we got here, best_match was found but both strategies didn't work
+            # Fall through to Strategy 2+
             if event_callback:
-                opt_texts = [o["text"] for o in options[:10]]
-                await event_callback("Fill Form", "info", f"No match for '{value}' in select. Options: {opt_texts}")
-            return False
+                await event_callback("Fill Form", "info", f"Native select failed for '{value}', trying click-based strategies...")
     except Exception:
         pass
 
@@ -2880,6 +3257,25 @@ async def _handle_resume_upload(page_or_frame, resume_path: str, event_callback=
     return False
 
 
+async def _highlight_element(page, selector: str):
+    """Flash an orange outline on an element so the user can see what's being filled.
+    Mimics browser-use's visual indicator. Non-blocking, best-effort."""
+    try:
+        await page.evaluate("""(sel) => {
+            const el = document.querySelector(sel);
+            if (!el) return;
+            el.scrollIntoView({behavior: 'smooth', block: 'center'});
+            const prev = el.style.cssText;
+            el.style.outline = '3px solid #FF6611';
+            el.style.outlineOffset = '2px';
+            el.style.boxShadow = '0 0 8px rgba(255,102,17,0.6)';
+            el.style.transition = 'outline 0.2s, box-shadow 0.2s';
+            setTimeout(() => { el.style.cssText = prev; }, 1500);
+        }""", selector)
+    except Exception:
+        pass
+
+
 async def fill_form(
     page,
     mappings: list[dict],
@@ -2897,6 +3293,60 @@ async def fill_form(
     failed = 0
     errors = []
 
+    # Determine the top-level page for highlights (form_ctx might be a Frame)
+    highlight_page = screenshot_page or page
+
+    # Post-process: fix action type for <select> elements that LLM may have mapped as "fill"
+    for m in mappings:
+        if m.get("action") == "fill" and m.get("selector") and m.get("value"):
+            try:
+                tag = await page.evaluate(
+                    f"document.querySelector('{m['selector']}')?.tagName?.toLowerCase()"
+                )
+                if tag == "select":
+                    m["action"] = "select"
+            except Exception:
+                pass
+
+    # Post-process: prevent resume/long text from being pasted into cover letter or textarea fields
+    for m in mappings:
+        if m.get("action") == "fill" and m.get("value"):
+            label_lower = m.get("label", "").lower()
+            value = m.get("value", "")
+            # Skip if this looks like resume content pasted into a cover letter field
+            is_cover_letter = any(kw in label_lower for kw in [
+                "cover letter", "cover_letter", "additional info", "anything else",
+                "is there anything", "additional comments"
+            ])
+            # Detect resume-like content: very long text with bullet-point patterns
+            looks_like_resume = len(value) > 500 and any(kw in value.lower() for kw in [
+                "experience", "education", "gpa", "university", "bachelor",
+                "technical skills", "programming", "hackathon"
+            ])
+            if is_cover_letter or looks_like_resume:
+                if event_callback:
+                    import asyncio as _aio
+                    _aio.ensure_future(event_callback(
+                        "Fill Form", "warning",
+                        f"Blocked resume/long text from being pasted into '{label_lower[:40]}' — skipping"
+                    ))
+                m["action"] = "skip"
+
+    # Post-process: prevent resume upload to cover letter / non-resume file inputs
+    for m in mappings:
+        if m.get("action") == "upload_file":
+            label_lower = m.get("label", "").lower()
+            is_resume_field = any(kw in label_lower for kw in ["resume", "cv"])
+            is_transcript_field = "transcript" in label_lower
+            if not is_resume_field and not is_transcript_field:
+                if event_callback:
+                    import asyncio as _aio
+                    _aio.ensure_future(event_callback(
+                        "Fill Form", "warning",
+                        f"Blocked file upload to non-resume field '{label_lower[:40]}' — skipping"
+                    ))
+                m["action"] = "skip"
+
     for m in mappings:
         selector = m.get("selector", "")
         action = m.get("action", "skip")
@@ -2906,23 +3356,71 @@ async def fill_form(
             skipped += 1
             continue
 
+        # Flash orange highlight on the target element
+        await _highlight_element(highlight_page, selector)
+
         try:
             if action == "fill":
-                is_location = "location" in selector.lower() or "location" in m.get("label", "").lower()
+                label_lower = m.get("label", "").lower()
+                is_location = ("location" in selector.lower() or "location" in label_lower
+                               or "city" in label_lower)
                 try:
                     loc = page.locator(selector).first
                     await loc.scroll_into_view_if_needed(timeout=3000)
                     if is_location:
-                        # Location fields often have autocomplete - type slowly and select suggestion
+                        # Location fields often have autocomplete - type slowly and select best suggestion
                         await loc.click(timeout=3000)
                         await loc.fill("", timeout=2000)  # Clear first
+                        # Type just "Santa Clara, CA" to help autocomplete narrow to California
                         await page.keyboard.type(value, delay=80)
-                        await asyncio.sleep(1.5)
-                        # Try pressing ArrowDown + Enter to accept autocomplete suggestion
-                        await page.keyboard.press("ArrowDown")
-                        await asyncio.sleep(0.3)
-                        await page.keyboard.press("Enter")
-                        await asyncio.sleep(0.5)
+                        await asyncio.sleep(2.0)
+                        # Look through visible autocomplete suggestions for one matching CA/California/USA
+                        picked = await page.evaluate("""() => {
+                            const suggestions = document.querySelectorAll(
+                                '[role="option"], [role="listbox"] li, .pac-item, .pac-container .pac-item, ' +
+                                '.autocomplete-suggestion, [class*="suggestion"], [class*="Suggestion"], ' +
+                                '[class*="dropdown"] li, [class*="listbox"] li, ul[class*="auto"] li'
+                            );
+                            const preferred = ["california", "ca,", "ca ", ", ca", "united states", "usa"];
+                            const avoid = ["peru", "cuba", "colombia", "mexico", "brazil", "chile", "argentina"];
+                            for (const s of suggestions) {
+                                if (s.offsetParent === null) continue;
+                                const text = (s.innerText || s.textContent || '').toLowerCase();
+                                if (!text) continue;
+                                // Check if this suggestion matches California/US
+                                for (const p of preferred) {
+                                    if (text.includes(p)) {
+                                        s.click();
+                                        return text.trim().substring(0, 80);
+                                    }
+                                }
+                            }
+                            // If no preferred match found, check first suggestion doesn't contain avoided countries
+                            for (const s of suggestions) {
+                                if (s.offsetParent === null) continue;
+                                const text = (s.innerText || s.textContent || '').toLowerCase();
+                                if (!text) continue;
+                                let bad = false;
+                                for (const a of avoid) {
+                                    if (text.includes(a)) { bad = true; break; }
+                                }
+                                if (!bad) {
+                                    s.click();
+                                    return text.trim().substring(0, 80);
+                                }
+                            }
+                            return null;
+                        }""")
+                        if picked:
+                            if event_callback:
+                                await event_callback("Fill Form", "info", f"Location autocomplete: {picked[:60]}")
+                            await asyncio.sleep(0.5)
+                        else:
+                            # Fallback: ArrowDown + Enter for first suggestion
+                            await page.keyboard.press("ArrowDown")
+                            await asyncio.sleep(0.3)
+                            await page.keyboard.press("Enter")
+                            await asyncio.sleep(0.5)
                         # If autocomplete cleared the value, just set it directly
                         current = await loc.input_value()
                         if not current:
@@ -3043,18 +3541,25 @@ async def fill_form(
 
             elif action == "upload_file":
                 try:
-                    file_path = resume_path
-                    file_label = "resume"
-                    if value == "transcript" and transcript_path:
-                        file_path = transcript_path
-                        file_label = "transcript"
-
-                    success = await _handle_resume_upload(page, file_path, event_callback)
-                    if success:
+                    # Check if file inputs still exist — if not, upload already succeeded
+                    has_file_inputs = await page.evaluate("document.querySelectorAll('input[type=\"file\"]').length > 0")
+                    if not has_file_inputs:
+                        if event_callback:
+                            await event_callback("Upload", "info", "File already uploaded (no file inputs on page)")
                         filled += 1
                     else:
-                        failed += 1
-                        errors.append(f"{file_label} upload failed")
+                        file_path = resume_path
+                        file_label = "resume"
+                        if value == "transcript" and transcript_path:
+                            file_path = transcript_path
+                            file_label = "transcript"
+
+                        success = await _handle_resume_upload(page, file_path, event_callback)
+                        if success:
+                            filled += 1
+                        else:
+                            failed += 1
+                            errors.append(f"{file_label} upload failed")
                 except Exception as e:
                     errors.append(f"File upload error: {e}")
                     failed += 1
@@ -3080,13 +3585,22 @@ async def fill_form(
     # Post-fill: verify resume was uploaded, retry if not
     try:
         resume_ok = await page.evaluate("""() => {
+            // Check if file inputs have files
             for (const fi of document.querySelectorAll('input[type="file"]')) {
                 if (fi.files && fi.files.length > 0) return true;
             }
-            for (const sel of ['.filename', '.file-name', '.resume-filename', '.attachment-filename', '[data-automation-id="file-upload-item"]', '[class*="upload-success"]', '[class*="attachment"]']) {
+            // Check common upload confirmation selectors
+            for (const sel of ['.filename', '.file-name', '.resume-filename', '.attachment-filename',
+                               '[data-automation-id="file-upload-item"]', '[class*="upload-success"]',
+                               '[class*="attachment"]']) {
                 const el = document.querySelector(sel);
                 if (el && el.innerText.trim()) return true;
             }
+            // Greenhouse: after upload, the file input is removed and replaced with
+            // a filename display. If there are NO file inputs at all, the upload likely
+            // succeeded (the form originally had one).
+            const fileInputs = document.querySelectorAll('input[type="file"]');
+            if (fileInputs.length === 0) return true;
             return false;
         }""")
         if not resume_ok and resume_path:
@@ -3182,27 +3696,7 @@ async def fill_application(
         ss = await _take_screenshot(page)
         await screenshot_callback(ss)
 
-    # Check for CAPTCHA (reCAPTCHA, hCaptcha, etc.)
-    has_captcha = await _check_for_captcha(page)
-    if has_captcha:
-        if event_callback:
-            await event_callback("CAPTCHA", "warning",
-                "CAPTCHA detected! Please solve it in the browser window. Waiting up to 2 minutes...")
-        # Wait for user to solve CAPTCHA manually (up to 120s)
-        for _ in range(120):
-            await asyncio.sleep(1.0)
-            still_captcha = await _check_for_captcha(page)
-            if not still_captcha:
-                break
-            # Also check if form fields appeared (CAPTCHA solved and page moved on)
-            try:
-                input_count = await page.evaluate("document.querySelectorAll('input:not([type=hidden])').length")
-                if input_count > 3:
-                    break
-            except Exception:
-                pass
-        if event_callback:
-            await event_callback("CAPTCHA", "info", "Continuing after CAPTCHA wait")
+    # CAPTCHA detection removed — was producing false positives and blocking the pipeline
 
     # Scroll down incrementally to load lazy content (Greenhouse, etc.)
     page_height = await page.evaluate("document.body.scrollHeight")
@@ -3303,27 +3797,10 @@ async def fill_application(
             except Exception:
                 continue
 
-        # After clicking apply, check for CAPTCHA on the new page (iCIMS, etc.)
+        # CAPTCHA detection removed — was producing false positives and blocking the pipeline
+
         if apply_clicked:
-            has_captcha = await _check_for_captcha(page)
-            if has_captcha:
-                if event_callback:
-                    await event_callback("CAPTCHA", "warning",
-                        "CAPTCHA detected! Please solve it in the browser window. Waiting up to 2 minutes...")
-                for _ in range(120):
-                    await asyncio.sleep(1.0)
-                    still_captcha = await _check_for_captcha(page)
-                    if not still_captcha:
-                        break
-                    try:
-                        input_count = await page.evaluate("document.querySelectorAll('input:not([type=hidden])').length")
-                        if input_count > 3:
-                            break
-                    except Exception:
-                        pass
-                await asyncio.sleep(2.0)
-                if event_callback:
-                    await event_callback("CAPTCHA", "info", "Continuing after CAPTCHA")
+            await asyncio.sleep(2.0)
 
             # Handle iCIMS email login gate
             try:

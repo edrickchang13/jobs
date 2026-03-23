@@ -974,7 +974,12 @@ async def mark_as_not_applied(request: Request):
 
 @app.get("/api/uploads")
 async def get_uploads():
-    """Return current upload status."""
+    """Return current upload status. Re-check disk for files that appeared after startup."""
+    global uploaded_resume, uploaded_transcript
+    if not uploaded_resume and _default_resume.exists():
+        uploaded_resume = str(_default_resume)
+    if not uploaded_transcript and _default_transcript.exists():
+        uploaded_transcript = str(_default_transcript)
     return JSONResponse({
         "resume": bool(uploaded_resume),
         "resume_name": Path(uploaded_resume).name if uploaded_resume else "",
@@ -1161,7 +1166,49 @@ async def continue_application_endpoint():
         # --- VERIFICATION ---
         if state.get("isVerify"):
             add_event("Continue", "info",
-                "Verification page detected. Click 'Get Email Code' button to auto-fetch code from Gmail.")
+                "Verification page detected. Automatically checking Gmail for security code...")
+
+            # Auto-fetch and enter the security code
+            try:
+                from applicator.email_handler import auto_handle_security_code
+                company = ""
+                try:
+                    company = await page.title()
+                except Exception:
+                    pass
+                async def on_event(step, status, detail=""):
+                    add_event(step, status, detail)
+
+                code_entered = await auto_handle_security_code(
+                    page, company_name=company, event_callback=on_event
+                )
+
+                # Take screenshot after attempt
+                try:
+                    ss = await page.screenshot(type="png")
+                    latest_screenshot_b64 = base64.b64encode(ss).decode("utf-8")
+                    screenshot_version += 1
+                except Exception:
+                    pass
+
+                if code_entered:
+                    add_event("Continue", "success",
+                        "Security code entered! Waiting for page to load...")
+                    await asyncio.sleep(3)
+                    # Take another screenshot after page loads
+                    try:
+                        ss = await page.screenshot(type="png")
+                        latest_screenshot_b64 = base64.b64encode(ss).decode("utf-8")
+                        screenshot_version += 1
+                    except Exception:
+                        pass
+                    return JSONResponse({"status": "ok", "action": "code_entered"})
+                else:
+                    add_event("Continue", "warning",
+                        "Auto code retrieval failed. Click 'Get Email Code' to try again or enter manually.")
+            except Exception as e:
+                add_event("Continue", "warning", f"Auto email check error: {e}")
+
             # Take a fresh screenshot so user can see the verification page
             try:
                 ss = await page.screenshot(type="png")
@@ -1343,13 +1390,19 @@ async def continue_application_endpoint():
                 add_event("Continue", "info", f"Filled {result.get('filled',0)}, failed {result.get('failed',0)}")
             else:
                 add_event("Continue", "info", "No extractable fields on this page.")
+
+            # Run custom dropdown/radio/checkbox handler (Phase A-E)
+            add_event("Continue", "info", "Running custom dropdown & EEO handler...")
+            await _handle_custom_fields(page, add_event)
             return JSONResponse({"status": "ok", "action": "form"})
 
-        # --- UNKNOWN ---
+        # --- UNKNOWN / FEW FIELDS ---
+        # Still try the custom dropdown handler — the self-ID section may have
+        # custom React Select dropdowns that don't count as native inputs
         add_event("Continue", "info",
-            f"{state.get('visibleFields',0)} fields. Buttons: {state.get('buttons',[])}. "
-            f"Text: {state.get('bodyText','')[:200]}...")
-        return JSONResponse({"status": "ok", "action": "unknown"})
+            f"{state.get('visibleFields',0)} visible fields. Running custom dropdown handler...")
+        await _handle_custom_fields(page, add_event)
+        return JSONResponse({"status": "ok", "action": "form_custom"})
 
     except Exception as e:
         add_event("Continue", "error", f"Failed: {e}")
@@ -1477,6 +1530,825 @@ async def run_pipeline(request: Request):
     return JSONResponse({"status": "started"})
 
 
+async def _handle_custom_fields(page, add_event_func):
+    """Handle ALL custom dropdowns, radio buttons, checkboxes, and EEO selects on a Greenhouse form.
+
+    This is extracted as a standalone function so it can be called from both
+    _run_application() (initial pipeline) and /continue endpoint (re-runs).
+    """
+    global latest_screenshot_b64, screenshot_version
+    from applicator.form_filler import _load_personal_info
+    info = _load_personal_info()
+
+    # Build a label-to-value mapping for custom dropdowns
+    dd_value_map = {
+        "state": info.get("state", "California"),
+        "resident": info.get("state", "California"),
+        "graduation": info.get("graduation_year", "2028"),
+        "graduate": info.get("graduation_year", "2028"),
+        "intern season": info.get("intern_season", "Summer"),
+        "season": info.get("intern_season", "Summer"),
+        "sponsorship": info.get("sponsorship_needed", "No"),
+        "relocat": info.get("willing_to_relocate", "Yes"),
+        "internship": "No",
+        "co-op": "No",
+        "coop": "No",
+        "prior": "No",
+        "gender": info.get("gender", "Male"),
+        "gender identity": "Man",
+        "describe your gender": "Man",
+        "race": info.get("race_ethnicity", "Asian"),
+        "ethnicity": info.get("race_ethnicity", "Asian"),
+        "racial": info.get("race_ethnicity", "Asian"),
+        "ethnic": info.get("race_ethnicity", "Asian"),
+        "identify your race": info.get("race_ethnicity", "Asian"),
+        "hispanic": "No",
+        "latino": "No",
+        "sexual orientation": "Decline to self-identify",
+        "transgender": "No",
+        "identify as transgender": "No",
+        "veteran": info.get("veteran_status", "I am not a protected veteran"),
+        "armed forces": info.get("veteran_status", "I am not a protected veteran"),
+        "disability": info.get("disability_status", "I do not wish to answer"),
+        "chronic condition": info.get("disability_status", "I do not wish to answer"),
+        "hear": info.get("how_did_you_hear", "LinkedIn"),
+        "education": info.get("degree", "Bachelor's"),
+        "country": info.get("country", "United States"),
+        # Education fields
+        "confirm your school": info.get("school", "Santa Clara University"),
+        "school": info.get("school", "Santa Clara University"),
+        "university": info.get("school", "Santa Clara University"),
+        "college": info.get("school", "Santa Clara University"),
+        "degree": info.get("degree", "Bachelor's Degree"),
+        "discipline": info.get("major", "Computer Science"),
+        "major": info.get("major", "Computer Science"),
+        "field of study": info.get("major", "Computer Science"),
+        "area of study": info.get("major", "Computer Science"),
+        # Date fields
+        "start date month": "September",
+        "end date month": "June",
+    }
+
+    # Mapping for radio buttons
+    radio_value_map = {
+        "authorized": "Yes",
+        "work in the united states": "Yes",
+        "legally authorized": "Yes",
+        "on-site": "Yes",
+        "onsite": "Yes",
+        "18": "Yes",
+        "over 18": "Yes",
+        "felony": "No",
+        "convicted": "No",
+        "criminal": "No",
+    }
+
+    try:
+        # --- PHASE A: Find ALL unfilled custom dropdowns ---
+        unfilled_dropdowns = await page.evaluate("""() => {
+            const results = [];
+            const containers = document.querySelectorAll('[class*="select__container"]');
+            for (let i = 0; i < containers.length; i++) {
+                const container = containers[i];
+                const style = window.getComputedStyle(container);
+                if (style.display === 'none' || style.visibility === 'hidden') continue;
+
+                const singleVal = container.querySelector('[class*="single-value"], [class*="singleValue"]');
+                const multiVals = container.querySelectorAll('[class*="multi-value"], [class*="multiValue"]');
+                const placeholder = container.querySelector('[class*="placeholder"]');
+                const displayText = singleVal ? singleVal.innerText.trim() : (placeholder ? placeholder.innerText.trim() : '');
+                const isUnfilled = (!singleVal && multiVals.length === 0) || displayText.toLowerCase().startsWith('select');
+
+                if (!isUnfilled) continue;
+
+                const fieldContainer = container.closest('li, .field, .form-group, .question, .select-field, [class*="application-question"]') || container.parentElement;
+                const lbl = fieldContainer ? fieldContainer.querySelector('label') : null;
+                const lblText = lbl ? lbl.innerText.trim() : '';
+                const isRequired = lblText.includes('*');
+
+                results.push({
+                    index: i,
+                    label: lblText.replace('*', '').trim(),
+                    displayText: displayText,
+                    isRequired: isRequired,
+                });
+            }
+            return results;
+        }""")
+
+        if unfilled_dropdowns:
+            add_event_func("Custom DD", "info", f"Found {len(unfilled_dropdowns)} unfilled custom dropdown(s)")
+
+        for dd_info in (unfilled_dropdowns or []):
+            dd_label = dd_info.get("label", "")
+            dd_idx = dd_info.get("index", 0)
+            dd_label_lower = dd_label.lower()
+
+            # Determine target value from mapping
+            target_value = None
+            for keyword, val in dd_value_map.items():
+                if keyword in dd_label_lower:
+                    target_value = val
+                    break
+
+            pick_first = "onsite location" in dd_label_lower or "which.*location" in dd_label_lower
+
+            # For demographic/EEO fields with no mapping, prefer "Decline" or "I do not wish" over first option
+            is_demographic = any(kw in dd_label_lower for kw in [
+                "gender", "race", "ethnic", "racial", "sexual orientation",
+                "transgender", "disability", "chronic condition", "veteran",
+                "armed forces", "mark all that apply"
+            ])
+
+            if not target_value and not pick_first:
+                if is_demographic:
+                    add_event_func("Custom DD", "info", f"No mapping for demographic dropdown: '{dd_label[:60]}' — will try 'Decline to self-identify'")
+                    target_value = "Decline to self-identify"
+                else:
+                    add_event_func("Custom DD", "warning", f"No mapping for dropdown: '{dd_label[:60]}' — will try first option")
+                    pick_first = True
+
+            add_event_func("Custom DD", "info", f"Fixing dropdown #{dd_idx}: '{dd_label[:50]}' → target='{target_value or 'first option'}'")
+
+            try:
+                all_containers = page.locator('[class*="select__container"]')
+                container_loc = all_containers.nth(dd_idx)
+                await container_loc.scroll_into_view_if_needed(timeout=3000)
+                await asyncio.sleep(0.3)
+
+                async def verify_dd_filled(idx):
+                    return await page.evaluate(f"""() => {{
+                        const containers = document.querySelectorAll('[class*="select__container"]');
+                        const c = containers[{idx}];
+                        if (!c) return null;
+                        // Check single-value (regular select)
+                        const sv = c.querySelector('[class*="single-value"], [class*="singleValue"]');
+                        if (sv) return sv.innerText.trim();
+                        // Check multi-value (multi-select) — return comma-joined selected values
+                        const mvs = c.querySelectorAll('[class*="multi-value"], [class*="multiValue"]');
+                        if (mvs.length > 0) return Array.from(mvs).map(v => v.innerText.trim()).join(', ');
+                        return null;
+                    }}""")
+
+                async def open_dd(container_locator):
+                    await container_locator.click(timeout=3000)
+                    await asyncio.sleep(0.8)
+                    menu_open = await page.locator('[class*="select__menu"]').count()
+                    if menu_open == 0:
+                        try:
+                            indicator = container_locator.locator('[class*="indicator"], [class*="IndicatorsContainer"] div').first
+                            await indicator.click(timeout=1000)
+                            await asyncio.sleep(0.5)
+                        except Exception:
+                            pass
+
+                await open_dd(container_loc)
+
+                picked = False
+
+                if target_value:
+                    # Strategy 1: Direct click on option with text match
+                    for selector in ['[class*="select__option"]', '[role="option"]']:
+                        try:
+                            option_loc = page.locator(f'{selector}:has-text("{target_value}")').first
+                            await option_loc.click(timeout=2000)
+                            await asyncio.sleep(0.5)
+                            filled_val = await verify_dd_filled(dd_idx)
+                            if filled_val and filled_val.lower() != 'select...':
+                                add_event_func("Custom DD", "success", f"Selected '{filled_val[:40]}' for '{dd_label[:40]}'")
+                                picked = True
+                                break
+                            else:
+                                add_event_func("Custom DD", "info", f"Click seemed to work but value shows '{filled_val}', retrying...")
+                        except Exception:
+                            continue
+
+                    # Strategy 2: Type to filter + click best matching option
+                    # This is the CRITICAL strategy for large searchable dropdowns (School, etc.)
+                    if not picked:
+                        type_keywords = {
+                            "I am not a protected veteran": "not a protected",
+                            "I do not wish to answer": "do not wish",
+                            "No, I do not have a disability": "do not have",
+                            "Decline to self-identify": "Decline",
+                            "Decline to self identify": "Decline",
+                            "California": "Calif",
+                            "United States": "United",
+                            "Bachelor's": "Bachelor",
+                            "Bachelor's Degree": "Bachelor",
+                            "Santa Clara University": "Santa Clara Uni",
+                            "Computer Science and Engineering": "Computer Science",
+                            "Computer Science": "Computer Sci",
+                            "Asian": "Asian",
+                            "September": "Sep",
+                            "June": "Jun",
+                            "Male": "Male",
+                            "Man": "Man",
+                            "No": "No",
+                            "Yes": "Yes",
+                            "LinkedIn": "LinkedIn",
+                        }
+                        type_text = type_keywords.get(target_value, target_value[:15])
+                        add_event_func("Custom DD", "info", f"Trying type-to-filter: '{type_text}'...")
+
+                        # Close any stale menu first, then re-open fresh
+                        await page.keyboard.press("Escape")
+                        await asyncio.sleep(0.3)
+                        await open_dd(container_loc)
+
+                        # Type directly using keyboard (more reliable than input.fill/type)
+                        # The React Select listens for keyboard input when focused
+                        await page.keyboard.type(type_text, delay=80)
+                        # Wait longer for large lists (schools) to filter via API/search
+                        await asyncio.sleep(1.5)
+
+                        try:
+                            opts = page.locator('[class*="select__option"]')
+                            count = await opts.count()
+                            add_event_func("Custom DD", "info", f"After typing '{type_text}': {count} option(s) visible")
+
+                            # Find best matching option (prefer exact match over partial)
+                            best_idx = -1
+                            best_text = ""
+                            for oi in range(min(count, 10)):
+                                try:
+                                    opt_text = await opts.nth(oi).inner_text(timeout=1000)
+                                except Exception:
+                                    continue
+                                if "no options" in opt_text.lower() or "loading" in opt_text.lower():
+                                    continue
+                                # Exact match
+                                if opt_text.strip().lower() == target_value.lower():
+                                    best_idx = oi
+                                    best_text = opt_text.strip()
+                                    break
+                                # Partial match (target in option or option in target)
+                                if best_idx < 0 and (
+                                    target_value.lower() in opt_text.lower() or
+                                    opt_text.strip().lower() in target_value.lower()
+                                ):
+                                    best_idx = oi
+                                    best_text = opt_text.strip()
+                                # First valid option as fallback
+                                if best_idx < 0:
+                                    best_idx = oi
+                                    best_text = opt_text.strip()
+
+                            if best_idx >= 0:
+                                add_event_func("Custom DD", "info", f"Clicking option: '{best_text[:40]}'")
+                                await opts.nth(best_idx).click(timeout=2000)
+                                await asyncio.sleep(0.5)
+                                filled_val = await verify_dd_filled(dd_idx)
+                                if filled_val and filled_val.lower() != 'select...':
+                                    add_event_func("Custom DD", "success",
+                                        f"Type+click selected '{filled_val[:40]}' for '{dd_label[:40]}'")
+                                    picked = True
+                                else:
+                                    add_event_func("Custom DD", "info", f"Clicked but verify shows '{filled_val}', not picked")
+                        except Exception as e2:
+                            add_event_func("Custom DD", "info", f"Type-filter click error: {str(e2)[:60]}")
+
+                        if not picked:
+                            await page.keyboard.press("Escape")
+                            await asyncio.sleep(0.3)
+
+                    # Strategy 3: Use JS to simulate React Select's onChange
+                    if not picked:
+                        add_event_func("Custom DD", "info", f"Trying JS-based selection for '{dd_label[:40]}'...")
+                        try:
+                            js_picked = await page.evaluate(f"""(targetVal) => {{
+                                const containers = document.querySelectorAll('[class*="select__container"]');
+                                const container = containers[{dd_idx}];
+                                if (!container) return false;
+
+                                container.querySelector('[class*="control"]')?.click();
+
+                                return new Promise(resolve => {{
+                                    setTimeout(() => {{
+                                        const options = document.querySelectorAll('[class*="select__option"]');
+                                        for (const opt of options) {{
+                                            const text = opt.innerText.trim();
+                                            if (text.toLowerCase().includes(targetVal.toLowerCase()) ||
+                                                targetVal.toLowerCase().includes(text.toLowerCase())) {{
+                                                opt.dispatchEvent(new MouseEvent('mousedown', {{bubbles: true}}));
+                                                opt.dispatchEvent(new MouseEvent('mouseup', {{bubbles: true}}));
+                                                opt.click();
+                                                resolve(true);
+                                                return;
+                                            }}
+                                        }}
+                                        resolve(false);
+                                    }}, 500);
+                                }});
+                            }}""", target_value)
+
+                            if js_picked:
+                                await asyncio.sleep(0.5)
+                                filled_val = await verify_dd_filled(dd_idx)
+                                if filled_val and filled_val.lower() != 'select...':
+                                    add_event_func("Custom DD", "success",
+                                        f"JS selected '{filled_val[:40]}' for '{dd_label[:40]}'")
+                                    picked = True
+                        except Exception as js_err:
+                            add_event_func("Custom DD", "info", f"JS selection failed: {str(js_err)[:60]}")
+
+                # Strategy 4: For demographic fields, try multiple decline-type phrases
+                if not picked and is_demographic:
+                    decline_phrases = [
+                        "Decline", "decline", "Prefer not", "prefer not",
+                        "do not wish", "Don't wish", "not to disclose",
+                        "choose not", "rather not",
+                    ]
+                    for phrase in decline_phrases:
+                        if picked:
+                            break
+                        try:
+                            await page.keyboard.press("Escape")
+                            await asyncio.sleep(0.3)
+                            await open_dd(container_loc)
+                            await page.keyboard.type(phrase, delay=80)
+                            await asyncio.sleep(1.0)
+                            opts = page.locator('[class*="select__option"]')
+                            count = await opts.count()
+                            if count > 0:
+                                opt_text = await opts.first.inner_text(timeout=1000)
+                                if "no options" not in opt_text.lower() and "loading" not in opt_text.lower():
+                                    await opts.first.click(timeout=2000)
+                                    await asyncio.sleep(0.5)
+                                    filled_val = await verify_dd_filled(dd_idx)
+                                    if filled_val and filled_val.lower() != 'select...':
+                                        add_event_func("Custom DD", "success",
+                                            f"Decline phrase '{phrase}' selected '{filled_val[:40]}' for '{dd_label[:40]}'")
+                                        picked = True
+                        except Exception:
+                            continue
+
+                if pick_first and not picked:
+                    try:
+                        menu_count = await page.locator('[class*="select__menu"]').count()
+                        if menu_count == 0:
+                            await open_dd(container_loc)
+                        first_opt = page.locator('[class*="select__option"]').first
+                        opt_text = await first_opt.inner_text(timeout=2000)
+                        await first_opt.click(timeout=2000)
+                        await asyncio.sleep(0.5)
+                        add_event_func("Custom DD", "success", f"Picked first option '{opt_text[:30]}' for '{dd_label[:40]}'")
+                        picked = True
+                    except Exception:
+                        add_event_func("Custom DD", "warning", f"Could not pick option for '{dd_label[:40]}'")
+
+                if not picked:
+                    await page.keyboard.press("Escape")
+
+                await asyncio.sleep(0.3)
+            except Exception as e:
+                add_event_func("Custom DD", "warning", f"Error fixing '{dd_label[:40]}': {str(e)[:80]}")
+
+        # --- PHASE A2: Fix phone country code dropdown ---
+        try:
+            from applicator.form_filler import _handle_phone_country
+            async def _phone_evt(s, st, d=""):
+                add_event_func(s, st, d)
+            phone_fixed = await _handle_phone_country(page, "United States", _phone_evt)
+            if phone_fixed:
+                add_event_func("Phone CC", "success", "Phone country code set to US (+1)")
+            else:
+                phone_dd = await page.evaluate("""() => {
+                    const telInputs = document.querySelectorAll('input[type="tel"]');
+                    for (const tel of telInputs) {
+                        let parent = tel.parentElement;
+                        for (let i = 0; i < 5 && parent; i++) {
+                            const dd = parent.querySelector('[class*="select__container"]');
+                            if (dd) {
+                                const sv = dd.querySelector('[class*="single-value"], [class*="singleValue"]');
+                                const text = sv ? sv.innerText.trim() : '';
+                                if (text.includes('United States') || text.includes('+1') || text.includes('\U0001f1fa\U0001f1f8')) {
+                                    return null;
+                                }
+                                const allContainers = document.querySelectorAll('[class*="select__container"]');
+                                for (let j = 0; j < allContainers.length; j++) {
+                                    if (allContainers[j] === dd) return {index: j, currentText: text};
+                                }
+                            }
+                            parent = parent.parentElement;
+                        }
+                    }
+                    return null;
+                }""")
+                if phone_dd:
+                    ph_idx = phone_dd["index"]
+                    add_event_func("Phone CC", "info", f"Found phone country dropdown at index {ph_idx}")
+                    try:
+                        ph_container = page.locator('[class*="select__container"]').nth(ph_idx)
+                        await ph_container.scroll_into_view_if_needed(timeout=3000)
+                        await ph_container.click(timeout=3000)
+                        await asyncio.sleep(0.8)
+                        await page.keyboard.type("United States", delay=40)
+                        await asyncio.sleep(0.8)
+                        us_opt = page.locator('[class*="select__option"]:has-text("United States")').first
+                        await us_opt.click(timeout=2000)
+                        add_event_func("Phone CC", "success", "Selected United States for phone country")
+                    except Exception as phe:
+                        await page.keyboard.press("Escape")
+                        add_event_func("Phone CC", "warning", f"Phone country select error: {str(phe)[:60]}")
+        except Exception as e:
+            add_event_func("Phone CC", "info", f"Phone country check: {str(e)[:60]}")
+
+        # --- PHASE B: Handle unfilled RADIO BUTTONS ---
+        unfilled_radios = await page.evaluate("""() => {
+            const results = [];
+            const radioInputs = document.querySelectorAll('input[type="radio"]');
+            const groups = {};
+            for (const r of radioInputs) {
+                const name = r.name || r.id || 'unknown';
+                if (!groups[name]) groups[name] = [];
+                groups[name].push(r);
+            }
+            for (const [name, radios] of Object.entries(groups)) {
+                const anyChecked = radios.some(r => r.checked);
+                if (anyChecked) continue;
+
+                const firstRadio = radios[0];
+                let questionText = '';
+                let ancestor = firstRadio;
+                for (let i = 0; i < 10 && ancestor; i++) {
+                    ancestor = ancestor.parentElement;
+                    if (!ancestor || ancestor === document.body) break;
+                    const lbl = ancestor.querySelector('label, legend, .field-label, h3, h4');
+                    if (lbl) {
+                        const t = lbl.innerText.trim();
+                        if (t.length > 10 && t !== 'Yes' && t !== 'No') {
+                            questionText = t.substring(0, 200);
+                            break;
+                        }
+                    }
+                }
+
+                const options = radios.map(r => {
+                    const wrapper = r.closest('li, div, label');
+                    const optText = wrapper ? wrapper.innerText.trim() : (r.value || '');
+                    return {
+                        value: r.value,
+                        text: optText,
+                        selector: r.id ? '#' + r.id : (r.name ? '[name="' + r.name + '"][value="' + r.value + '"]' : ''),
+                    };
+                });
+
+                results.push({
+                    name: name,
+                    question: questionText,
+                    options: options,
+                    isRequired: questionText.includes('*'),
+                });
+            }
+            return results;
+        }""")
+
+        if unfilled_radios:
+            add_event_func("Radio/Check", "info", f"Found {len(unfilled_radios)} unfilled radio group(s)")
+
+        for radio_group in (unfilled_radios or []):
+            question = radio_group.get("question", "")
+            options = radio_group.get("options", [])
+            question_lower = question.lower()
+
+            target_answer = None
+            for keyword, val in radio_value_map.items():
+                if keyword in question_lower:
+                    target_answer = val
+                    break
+
+            if not target_answer:
+                if radio_group.get("isRequired"):
+                    target_answer = "Yes"
+                else:
+                    continue
+
+            target_selector = None
+            for opt in options:
+                if opt["text"].strip().lower() == target_answer.lower():
+                    target_selector = opt["selector"]
+                    break
+            if not target_selector:
+                for opt in options:
+                    if target_answer.lower() in opt["text"].strip().lower():
+                        target_selector = opt["selector"]
+                        break
+
+            if target_selector:
+                try:
+                    loc = page.locator(target_selector).first
+                    await loc.scroll_into_view_if_needed(timeout=3000)
+                    await loc.click(timeout=3000)
+                    add_event_func("Radio/Check", "success", f"Clicked '{target_answer}' for '{question[:50]}'")
+                except Exception as e:
+                    add_event_func("Radio/Check", "warning", f"Failed to click radio for '{question[:40]}': {str(e)[:60]}")
+            else:
+                add_event_func("Radio/Check", "warning", f"No matching option for '{question[:40]}' → '{target_answer}'")
+
+        # --- PHASE C: Handle unfilled CHECKBOXES ---
+        unfilled_checkboxes = await page.evaluate("""() => {
+            const results = [];
+            const checkboxes = document.querySelectorAll('input[type="checkbox"]');
+            for (const cb of checkboxes) {
+                if (cb.checked) continue;
+                if (cb.offsetParent === null) continue;
+                if ((cb.name || '').includes('cookie') || (cb.id || '').includes('ot-')) continue;
+
+                const wrapper = cb.closest('li, div, label, .field, .form-group');
+                const text = wrapper ? wrapper.innerText.trim() : '';
+                const isRequired = text.includes('*') || cb.required;
+
+                const textLower = text.toLowerCase();
+                const shouldCheck = isRequired || textLower.includes('understand') || textLower.includes('agree')
+                    || textLower.includes('acknowledge') || textLower.includes('on-site')
+                    || textLower.includes('onsite') || textLower.includes('authorize')
+                    || textLower.includes('certif');
+
+                if (!shouldCheck) continue;
+
+                results.push({
+                    selector: cb.id ? '#' + cb.id : (cb.name ? '[name="' + cb.name + '"]' : ''),
+                    text: text.substring(0, 150),
+                });
+            }
+            return results;
+        }""")
+
+        if unfilled_checkboxes:
+            add_event_func("Radio/Check", "info", f"Found {len(unfilled_checkboxes)} unchecked checkbox(es) to check")
+
+        for cb_info in (unfilled_checkboxes or []):
+            selector = cb_info.get("selector", "")
+            text = cb_info.get("text", "")
+            if not selector:
+                continue
+            try:
+                loc = page.locator(selector).first
+                await loc.scroll_into_view_if_needed(timeout=3000)
+                await loc.click(timeout=3000)
+                add_event_func("Radio/Check", "success", f"Checked: '{text[:50]}'")
+            except Exception as e:
+                add_event_func("Radio/Check", "warning", f"Failed to check: {str(e)[:60]}")
+
+        # --- PHASE D: Handle Voluntary Self-Identification (EEO) native <select> elements ---
+        eeo_selects = await page.evaluate("""() => {
+            const results = [];
+            const selects = document.querySelectorAll('select');
+            for (const s of selects) {
+                if (s.offsetParent === null) continue;
+                const section = s.closest('fieldset, .voluntary-self-id, [class*="demographic"], [class*="eeo"], [class*="voluntary"]');
+                const label = s.closest('li, .field, .form-group')?.querySelector('label, .field-label')?.innerText?.trim() || '';
+                const currentText = s.options[s.selectedIndex]?.text?.trim() || '';
+                const isPlaceholder = ['select...', 'select', 'choose', '--', ''].includes(currentText.toLowerCase());
+
+                if (!isPlaceholder) continue;
+
+                const opts = Array.from(s.options).map(o => ({v: o.value, t: o.text.trim(), i: o.index}));
+                results.push({
+                    selector: s.id ? '#' + s.id : (s.name ? 'select[name="' + s.name + '"]' : ''),
+                    label: label,
+                    currentText: currentText,
+                    options: opts,
+                    inEEO: !!section,
+                });
+            }
+            return results;
+        }""")
+
+        if eeo_selects:
+            add_event_func("EEO", "info", f"Found {len(eeo_selects)} unfilled select(s)")
+
+        eeo_value_map = {
+            "gender": info.get("gender", "Male"),
+            "race": info.get("race_ethnicity", "Asian"),
+            "ethnicity": info.get("race_ethnicity", "Asian"),
+            "hispanic": "No",
+            "veteran": info.get("veteran_status", "I am not a protected veteran"),
+            "disability": info.get("disability_status", "I do not wish to answer"),
+            "state": info.get("state", "California"),
+            "resident": info.get("state", "California"),
+        }
+
+        for sel_info in (eeo_selects or []):
+            selector = sel_info.get("selector", "")
+            label = sel_info.get("label", "")
+            label_lower = label.lower()
+
+            target_value = None
+            for keyword, val in eeo_value_map.items():
+                if keyword in label_lower:
+                    target_value = val
+                    break
+
+            if not target_value:
+                continue
+
+            target_idx = None
+            for opt in sel_info.get("options", []):
+                if opt["t"].lower().strip() == target_value.lower().strip():
+                    target_idx = opt["i"]
+                    break
+                if target_value.lower() in opt["t"].lower():
+                    target_idx = opt["i"]
+
+            if target_idx is None:
+                add_event_func("EEO", "warning", f"No option matching '{target_value}' for '{label[:40]}'")
+                continue
+
+            try:
+                loc = page.locator(selector).first
+                await loc.scroll_into_view_if_needed(timeout=3000)
+                await loc.select_option(index=target_idx, timeout=3000)
+                await page.evaluate(f"""() => {{
+                    const el = document.querySelector('{selector}');
+                    if (el) {{
+                        el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                        el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    }}
+                }}""")
+                add_event_func("EEO", "success", f"Selected '{target_value}' for '{label[:40]}'")
+            except Exception as e:
+                add_event_func("EEO", "warning", f"Failed to select for '{label[:40]}': {str(e)[:60]}")
+
+        # --- PHASE F: Clean up resume wrongly uploaded to cover letter fields ---
+        # The browser-use agent sometimes uploads resume to ALL file inputs including cover letter.
+        # We detect non-resume upload fields that have a file attached and remove it.
+        try:
+            cover_letter_uploads = await page.evaluate("""() => {
+                const results = [];
+                // Find all upload field containers on Greenhouse forms
+                const fields = document.querySelectorAll('.field, .application-field, .form-group, li[class*="field"]');
+                for (const field of fields) {
+                    if (field.offsetParent === null) continue;
+                    // Get the label
+                    const lbl = field.querySelector('label, .field-label, h3, h4');
+                    if (!lbl) continue;
+                    const labelText = lbl.innerText.trim().toLowerCase();
+                    // Skip if this IS a resume/CV field
+                    if (labelText.match(/resume|\\bcv\\b/)) continue;
+                    // Check if this is a cover letter or other non-resume upload field
+                    const isUploadField = labelText.match(/cover.?letter|additional|supplement|other|portfolio|writing.?sample|transcript/);
+                    if (!isUploadField) continue;
+                    // Check if a file has been uploaded here
+                    // Greenhouse shows filename after upload, or has attachment elements
+                    const hasFile = field.querySelector('.filename, .file-name, .attachment-filename, [class*="attachment"], [class*="upload-success"], [class*="uploaded"]');
+                    const hasRemoveBtn = field.querySelector('button[aria-label*="Remove"], button[aria-label*="remove"], button[aria-label*="Delete"], button[aria-label*="delete"], a[aria-label*="Remove"], .remove-file, [class*="remove"], button:has(svg), button.close, [data-automation-id*="delete"]');
+                    // Also check if there's a displayed filename text (Greenhouse pattern)
+                    const filenameEls = field.querySelectorAll('span, div, a');
+                    let hasFilename = false;
+                    for (const el of filenameEls) {
+                        if (el.offsetParent === null) continue;
+                        const txt = el.innerText.trim().toLowerCase();
+                        if (txt.match(/\\.(pdf|doc|docx|txt|rtf)$/)) { hasFilename = true; break; }
+                    }
+                    if (hasFile || hasFilename || hasRemoveBtn) {
+                        // Find the remove/X button
+                        const removeBtn = field.querySelector('button[aria-label*="Remove"], button[aria-label*="remove"], button[aria-label*="Delete"], button[aria-label*="delete"], a[aria-label*="Remove"], .remove-file, [class*="remove"], button.close, [data-automation-id*="delete"]');
+                        results.push({
+                            label: lbl.innerText.trim().substring(0, 80),
+                            hasRemoveBtn: !!removeBtn,
+                        });
+                    }
+                }
+                return results;
+            }""")
+
+            for cl_info in cover_letter_uploads:
+                cl_label = cl_info.get("label", "")
+                add_event_func("CoverLetter", "info", f"Found file in non-resume field: '{cl_label[:50]}' — attempting removal")
+
+                # Try to click the remove button within that field
+                try:
+                    # Find the field container by label text
+                    field_loc = page.locator(f'.field:has(label:has-text("{cl_label[:30]}")), .application-field:has(label:has-text("{cl_label[:30]}")), li:has(label:has-text("{cl_label[:30]}"))').first
+                    # Look for remove/X button
+                    remove_selectors = [
+                        'button[aria-label*="Remove"]', 'button[aria-label*="remove"]',
+                        'button[aria-label*="Delete"]', 'button[aria-label*="delete"]',
+                        'a[aria-label*="Remove"]', '.remove-file', '[class*="remove"]',
+                        'button.close', '[data-automation-id*="delete"]',
+                    ]
+                    removed = False
+                    for sel in remove_selectors:
+                        try:
+                            btn = field_loc.locator(sel).first
+                            if await btn.is_visible(timeout=1000):
+                                await btn.click(timeout=2000)
+                                await asyncio.sleep(0.5)
+                                add_event_func("CoverLetter", "success", f"Removed file from '{cl_label[:50]}'")
+                                removed = True
+                                break
+                        except Exception:
+                            continue
+
+                    if not removed:
+                        # Try clearing the file input directly
+                        try:
+                            file_input = field_loc.locator('input[type="file"]').first
+                            if await file_input.count() > 0:
+                                await file_input.evaluate("el => { el.value = ''; el.dispatchEvent(new Event('change', {bubbles: true})); }")
+                                add_event_func("CoverLetter", "success", f"Cleared file input in '{cl_label[:50]}'")
+                                removed = True
+                        except Exception:
+                            pass
+
+                    if not removed:
+                        add_event_func("CoverLetter", "warning", f"Could not remove file from '{cl_label[:50]}' — may need manual removal")
+
+                except Exception as e_cl:
+                    add_event_func("CoverLetter", "warning", f"Error cleaning '{cl_label[:40]}': {str(e_cl)[:60]}")
+
+            if not cover_letter_uploads:
+                add_event_func("CoverLetter", "info", "No wrongly-uploaded files found in non-resume fields")
+        except Exception as e_clf:
+            add_event_func("CoverLetter", "info", f"Cover letter cleanup check skipped: {str(e_clf)[:60]}")
+
+        # --- PHASE E: Log all remaining unfilled REQUIRED fields ---
+        unfilled_required = await page.evaluate("""() => {
+            const results = [];
+            const inputs = document.querySelectorAll('input:not([type="hidden"]):not([type="submit"]):not([type="button"]), textarea, select');
+            for (const el of inputs) {
+                if (el.offsetParent === null) continue;
+                const isRequired = el.required || el.getAttribute('aria-required') === 'true';
+                if (!isRequired) continue;
+                if (el.closest('[class*="select__container"]')) continue;
+                if ((el.id || '').includes('security') || (el.name || '').includes('security')) continue;
+
+                let isEmpty = false;
+                if (el.tagName === 'SELECT') {
+                    const currentText = el.options[el.selectedIndex]?.text?.trim()?.toLowerCase() || '';
+                    isEmpty = ['select...', 'select', '', '--'].includes(currentText);
+                } else if (el.type === 'radio') {
+                    const name = el.name;
+                    if (name) {
+                        const group = document.querySelectorAll('input[name="' + name + '"]');
+                        isEmpty = !Array.from(group).some(r => r.checked);
+                    }
+                } else if (el.type === 'checkbox') {
+                    isEmpty = !el.checked;
+                } else {
+                    isEmpty = !el.value.trim();
+                }
+
+                if (!isEmpty) continue;
+
+                let label = '';
+                if (el.id) {
+                    const lbl = document.querySelector('label[for="' + el.id + '"]');
+                    if (lbl) label = lbl.innerText.trim();
+                }
+                if (!label) {
+                    const parent = el.closest('li, .field, .form-group');
+                    const lbl = parent?.querySelector('label');
+                    if (lbl) label = lbl.innerText.trim();
+                }
+
+                results.push({
+                    tag: el.tagName.toLowerCase(),
+                    type: el.type || '',
+                    name: el.name || el.id || '',
+                    label: label.substring(0, 100),
+                });
+            }
+
+            // Also check custom dropdowns still showing Select...
+            const customDDs = document.querySelectorAll('[class*="select__container"]');
+            for (const dd of customDDs) {
+                if (dd.offsetParent === null) continue;
+                const singleVal = dd.querySelector('[class*="single-value"], [class*="singleValue"]');
+                if (singleVal) continue;
+                const fieldContainer = dd.closest('li, .field, .form-group') || dd.parentElement;
+                const lbl = fieldContainer?.querySelector('label');
+                const lblText = lbl ? lbl.innerText.trim() : '';
+                if (lblText.includes('*')) {
+                    results.push({tag: 'div', type: 'custom-dropdown', name: '', label: lblText.substring(0, 100)});
+                }
+            }
+
+            return results;
+        }""")
+
+        if unfilled_required:
+            add_event_func("Unfilled", "warning", f"{len(unfilled_required)} required field(s) still empty:")
+            for uf in unfilled_required[:10]:
+                add_event_func("Unfilled", "warning", f"  - [{uf.get('type','')}] {uf.get('label','') or uf.get('name','unknown')}")
+        else:
+            add_event_func("Verify", "success", "All required fields appear to be filled!")
+
+        # Final screenshot
+        try:
+            ss = await page.screenshot(type="png")
+            latest_screenshot_b64 = base64.b64encode(ss).decode("utf-8")
+            screenshot_version += 1
+        except Exception:
+            pass
+
+    except Exception as e:
+        import traceback as _tb
+        add_event_func("Post-Fill", "warning", f"Post-fill handler error: {str(e)[:100]}\n{_tb.format_exc()[:300]}")
+
+
 async def _run_application(url: str, company: str, role: str):
     global pipeline_running, latest_screenshot_b64, browser_instance, active_page, active_context
     active_page = None
@@ -1558,6 +2430,57 @@ async def _run_application(url: str, company: str, role: str):
                 active_context = None
         print(f">>> _run_application: active_page set to {active_page}")
 
+        # --- Auto Security Code: if agent landed on a verification page ---
+        if page and not pipeline_stop_requested:
+            try:
+                is_verify_page = await page.evaluate("""() => {
+                    const t = document.body.innerText.toLowerCase();
+                    return ['verify your email','verification code','security code',
+                        'check your email','check your inbox','enter the code','enter code',
+                        'we sent','sent a code'].some(k => t.includes(k));
+                }""")
+                if is_verify_page:
+                    add_event("Auto Email", "info", "Agent landed on verification page. Auto-fetching code from Gmail...")
+                    from applicator.email_handler import auto_handle_security_code
+                    code_ok = await auto_handle_security_code(page, company_name=company, event_callback=on_event)
+                    if code_ok:
+                        add_event("Auto Email", "success", "Security code entered! Waiting for form to load...")
+                        await asyncio.sleep(5)
+                        # Take screenshot of post-verification page
+                        try:
+                            ss = await page.screenshot(type="png")
+                            latest_screenshot_b64 = base64.b64encode(ss).decode("utf-8")
+                            screenshot_version += 1
+                        except Exception:
+                            pass
+                        # Now re-run the form filler on the actual application form
+                        add_event("Auto Email", "info", "Re-running form filler on application form...")
+                        result2 = await fill_with_browser_agent(
+                            url=page.url,
+                            company=company,
+                            role=role,
+                            resume_path=resume_path,
+                            job_description=jd,
+                            event_callback=on_event,
+                            screenshot_callback=on_screenshot,
+                            transcript_path=uploaded_transcript,
+                        )
+                        completed = result2.get("completed", False)
+                        # Update page ref
+                        page2 = result2.get("page")
+                        if page2:
+                            page = page2
+                            active_page = page
+                            try:
+                                active_context = page.context
+                            except Exception:
+                                pass
+                    else:
+                        add_event("Auto Email", "warning",
+                            "Could not auto-enter code. Click 'Get Email Code' or enter manually, then click Continue.")
+            except Exception as e:
+                add_event("Auto Email", "warning", f"Auto security code check error: {str(e)[:100]}")
+
         # --- Recovery: if agent returned incomplete on a Workday auth page ---
         is_workday = "workday" in url.lower() or "myworkdayjobs" in url.lower()
         if not completed and page and is_workday:
@@ -1619,27 +2542,26 @@ async def _run_application(url: str, company: str, role: str):
 
         # Verify completion: check if the page still has empty required fields
         has_empty_fields = False
-        if page and completed:
+        if page:
             try:
                 empty_count = await page.evaluate("""() => {
                     const inputs = Array.from(document.querySelectorAll('input:not([type="hidden"]):not([type="submit"]):not([type="button"]),textarea,select'));
                     return inputs.filter(el => el.offsetParent !== null && !el.value && !el.disabled).length;
                 }""")
                 has_empty_fields = empty_count > 2
-                if has_empty_fields:
-                    add_event("Verify", "warning", f"Agent said done but {empty_count} empty fields remain (after {agent_steps} steps)")
+                if has_empty_fields and completed:
+                    add_event("Verify", "info", f"{empty_count} empty fields remain — click Continue to fill more")
             except Exception:
                 pass
 
-        # If agent "completed" too fast or left empty fields, don't trust it — run deterministic filler
-        if page and (has_empty_fields or (completed and agent_steps < 5)):
-            add_event("Fallback Filler", "info", "Agent finished too quickly or left empty fields. Running deterministic form filler...")
+        # If fields were filled but some remain, run one more fallback pass
+        if page and completed and has_empty_fields:
+            add_event("Fallback Filler", "info", "Running extra fill pass for remaining empty fields...")
             try:
                 from applicator.form_filler import JS_EXTRACT_FIELDS, map_fields_to_profile, fill_form
                 fields = await page.evaluate(JS_EXTRACT_FIELDS)
                 if fields:
                     mappings = map_fields_to_profile(fields, jd, company, role)
-                    # Filter out non-dict elements (LLM may return malformed JSON with strings)
                     mappings = [m for m in mappings if isinstance(m, dict)]
                     async def fallback_evt(s, st, d=""):
                         add_event(s, st, d)
@@ -1648,38 +2570,197 @@ async def _run_application(url: str, company: str, role: str):
                     fb_failed = fb_result.get("failed", 0)
                     add_event("Fallback Filler", "success" if fb_filled > 0 else "warning",
                         f"Deterministic filler: {fb_filled} filled, {fb_failed} failed")
-                    if fb_filled > 0:
-                        completed = True
-                    # Take post-fill screenshot
                     try:
                         ss = await page.screenshot(type="png")
                         latest_screenshot_b64 = base64.b64encode(ss).decode("utf-8")
                         screenshot_version += 1
                     except Exception:
                         pass
-                else:
-                    add_event("Fallback Filler", "info", "No extractable fields found for fallback filler.")
             except Exception as e:
                 import traceback as _tb
                 tb_str = _tb.format_exc()
                 add_event("Fallback Filler", "error", f"Fallback filler failed: {e}\n{tb_str[:500]}")
-            # Don't auto-mark as applied after fallback — let user review
-            completed = False
 
-        if completed and not has_empty_fields and agent_steps >= 5:
-            add_event("Screenshot & Review", "success", "Ready for review.")
-            add_event("Pipeline Complete", "success",
-                      f"Agent completed in {agent_steps} steps. "
-                      f"Auto-marked as applied.")
-            from database.tracker import mark_applied
-            mark_applied(url, company, role)
+        # Fix native <select> dropdowns that select_option can't change (React-controlled)
+        add_event("Fill Form", "info", f"Select fixer: page={page is not None}, completed={completed}")
+        if page and completed:
+            try:
+                # First check how many selects exist on the page
+                select_count = await page.evaluate("document.querySelectorAll('select').length")
+                add_event("Fill Form", "info", f"Select fixer: found {select_count} native select elements")
+
+                # Look for the state dropdown by finding label containing "state" or "resident"
+                state_dropdown_info = await page.evaluate("""() => {
+                    const labels = document.querySelectorAll('label');
+                    for (const lbl of labels) {
+                        const text = (lbl.innerText || '').toLowerCase();
+                        if (text.includes('state') && (text.includes('resident') || text.includes('currently'))) {
+                            const container = lbl.closest('.field, .form-group, .question, li, .select-field')
+                                || lbl.parentElement;
+                            if (!container) continue;
+                            // Find the interactive dropdown element
+                            const selectEl = container.querySelector('select');
+                            const reactSelect = container.querySelector('[class*="react-select"], [class*="indicatorContainer"]');
+                            const customDD = container.querySelector('[role="combobox"], [role="listbox"], [class*="dropdown"]');
+                            const allChildren = container.innerHTML.substring(0, 500);
+                            return {
+                                labelText: lbl.innerText.trim(),
+                                hasNativeSelect: !!selectEl,
+                                hasReactSelect: !!reactSelect,
+                                hasCustomDD: !!customDD,
+                                containerTag: container.tagName,
+                                containerClasses: container.className?.substring(0, 200) || '',
+                                htmlSnippet: allChildren
+                            };
+                        }
+                    }
+                    return null;
+                }""")
+                if state_dropdown_info:
+                    add_event("Fill Form", "info",
+                        f"State dropdown: native={state_dropdown_info.get('hasNativeSelect')}, "
+                        f"react={state_dropdown_info.get('hasReactSelect')}, "
+                        f"custom={state_dropdown_info.get('hasCustomDD')}, "
+                        f"classes={state_dropdown_info.get('containerClasses','')[:80]}")
+                    add_event("Fill Form", "info", f"State HTML: {state_dropdown_info.get('htmlSnippet','')[:200]}")
+                else:
+                    add_event("Fill Form", "warning", "Could not find state/resident dropdown label")
+
+                unfilled_selects = await page.evaluate("""() => {
+                    const selects = document.querySelectorAll('select');
+                    const result = [];
+                    for (const s of selects) {
+                        // Check ALL selects — even if select_option set the DOM value,
+                        // the visual rendering may not match (React doesn't re-render).
+                        // We identify selects that SHOULD have a value (more than just placeholder options).
+                        const nonPlaceholderOpts = Array.from(s.options).filter(o =>
+                            o.value && o.text.trim() && !['select...','select','choose','--',''].includes(o.text.trim().toLowerCase())
+                        );
+                        if (nonPlaceholderOpts.length > 0) {
+                            const label = s.closest('.field, .form-group, .question')
+                                ?.querySelector('label, .field-label')?.textContent?.trim() || '';
+                            const opts = Array.from(s.options).map(o => ({v: o.value, t: o.text.trim(), i: o.index}));
+                            const id = s.id || '';
+                            const name = s.name || '';
+                            const currentVal = s.value;
+                            const currentText = s.options[s.selectedIndex]?.text?.trim() || '';
+                            result.push({id, name, label, options: opts,
+                                selector: s.id ? '#'+CSS.escape(s.id) : 'select[name=\"'+s.name+'\"]',
+                                currentVal, currentText});
+                        }
+                    }
+                    return result;
+                }""")
+                if unfilled_selects:
+                    add_event("Fill Form", "info", f"Found {len(unfilled_selects)} select(s) to verify/fix with keyboard...")
+                    from applicator.form_filler import _load_personal_info
+                    info = _load_personal_info()
+                    # Map field labels to known values
+                    select_value_map = {
+                        "state": info.get("state", "California"),
+                        "resident": info.get("state", "California"),
+                        "country": info.get("country", "United States"),
+                        "gender": info.get("gender", "Male"),
+                        "race": info.get("race_ethnicity", "Asian"),
+                        "ethnicity": info.get("race_ethnicity", "Asian"),
+                        "veteran": info.get("veteran_status", "I am not a protected veteran"),
+                        "disability": info.get("disability_status", "I do not wish to answer"),
+                        "hear": info.get("how_did_you_hear", "LinkedIn"),
+                        "education": info.get("degree", "Bachelor's"),
+                    }
+                    for sel_info in unfilled_selects:
+                        label_lower = (sel_info.get("label", "") + " " + sel_info.get("name", "") + " " + sel_info.get("id", "")).lower()
+                        target_value = None
+                        for keyword, val in select_value_map.items():
+                            if keyword in label_lower:
+                                target_value = val
+                                break
+
+                        if not target_value:
+                            continue
+
+                        # Skip if the visible selected option text already matches target
+                        current_text = sel_info.get("currentText", "").lower().strip()
+                        placeholder_texts = ["select...", "select", "choose", "--", "", "choose..."]
+                        if current_text and current_text not in placeholder_texts and current_text == target_value.lower().strip():
+                            add_event("Fill Form", "info", f"Select already showing '{current_text[:30]}', skipping")
+                            continue
+                        # Only fix selects that are stuck on placeholder
+                        if current_text not in placeholder_texts:
+                            add_event("Fill Form", "info", f"Select shows '{current_text[:30]}' (not placeholder), skipping")
+                            continue
+
+                        add_event("Fill Form", "info", f"Fixing select: label='{sel_info.get('label','')[:30]}' current='{current_text[:20]}' target='{target_value[:20]}'")
+
+                        # Find the option index for the target value
+                        target_idx = None
+                        for opt in sel_info.get("options", []):
+                            if opt["t"].lower().strip() == target_value.lower().strip():
+                                target_idx = opt["i"]
+                                break
+                            if target_value.lower() in opt["t"].lower():
+                                target_idx = opt["i"]
+                                # Don't break — keep looking for exact match
+
+                        if target_idx is None:
+                            add_event("Fill Form", "info", f"No option matching '{target_value}' for {sel_info.get('label','')[:30]}")
+                            continue
+
+                        # Use keyboard navigation: focus select, ArrowDown to target, Tab to confirm
+                        # IMPORTANT: Do NOT press Enter — it submits the form!
+                        try:
+                            css_sel = sel_info["selector"]
+                            loc = page.locator(css_sel).first
+                            await loc.scroll_into_view_if_needed(timeout=3000)
+                            await loc.focus(timeout=3000)
+                            await asyncio.sleep(0.2)
+                            # First reset to the beginning by pressing Home
+                            await page.keyboard.press("Home")
+                            await asyncio.sleep(0.1)
+                            # ArrowDown directly changes the selected option without opening dropdown
+                            for _ in range(target_idx):
+                                await page.keyboard.press("ArrowDown")
+                                await asyncio.sleep(0.05)
+                            await asyncio.sleep(0.3)
+                            # Tab away to trigger change event (NOT Enter which submits form!)
+                            await page.keyboard.press("Tab")
+                            await asyncio.sleep(0.5)
+
+                            # Verify
+                            new_val = await page.evaluate(f"document.querySelector('{css_sel}')?.options[document.querySelector('{css_sel}')?.selectedIndex]?.text || ''")
+                            if new_val.strip():
+                                add_event("Fill Form", "success", f"Fixed select (keyboard): {new_val[:50]}")
+                            else:
+                                add_event("Fill Form", "warning", f"Keyboard select may not have worked for {sel_info.get('label','')[:30]}")
+                        except Exception as e:
+                            add_event("Fill Form", "warning", f"Keyboard select error: {str(e)[:80]}")
+
+                    # Take updated screenshot
+                    try:
+                        ss = await page.screenshot(type="png")
+                        latest_screenshot_b64 = base64.b64encode(ss).decode("utf-8")
+                        screenshot_version += 1
+                    except Exception:
+                        pass
+            except Exception as e:
+                add_event("Fill Form", "warning", f"Select fixer error: {str(e)[:100]}")
+
+        # === GENERALIZED CUSTOM DROPDOWN, RADIO, CHECKBOX HANDLER ===
+        if page and completed:
+            await _handle_custom_fields(page, add_event)
+
+        # Report status — completed means fields were filled, user reviews before submit
+        if completed:
+            add_event("Screenshot & Review", "success",
+                f"Form filling done ({agent_steps} agent steps). Review in browser, then submit or click Continue for more.")
         else:
-            add_event("Screenshot & Review", "warning", "Agent did NOT fully complete the application.")
+            add_event("Screenshot & Review", "warning",
+                "No fields were filled automatically. Click Continue to try again or fill manually.")
             final_result = summary.get("final_result", "")
             error = summary.get("error", "")
-            detail = final_result or error or "Form may need manual review"
+            detail = final_result or error or "Form may need manual navigation"
             add_event("Pipeline Incomplete", "info",
-                      f"NOT auto-marked as applied. {detail[:200]}. Click Continue to fill remaining fields.")
+                      f"{detail[:200]}. Click Continue to fill remaining fields.")
 
         # Keep browser open so user can review and manually submit/retry
         add_event("Pipeline Complete", "info", "Browser stays open. Use Continue to analyze page, or Get Email Code for verification.")
