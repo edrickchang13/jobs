@@ -220,7 +220,7 @@ YOUR TASK IS LIMITED — do ONLY these steps, then STOP:
 
 1. Navigate to the URL above
 2. Click "Apply" or "Apply Now" button. On Workday sites the button may be a link with text "Apply" inside an element with data-uxi-element-id="Apply_adventureButton".
-3. If you see options like "Apply Manually" / "Autofill with Resume", ALWAYS click "Apply Manually". Do NOT click "Autofill with Resume" — it opens a file upload that breaks the flow. The deterministic code will handle resume upload later.
+3. If you see a "Start Your Application" dialog with options like "Apply Manually", "Autofill with Resume", or "Use My Last Application": click "Use My Last Application" if available, otherwise click "Apply Manually". Do NOT click "Autofill with Resume".
 4. If you see a cookie consent banner, click "Accept" or "Accept All"
 
 STOP CONDITIONS — stop immediately when you see ANY of these:
@@ -271,7 +271,34 @@ Report what page you're on when you stop."""
                 pass
         if event_callback:
             await event_callback("Agent", "info", f"Navigation step {steps}")
-        # CAPTCHA detection removed — was producing false positives and blocking the pipeline
+
+        # Handle "Start Your Application" modal if it appears during agent navigation
+        try:
+            bu_page = await agent_instance.browser_session.get_current_page()
+            if bu_page:
+                modal_btn = await bu_page.evaluate("""() => {
+                    const btns = document.querySelectorAll('button, a[role="button"], div[role="button"]');
+                    const preferred = ['use my last application', 'apply manually'];
+                    for (const pref of preferred) {
+                        for (const btn of btns) {
+                            const text = (btn.innerText || btn.textContent || '').trim().toLowerCase();
+                            if (text === pref || text.includes(pref)) {
+                                const r = btn.getBoundingClientRect();
+                                if (r.width > 0 && r.height > 0) {
+                                    return {text: text, x: r.x + r.width / 2, y: r.y + r.height / 2, found: true};
+                                }
+                            }
+                        }
+                    }
+                    return {found: false};
+                }""")
+                if modal_btn and modal_btn.get("found"):
+                    await bu_page.mouse.click(modal_btn["x"], modal_btn["y"])
+                    if event_callback:
+                        await event_callback("Navigate", "success", f"Clicked modal: '{modal_btn['text']}'")
+                    await asyncio.sleep(3.0)
+        except Exception:
+            pass
 
     history = None
     try:
@@ -366,6 +393,129 @@ Report what page you're on when you stop."""
         state = await _detect_workday_page_state(page)
         if event_callback:
             await event_callback("Pipeline", "info", f"Page state after agent: {state}")
+
+        # Handle "Start Your Application" modal (appears when user already has account)
+        # Options: "Autofill with Resume", "Apply Manually", "Use My Last Application"
+        try:
+            modal_handled = await page.evaluate("""() => {
+                // Look for the modal buttons
+                const btns = document.querySelectorAll('button, a[role="button"], div[role="button"]');
+                for (const btn of btns) {
+                    const text = (btn.innerText || btn.textContent || '').trim().toLowerCase();
+                    if (text === 'use my last application' || text === 'apply manually') {
+                        const r = btn.getBoundingClientRect();
+                        return {text: text, x: r.x + r.width / 2, y: r.y + r.height / 2, found: true};
+                    }
+                }
+                return {found: false};
+            }""")
+            if modal_handled and modal_handled.get("found"):
+                btn_text = modal_handled.get("text", "")
+                if event_callback:
+                    await event_callback("Navigate", "info", f"Found '{btn_text}' modal button, clicking...")
+                # Prefer "Use My Last Application" to re-use previous data
+                await page.mouse.click(modal_handled["x"], modal_handled["y"])
+                await asyncio.sleep(5.0)
+                state = await _detect_workday_page_state(page)
+                if event_callback:
+                    await event_callback("Navigate", "success", f"After modal click: state={state}")
+        except Exception:
+            pass
+
+        # If still on job listing page (agent couldn't click Apply), use trusted Playwright clicks
+        if state == "unknown":
+            if event_callback:
+                await event_callback("Navigate", "info", "Still on job page — clicking Apply with trusted Playwright click...")
+            try:
+                # Strategy 1: Workday adventure button (data-uxi-element-id)
+                apply_selectors = [
+                    'a[data-uxi-element-id="Apply_adventureButton"]',
+                    '[data-automation-id="adventureButton"]',
+                    '[data-automation-id="jobPostingApplyButton"]',
+                    'a[role="button"]:has-text("Apply")',
+                    'button:has-text("Apply")',
+                    'a:has-text("Apply")',
+                ]
+                apply_clicked = False
+                for sel in apply_selectors:
+                    try:
+                        btn = page.locator(sel).first
+                        if await btn.is_visible(timeout=2000):
+                            # Use bounding box + mouse.click for trusted events (bypasses click_filter)
+                            box = await btn.bounding_box()
+                            if box:
+                                cx = box['x'] + box['width'] / 2
+                                cy = box['y'] + box['height'] / 2
+                                await page.mouse.click(cx, cy)
+                                apply_clicked = True
+                                if event_callback:
+                                    await event_callback("Navigate", "success", f"Clicked Apply via mouse.click ({sel})")
+                                await asyncio.sleep(5.0)
+                                break
+                    except Exception:
+                        continue
+
+                if not apply_clicked:
+                    # JS fallback: find and click Apply link/button
+                    apply_clicked = await page.evaluate("""() => {
+                        const els = document.querySelectorAll('a, button, div[role="button"]');
+                        for (const el of els) {
+                            const text = (el.innerText || el.textContent || '').trim();
+                            if (/^Apply$/i.test(text) && el.offsetParent !== null) {
+                                el.click();
+                                return true;
+                            }
+                        }
+                        return false;
+                    }""")
+                    if apply_clicked:
+                        if event_callback:
+                            await event_callback("Navigate", "info", "Clicked Apply via JS fallback")
+                        await asyncio.sleep(5.0)
+
+                if apply_clicked:
+                    # Check for "Start Your Application" modal with options
+                    try:
+                        modal_btn = await page.evaluate("""() => {
+                            const btns = document.querySelectorAll('button, a[role="button"], div[role="button"], [data-automation-id="applyManually"]');
+                            // Prefer "Use My Last Application" > "Apply Manually"
+                            const preferred = ['use my last application', 'apply manually'];
+                            for (const pref of preferred) {
+                                for (const btn of btns) {
+                                    const text = (btn.innerText || btn.textContent || '').trim().toLowerCase();
+                                    if (text === pref || text.includes(pref)) {
+                                        const r = btn.getBoundingClientRect();
+                                        return {text: text, x: r.x + r.width / 2, y: r.y + r.height / 2, found: true};
+                                    }
+                                }
+                            }
+                            return {found: false};
+                        }""")
+                        if modal_btn and modal_btn.get("found"):
+                            await page.mouse.click(modal_btn["x"], modal_btn["y"])
+                            if event_callback:
+                                await event_callback("Navigate", "success", f"Clicked '{modal_btn['text']}'")
+                            await asyncio.sleep(5.0)
+                    except Exception:
+                        pass
+
+                    if screenshot_callback:
+                        try:
+                            ss = await page.screenshot(type="png")
+                            await screenshot_callback(ss)
+                        except Exception:
+                            pass
+
+                    # Re-detect state
+                    state = await _detect_workday_page_state(page)
+                    if event_callback:
+                        await event_callback("Pipeline", "info", f"After Apply click: state={state}")
+                else:
+                    if event_callback:
+                        await event_callback("Navigate", "warning", "Could not find Apply button on Workday page")
+            except Exception as e:
+                if event_callback:
+                    await event_callback("Navigate", "error", f"Apply click error: {e}")
 
         # Handle resume upload if we landed on upload page
         if state == "upload":
@@ -614,7 +764,7 @@ Report what page you're on when you stop."""
                             if len(fields) == 0:
                                 break
 
-                        mappings = map_fields_to_profile(fields, job_description, company, role)
+                        mappings = await asyncio.to_thread(map_fields_to_profile, fields, job_description, company, role)
                         # Ensure all mappings are dicts (LLM may return strings)
                         mappings = [m for m in mappings if isinstance(m, dict)]
                         if pass_num > 0:
@@ -1148,8 +1298,16 @@ JS_EXTRACT_FIELDS = """
     for (const el of wdInteractive) {
         if (el.offsetParent === null) continue;
         const dataid = el.getAttribute('data-automation-id') || '';
-        // Skip non-form elements
-        if (['click_filter', 'uiAction', 'Apply'].some(s => dataid.includes(s))) continue;
+        // Skip non-form elements (navigation, utility, chrome)
+        if (['click_filter', 'uiAction', 'Apply',
+             'navigationItem', 'utilityMenuButton', 'settingsButton',
+             'headerTitle', 'signOut', 'signIn', 'searchButton',
+             'globalSearchButton', 'notificationButton', 'profileImage',
+             'candidate-home', 'Candidate Home', 'Search for Job',
+             'inboxButton', 'tasksButton', 'helpButton',
+        ].some(s => dataid.includes(s))) continue;
+        // Skip elements in the header/nav bar area
+        if (el.closest('header, nav, [role="banner"], [role="navigation"], [data-automation-id="headerWrapper"]')) continue;
         // Skip if already captured
         if (fields.some(f => f.selector.includes(dataid))) continue;
         const container = el.closest('[data-automation-id^="formField-"]') || el.parentElement;
@@ -1172,15 +1330,24 @@ JS_EXTRACT_FIELDS = """
 """
 
 
-def _get_llm_client():
-    # Cerebras API (free tier, 1M tokens/day) - Gemini key expired
+def _get_llm_client(provider="cerebras"):
+    """Get LLM client. Supports 'cerebras' (primary) and 'groq' (fallback)."""
+    if provider == "groq":
+        return OpenAI(
+            base_url="https://api.groq.com/openai/v1",
+            api_key=os.getenv("GROQ_API_KEY"),
+            timeout=30.0,  # 30 second timeout to prevent server hangs
+        )
+    # Default: Cerebras API (free tier, 1M tokens/day)
     return OpenAI(
         base_url="https://api.cerebras.ai/v1",
         api_key=os.getenv("CEREBRAS_API_KEY"),
+        timeout=30.0,  # 30 second timeout to prevent server hangs
     )
 
 # Model to use for field mapping LLM calls
 _LLM_MODEL = "qwen-3-235b-a22b-instruct-2507"
+_GROQ_MODEL = "llama-3.3-70b-versatile"
 
 
 def _parse_json_response(text: str) -> list:
@@ -1314,19 +1481,52 @@ Return ONLY a JSON array. Each element must have exactly these keys:
 - "action": one of "fill", "select", "click", "upload_file", "skip"
 - "value": the value to fill/select, or file path for upload_file, or empty string for skip
 
-REMEMBER: Fill EVERY field. Only use "skip" for optional cover letter / additional info fields. Do NOT include any explanation, only the JSON array."""
+CRITICAL: NEVER interact with navigation elements, menus, or settings buttons. Skip ANY field with a selector containing "navigationItem", "utilityMenu", "settingsButton", "searchButton", "signOut", "headerWrapper", "Candidate Home", "Search for Job". These are page chrome, not form fields.
 
-    response = client.chat.completions.create(
-        model=_LLM_MODEL,
-        max_tokens=8000,
-        messages=[
-            {"role": "system", "content": "You return only valid JSON arrays. No markdown, no explanation. /no_think"},
-            {"role": "user", "content": prompt},
-        ],
-    )
+REMEMBER: Fill EVERY actual form field. Only use "skip" for optional cover letter / additional info fields and navigation elements. Do NOT include any explanation, only the JSON array."""
 
-    raw = response.choices[0].message.content
-    return _parse_json_response(raw)
+    # Retry with exponential backoff for 429 rate limit errors
+    # NOTE: This is a sync function, so uses time.sleep(). Callers should run
+    # this in a thread pool (asyncio.to_thread) to avoid blocking the event loop.
+    import time as _time
+
+    # Try providers in order: Cerebras (primary), then Groq (fallback)
+    providers = [
+        ("cerebras", _LLM_MODEL, client),
+        ("groq", _GROQ_MODEL, _get_llm_client("groq")),
+    ]
+    last_error = None
+    for provider_name, model, llm_client in providers:
+        max_retries = 3 if provider_name == "cerebras" else 2
+        for attempt in range(max_retries):
+            try:
+                msgs = [
+                    {"role": "system", "content": "You return only valid JSON arrays. No markdown, no explanation. /no_think"},
+                    {"role": "user", "content": prompt},
+                ]
+                response = llm_client.chat.completions.create(
+                    model=model,
+                    max_tokens=8000,
+                    messages=msgs,
+                )
+                raw = response.choices[0].message.content
+                result = _parse_json_response(raw)
+                if result:
+                    print(f"[LLM] Success with {provider_name} ({model}) on attempt {attempt+1}")
+                    return result
+            except Exception as e:
+                last_error = e
+                err_str = str(e).lower()
+                if "429" in err_str or "rate" in err_str or "too_many" in err_str or "queue" in err_str:
+                    wait_time = min(2 ** attempt * 5, 30)  # 5, 10, 20 seconds
+                    print(f"[LLM] {provider_name} 429 rate limit, attempt {attempt+1}/{max_retries}, waiting {wait_time}s...")
+                    _time.sleep(wait_time)
+                    continue
+                print(f"[LLM] {provider_name} error: {e}")
+                break  # Non-rate-limit error, try next provider
+        print(f"[LLM] {provider_name} exhausted, trying next provider...")
+
+    raise RuntimeError(f"All LLM providers rate limited/failed: {last_error}")
 
 
 async def _dismiss_cookie_banners(page: Page):
@@ -1436,22 +1636,34 @@ Job Description: {job_description[:1500]}
 
 Write the cover letter. Do NOT use "Dear Hiring Manager" or other generic openers. Start with something specific about the company. Output ONLY the letter text."""
 
-    response = client.chat.completions.create(
-        model=_LLM_MODEL,
-        max_tokens=1000,
-        messages=[
-            {"role": "system", "content": "You write concise, authentic cover letters. No markdown, no explanation."},
-            {"role": "user", "content": prompt},
-        ],
-    )
-    raw = response.choices[0].message.content
-    # Strip think tags aggressively
-    while '<think>' in raw and '</think>' in raw:
-        raw = re.sub(r'<think>[\s\S]*?</think>', '', raw, flags=re.DOTALL)
-    raw = re.sub(r'<think>[\s\S]*$', '', raw, flags=re.DOTALL)
-    raw = re.sub(r'^[\s\S]*?</think>', '', raw, flags=re.DOTALL)
-    raw = re.sub(r'</?think>', '', raw)
-    return raw.strip()
+    # Retry with exponential backoff for 429 rate limit errors
+    import time as _time
+    for attempt in range(5):
+        try:
+            response = client.chat.completions.create(
+                model=_LLM_MODEL,
+                max_tokens=1000,
+                messages=[
+                    {"role": "system", "content": "You write concise, authentic cover letters. No markdown, no explanation."},
+                    {"role": "user", "content": prompt},
+                ],
+            )
+            raw = response.choices[0].message.content
+            # Strip think tags aggressively
+            while '<think>' in raw and '</think>' in raw:
+                raw = re.sub(r'<think>[\s\S]*?</think>', '', raw, flags=re.DOTALL)
+            raw = re.sub(r'<think>[\s\S]*$', '', raw, flags=re.DOTALL)
+            raw = re.sub(r'^[\s\S]*?</think>', '', raw, flags=re.DOTALL)
+            raw = re.sub(r'</?think>', '', raw)
+            return raw.strip()
+        except Exception as e:
+            err_str = str(e).lower()
+            if "429" in err_str or "rate" in err_str or "too_many" in err_str or "queue" in err_str:
+                wait_time = min(2 ** attempt * 5, 60)
+                _time.sleep(wait_time)
+                continue
+            raise
+    raise RuntimeError("LLM rate limited after 5 retries")
 
 
 async def _handle_ats_auth(page, ats_key: str, event_callback=None) -> bool:
@@ -2167,7 +2379,7 @@ async def _handle_workday_apply(page, resume_path, event_callback=None, screensh
 
             # Use LLM to map fields
             try:
-                mappings = map_fields_to_profile(fields_on_page, "", "", "")
+                mappings = await asyncio.to_thread(map_fields_to_profile, fields_on_page, "", "", "")
                 for m in mappings:
                     if m.get("action") == "skip":
                         continue
@@ -2313,14 +2525,22 @@ async def _handle_workday_auth(page, event_callback=None) -> bool:
         return True
 
     # --- Helper: try clicking with multiple methods ---
-    async def _multi_click(selectors, js_fallback=None, force=False, timeout=2000):
-        """Try Playwright selectors, then JS. Returns True if clicked."""
+    async def _multi_click(selectors, js_fallback=None, force=False, timeout=2000, use_mouse=False):
+        """Try Playwright selectors, then JS. Returns True if clicked.
+        If use_mouse=True, uses page.mouse.click() for isTrusted=true events (required for Workday click_filter).
+        """
         for sel in selectors:
             try:
                 loc = page.locator(sel).first
                 if await loc.is_visible(timeout=timeout):
-                    await loc.click(force=force, timeout=5000)
-                    return True
+                    if use_mouse:
+                        box = await loc.bounding_box()
+                        if box:
+                            await page.mouse.click(box['x'] + box['width'] / 2, box['y'] + box['height'] / 2)
+                            return True
+                    else:
+                        await loc.click(force=force, timeout=5000)
+                        return True
             except Exception:
                 continue
         if js_fallback:
@@ -2369,6 +2589,27 @@ async def _handle_workday_auth(page, event_callback=None) -> bool:
     except Exception:
         pass
 
+    # --- Check for "Sign in with email" / "Sign in with Google" pattern ---
+    # Some Workday sites (e.g. NVIDIA) show a choice page instead of direct email/password
+    has_sign_in_with_email = False
+    try:
+        has_sign_in_with_email = await page.evaluate("""() => {
+            const buttons = document.querySelectorAll('button, a, div[role="button"]');
+            for (const btn of buttons) {
+                const text = (btn.innerText || btn.textContent || '').trim().toLowerCase();
+                if (text.includes('sign in with email') && btn.offsetParent !== null) {
+                    return true;
+                }
+            }
+            return false;
+        }""")
+    except Exception:
+        pass
+
+    if has_sign_in_with_email:
+        needs_auth = True
+        await _log("Found 'Sign in with email' button pattern")
+
     if not needs_auth and not has_auth_popup:
         # Might already be on the form or no auth required
         if await _is_on_form():
@@ -2377,8 +2618,34 @@ async def _handle_workday_auth(page, event_callback=None) -> bool:
         await _log("No sign-in button found, proceeding anyway")
         return True
 
+    # --- Step 0.5: Handle "Sign in with email" button if present ---
+    if has_sign_in_with_email:
+        clicked_email_btn = await _multi_click(
+            [
+                'button:has-text("Sign in with email")',
+                'a:has-text("Sign in with email")',
+                'div[role="button"]:has-text("Sign in with email")',
+            ],
+            js_fallback="""() => {
+                const buttons = document.querySelectorAll('button, a, div[role="button"]');
+                for (const btn of buttons) {
+                    const text = (btn.innerText || btn.textContent || '').trim().toLowerCase();
+                    if (text.includes('sign in with email') && btn.offsetParent !== null) {
+                        btn.click();
+                        return true;
+                    }
+                }
+                return false;
+            }""",
+        )
+        if clicked_email_btn:
+            await _log("Clicked 'Sign in with email' button")
+            await asyncio.sleep(3.0)
+        else:
+            await _log("Could not click 'Sign in with email' button")
+
     # --- Step 1: Click Sign In nav button (header) if not already in auth popup ---
-    if needs_auth and not has_auth_popup:
+    elif needs_auth and not has_auth_popup:
         clicked = await _multi_click(
             ['button[data-automation-id="utilityButtonSignIn"]'],
             js_fallback="""() => {
@@ -2399,16 +2666,83 @@ async def _handle_workday_auth(page, event_callback=None) -> bool:
         await page.locator('input[data-automation-id="email"]').wait_for(state="visible", timeout=5000)
     except Exception:
         await _log("Email field not visible after clicking Sign In")
-        if await _is_on_form():
-            await _log_ok("On form already!")
+        # After clicking "Sign in with email", there might be a Create Account / Sign In choice
+        # Check for Create Account link which means we need to create an account first
+        try:
+            create_link = page.locator('[data-automation-id="createAccountLink"], button:has-text("Create Account"), a:has-text("Create Account")')
+            if await create_link.first.is_visible(timeout=2000):
+                await _log("Create Account page detected after Sign in with email")
+                # Fall through to the create account flow below
+                pass
+            else:
+                if await _is_on_form():
+                    await _log_ok("On form already!")
+                    return True
+                return True
+        except Exception:
+            if await _is_on_form():
+                await _log_ok("On form already!")
+                return True
             return True
-        return True
+
+    # --- Step 2a: Check if we landed on Create Account instead of Sign In ---
+    # Some Workday sites open Create Account modal when you click Sign In nav.
+    # Detect this by checking for "Verify New Password" field or "Create Account" heading.
+    on_create_account = False
+    try:
+        verify_pw_visible = await page.locator('input[data-automation-id="verifyPassword"]').is_visible(timeout=1000)
+        if verify_pw_visible:
+            on_create_account = True
+    except Exception:
+        pass
+    if not on_create_account:
+        try:
+            heading_text = await page.evaluate("""() => {
+                const headings = document.querySelectorAll('h2, h3, [role="heading"]');
+                for (const h of headings) {
+                    if ((h.innerText || '').trim() === 'Create Account' && h.offsetParent !== null) return true;
+                }
+                return false;
+            }""")
+            on_create_account = heading_text
+        except Exception:
+            pass
+
+    if on_create_account:
+        await _log("On Create Account modal, looking for 'Sign In' link to switch...")
+        sign_in_link_clicked = await _multi_click(
+            [
+                'a[data-automation-id="signInLink"]',
+                'button[data-automation-id="signInLink"]',
+            ],
+            js_fallback="""() => {
+                // Look for "Sign In" link near "Already have an account?"
+                for (const a of document.querySelectorAll('a, button')) {
+                    const parent = a.closest('.css-1fqoep4, .css-1q2dra3, [data-automation-id="signInLink"]') || a.parentElement;
+                    const parentText = (parent ? parent.innerText : '').toLowerCase();
+                    const t = (a.innerText || '').trim();
+                    if (t === 'Sign In' && a.offsetParent !== null && parentText.includes('already')) {
+                        a.click(); return true;
+                    }
+                }
+                // Fallback: any signInLink
+                let el = document.querySelector('[data-automation-id="signInLink"]');
+                if (el && el.offsetParent !== null) { el.click(); return true; }
+                return false;
+            }""",
+        )
+        if sign_in_link_clicked:
+            await _log("Clicked Sign In link from Create Account modal")
+            await asyncio.sleep(3.0)
+            # Now we should be on the real Sign In form
+        else:
+            await _log("Could not find Sign In link, proceeding with Create Account flow...")
 
     await _log("Sign-in form visible. Trying sign in...")
     await _fill_creds()
     await asyncio.sleep(0.5)
 
-    # Click Sign In submit - try all known patterns
+    # Click Sign In submit - use mouse.click for trusted events (Workday click_filter)
     sign_in_clicked = await _multi_click(
         [
             'div[data-automation-id="click_filter"][aria-label="Sign In"]',
@@ -2429,6 +2763,7 @@ async def _handle_workday_auth(page, event_callback=None) -> bool:
             return false;
         }""",
         force=True,
+        use_mouse=True,
     )
 
     if sign_in_clicked:
@@ -2501,7 +2836,7 @@ async def _handle_workday_auth(page, event_callback=None) -> bool:
 
     await asyncio.sleep(0.5)
 
-    # Submit create account — try BOTH button and click_filter
+    # Submit create account — use mouse.click for trusted events (Workday click_filter)
     submit_clicked = await _multi_click(
         [
             'button[data-automation-id="createAccountSubmitButton"]',
@@ -2530,6 +2865,7 @@ async def _handle_workday_auth(page, event_callback=None) -> bool:
             return false;
         }""",
         force=True,
+        use_mouse=True,
     )
 
     if submit_clicked:
@@ -2551,15 +2887,70 @@ async def _handle_workday_auth(page, event_callback=None) -> bool:
         await _log("Account already exists, switching to sign in...")
         account_just_created = True  # Still prevent going back to Create Account
 
-    # --- Step 5: Email verification (only if page shows verification prompt) ---
+        # Click "Sign In" link at the bottom of Create Account dialog
+        # ("Already have an account? Sign In")
+        sign_in_link_clicked = await _multi_click(
+            [
+                'button[data-automation-id="signInLink"]',
+                'a[data-automation-id="signInLink"]',
+                'a:has-text("Sign In")',
+            ],
+            js_fallback="""() => {
+                // Look for signInLink
+                let el = document.querySelector('[data-automation-id="signInLink"]');
+                if (el && el.offsetParent !== null) { el.click(); return true; }
+                // Find "Sign In" link near "Already have an account?"
+                for (const a of document.querySelectorAll('a, button')) {
+                    const t = (a.innerText || '').trim();
+                    if (t === 'Sign In' && a.offsetParent !== null) {
+                        a.click(); return true;
+                    }
+                }
+                return false;
+            }""",
+        )
+        if sign_in_link_clicked:
+            await _log("Clicked 'Sign In' link from Create Account dialog")
+            await asyncio.sleep(3.0)
+        else:
+            await _log("Could not find Sign In link in Create Account dialog")
+
+    # --- Step 5: Email verification (only if page shows actual verification prompt) ---
     try:
-        page_text = await page.evaluate("document.body.innerText")
-        if "verify" in page_text.lower() and "email" in page_text.lower():
+        needs_verification = await page.evaluate("""() => {
+            const bodyText = (document.body.innerText || '').toLowerCase();
+            // Must be a REAL verification prompt, not just "sign in with email"
+            const verifyPhrases = [
+                'verify your email', 'verification email', 'check your email',
+                'sent a verification', 'confirm your email', 'verify your account',
+                'enter the code', 'enter verification', 'verification code',
+            ];
+            return verifyPhrases.some(p => bodyText.includes(p));
+        }""")
+        if needs_verification:
             await _log("Email verification required...")
-            verified = await complete_email_verification(
-                page, sender_filter="workday", event_callback=event_callback
+            # Use IMAP-based verification first (faster, more reliable)
+            from applicator.email_handler import handle_email_verification, enter_verification_code
+            result = await handle_email_verification(
+                context=page.context,
+                original_page=page,
+                company_name="workday",
+                event_callback=event_callback,
             )
-            if verified:
+            if result.get("success"):
+                code = result.get("code")
+                link = result.get("link")
+                if code:
+                    await _log(f"Got verification code: {code}")
+                    await enter_verification_code(page, code, event_callback)
+                elif link:
+                    await _log("Got verification link, navigating...")
+                    verify_page = await page.context.new_page()
+                    try:
+                        await verify_page.goto(link, wait_until="domcontentloaded", timeout=30000)
+                        await verify_page.wait_for_timeout(5000)
+                    finally:
+                        await verify_page.close()
                 await asyncio.sleep(3.0)
                 await page.reload(wait_until="domcontentloaded")
                 await asyncio.sleep(5.0)
@@ -2575,12 +2966,50 @@ async def _handle_workday_auth(page, event_callback=None) -> bool:
                             break
                     except Exception:
                         pass
-    except Exception:
-        pass
+    except Exception as e:
+        await _log(f"Verification check error: {e}")
 
     # --- Step 6: IMMEDIATELY sign in after account creation ---
     # After Create Account submit (or "already exists"), we should now be on Sign In.
     # Do NOT check for createAccountLink — go straight to sign in.
+
+    # First check if we need to click "Sign in with email" again
+    try:
+        has_email_btn_again = await page.evaluate("""() => {
+            const buttons = document.querySelectorAll('button, a, div[role="button"]');
+            for (const btn of buttons) {
+                const text = (btn.innerText || btn.textContent || '').trim().toLowerCase();
+                if (text.includes('sign in with email') && btn.offsetParent !== null) {
+                    return true;
+                }
+            }
+            return false;
+        }""")
+    except Exception:
+        has_email_btn_again = False
+
+    if has_email_btn_again:
+        await _log("Back on 'Sign in with email' page, clicking it again...")
+        await _multi_click(
+            [
+                'button:has-text("Sign in with email")',
+                'a:has-text("Sign in with email")',
+                'div[role="button"]:has-text("Sign in with email")',
+            ],
+            js_fallback="""() => {
+                const buttons = document.querySelectorAll('button, a, div[role="button"]');
+                for (const btn of buttons) {
+                    const text = (btn.innerText || btn.textContent || '').trim().toLowerCase();
+                    if (text.includes('sign in with email') && btn.offsetParent !== null) {
+                        btn.click();
+                        return true;
+                    }
+                }
+                return false;
+            }""",
+        )
+        await asyncio.sleep(3.0)
+
     try:
         email_vis = await page.locator('input[data-automation-id="email"]').is_visible(timeout=5000)
     except Exception:
@@ -2597,6 +3026,7 @@ async def _handle_workday_auth(page, event_callback=None) -> bool:
                 'button:has-text("Sign In")',
             ],
             force=True,
+            use_mouse=True,
         )
         await asyncio.sleep(5.0)
 
@@ -2623,6 +3053,7 @@ async def _handle_workday_auth(page, event_callback=None) -> bool:
                     'button:has-text("Sign In")',
                 ],
                 force=True,
+                use_mouse=True,
             )
             await asyncio.sleep(5.0)
 
@@ -2799,38 +3230,106 @@ async def _handle_custom_dropdown(page, selector: str, value: str, event_callbac
             const el = document.querySelector('{selector}');
             if (!el) return false;
             const dataid = el.getAttribute('data-automation-id') || '';
-            return dataid.startsWith('formField-') || dataid.startsWith('multiSelectContainer') || !!el.querySelector('[data-automation-id="searchBox"]');
+            if (dataid.startsWith('formField-') || dataid.startsWith('multiSelectContainer')) return true;
+            if (el.querySelector('[data-automation-id="searchBox"]')) return true;
+            if (el.getAttribute('role') === 'combobox' || el.getAttribute('aria-haspopup') === 'listbox') return true;
+            // Check parent
+            const parent = el.closest('[data-automation-id^="formField-"]');
+            if (parent) return true;
+            return false;
         }}""")
         if is_workday_dd:
-            # Click the dropdown button to open
-            wd_btn = page.locator(f'{selector} button, {selector} [data-automation-id="searchBox"]').first
-            if await wd_btn.is_visible(timeout=2000):
-                await wd_btn.click(timeout=3000)
-                await asyncio.sleep(0.8)
-                # Type in search box if available
-                wd_search = page.locator('[data-automation-id="searchBox"] input, input[data-automation-id="searchBox"]').first
+            if event_callback:
+                await event_callback("Fill Form", "info", f"Workday dropdown detected for '{value[:30]}', trying click→type→select...")
+            # Try clicking the dropdown button/icon to open it
+            clicked_open = False
+            for btn_sel in [
+                f'{selector} button',
+                f'{selector} [role="button"]',
+                f'{selector} [data-automation-id="searchBox"]',
+                f'{selector} svg',
+                f'{selector} [aria-haspopup]',
+                selector,  # click the container itself as last resort
+            ]:
                 try:
-                    if await wd_search.is_visible(timeout=1000):
-                        await wd_search.fill(value, timeout=3000)
+                    btn = page.locator(btn_sel).first
+                    if await btn.is_visible(timeout=1000):
+                        # Use real mouse click for Workday click_filter
+                        box = await btn.bounding_box()
+                        if box:
+                            await page.mouse.click(box['x'] + box['width'] / 2, box['y'] + box['height'] / 2)
+                        else:
+                            await btn.click(timeout=3000)
+                        clicked_open = True
                         await asyncio.sleep(0.8)
+                        break
                 except Exception:
-                    pass
+                    continue
+
+            if not clicked_open:
+                if event_callback:
+                    await event_callback("Fill Form", "info", "Could not click Workday dropdown open")
+            else:
+                # Type in search box if available
+                for search_sel in [
+                    '[data-automation-id="searchBox"] input',
+                    'input[data-automation-id="searchBox"]',
+                    f'{selector} input[type="text"]',
+                    'input[role="combobox"]:visible',
+                ]:
+                    try:
+                        wd_search = page.locator(search_sel).first
+                        if await wd_search.is_visible(timeout=1000):
+                            await wd_search.fill("", timeout=2000)
+                            await asyncio.sleep(0.2)
+                            await wd_search.fill(value, timeout=3000)
+                            await asyncio.sleep(1.0)
+                            break
+                    except Exception:
+                        continue
+
                 # Click matching option
-                for opt_sel in ['[data-automation-id*="promptOption"]', '[role="option"]', '[data-automation-id="menuItem"]']:
+                for opt_sel in [
+                    '[data-automation-id*="promptOption"]',
+                    '[role="option"]',
+                    '[data-automation-id="menuItem"]',
+                    '[data-automation-id*="selectWidget"] [role="option"]',
+                    'ul li:visible',
+                ]:
                     try:
                         opts = page.locator(opt_sel)
                         count = await opts.count()
-                        for i in range(min(count, 15)):
+                        for i in range(min(count, 20)):
                             opt = opts.nth(i)
                             if await opt.is_visible(timeout=300):
                                 text = await opt.inner_text()
                                 if _is_dropdown_match(text, value):
-                                    await opt.click(timeout=3000)
+                                    box = await opt.bounding_box()
+                                    if box:
+                                        await page.mouse.click(box['x'] + box['width'] / 2, box['y'] + box['height'] / 2)
+                                    else:
+                                        await opt.click(timeout=3000)
                                     if event_callback:
                                         await event_callback("Fill Form", "info", f"Workday dropdown: {text[:50]}")
                                     return True
                     except Exception:
                         continue
+
+                # If no matching option found, try ArrowDown + Enter
+                try:
+                    first_opt = page.locator('[role="option"]:visible, [data-automation-id*="promptOption"]:visible').first
+                    if await first_opt.is_visible(timeout=500):
+                        text = await first_opt.inner_text()
+                        box = await first_opt.bounding_box()
+                        if box:
+                            await page.mouse.click(box['x'] + box['width'] / 2, box['y'] + box['height'] / 2)
+                        else:
+                            await first_opt.click(timeout=3000)
+                        if event_callback:
+                            await event_callback("Fill Form", "info", f"Workday dropdown (first option): {text[:50]}")
+                        return True
+                except Exception:
+                    pass
     except Exception:
         pass
 
@@ -3288,6 +3787,23 @@ async def fill_form(
     """Fill form fields using Playwright based on LLM mappings."""
     # Filter out non-dict elements (LLM may return malformed JSON with strings)
     mappings = [m for m in mappings if isinstance(m, dict)]
+
+    # Safety: remove any mappings that target navigation/utility elements
+    _NAV_BLOCKLIST = [
+        'navigationItem', 'utilityMenuButton', 'settingsButton', 'signOut',
+        'signIn', 'searchButton', 'globalSearch', 'headerWrapper', 'inboxButton',
+        'tasksButton', 'helpButton', 'profileImage', 'Candidate Home', 'Search for Job',
+    ]
+    safe_mappings = []
+    for m in mappings:
+        sel = m.get("selector", "")
+        if any(blocked in sel for blocked in _NAV_BLOCKLIST):
+            if event_callback:
+                import asyncio as _aio
+                _aio.ensure_future(event_callback("Fill Form", "warning", f"Blocked nav element: {sel[:60]}"))
+            continue
+        safe_mappings.append(m)
+    mappings = safe_mappings
     filled = 0
     skipped = 0
     failed = 0
@@ -3295,6 +3811,24 @@ async def fill_form(
 
     # Determine the top-level page for highlights (form_ctx might be a Frame)
     highlight_page = screenshot_page or page
+
+    # Post-process: normalize phone numbers for Workday (digits only, no parens/dashes)
+    is_workday_page = 'myworkdayjobs' in (page.url or '')
+    if is_workday_page:
+        import re as _re
+        for m in mappings:
+            if m.get("action") == "fill" and m.get("value"):
+                label_lower = (m.get("label") or "").lower()
+                sel_lower = (m.get("selector") or "").lower()
+                if "phone" in label_lower or "phone" in sel_lower:
+                    raw = m["value"]
+                    # Strip to digits only (remove parens, dashes, spaces, dots)
+                    digits = _re.sub(r'[^\d]', '', raw)
+                    # Remove leading 1 if it's a US number with country code
+                    if len(digits) == 11 and digits.startswith('1'):
+                        digits = digits[1:]
+                    if digits and digits != raw:
+                        m["value"] = digits
 
     # Post-process: fix action type for <select> elements that LLM may have mapped as "fill"
     for m in mappings:
@@ -3307,6 +3841,82 @@ async def fill_form(
                     m["action"] = "select"
             except Exception:
                 pass
+
+    # Post-process: convert Workday dropdown fields from "fill" to "select"
+    # Workday searchable dropdowns (promptList) have buttons/icons and need click→type→select
+    for m in mappings:
+        if m.get("action") == "fill" and m.get("selector") and m.get("value"):
+            try:
+                result = await page.evaluate(f"""(sel) => {{
+                    const el = document.querySelector(sel);
+                    if (!el) return {{isWdDd: false}};
+                    // Helper: check if a container has dropdown affordances
+                    function hasDropdownAffordance(container) {{
+                        if (!container) return false;
+                        return !!(
+                            container.querySelector('button') ||
+                            container.querySelector('[role="button"]') ||
+                            container.querySelector('[data-automation-id="searchBox"]') ||
+                            container.querySelector('[data-automation-id*="promptIcon"]') ||
+                            container.querySelector('[data-automation-id*="dropdown"]') ||
+                            container.querySelector('[aria-haspopup]') ||
+                            container.querySelector('svg') // icon button for dropdown
+                        );
+                    }}
+                    // Check direct element
+                    const dataid = el.getAttribute('data-automation-id') || '';
+                    if ((dataid.startsWith('formField-') || dataid.startsWith('multiSelectContainer'))
+                        && hasDropdownAffordance(el)) {{
+                        return {{isWdDd: true}};
+                    }}
+                    // Check if this is an input with role=combobox
+                    if (el.getAttribute('role') === 'combobox' || el.getAttribute('aria-haspopup') === 'listbox') {{
+                        const parent = el.closest('[data-automation-id^="formField-"], [data-automation-id^="multiSelectContainer"]');
+                        if (parent) {{
+                            const pid = parent.getAttribute('data-automation-id');
+                            return {{isWdDd: true, parentSelector: '[data-automation-id="' + pid + '"]'}};
+                        }}
+                        return {{isWdDd: true}};
+                    }}
+                    // Check parent container (input inside a Workday dropdown)
+                    const parent = el.closest('[data-automation-id^="formField-"], [data-automation-id^="multiSelectContainer"]');
+                    if (parent && hasDropdownAffordance(parent)) {{
+                        const pid = parent.getAttribute('data-automation-id');
+                        return {{isWdDd: true, parentSelector: '[data-automation-id="' + pid + '"]'}};
+                    }}
+                    return {{isWdDd: false}};
+                }}""", m["selector"])
+                if result.get("isWdDd"):
+                    m["action"] = "select"
+                    # Use parent container selector for Workday dropdown handler
+                    if result.get("parentSelector"):
+                        m["selector"] = result["parentSelector"]
+            except Exception:
+                pass
+
+    # Post-process: skip Workday email field if it already has a value (clicking it opens Change Email panel)
+    if is_workday_page:
+        for m in mappings:
+            if m.get("action") == "fill" and m.get("value"):
+                sel = m.get("selector", "")
+                label_lower = (m.get("label") or "").lower()
+                if "email" in label_lower or "email" in sel.lower():
+                    try:
+                        current_val = await page.evaluate(f"""() => {{
+                            const el = document.querySelector('{sel}');
+                            if (!el) return '';
+                            return (el.value || el.textContent || '').trim();
+                        }}""")
+                        if current_val and '@' in current_val:
+                            m["action"] = "skip"
+                            if event_callback:
+                                import asyncio as _aio
+                                _aio.ensure_future(event_callback(
+                                    "Fill Form", "info",
+                                    f"Skipping email field (already has: {current_val[:30]}) to prevent Change Email panel"
+                                ))
+                    except Exception:
+                        pass
 
     # Post-process: prevent resume/long text from being pasted into cover letter or textarea fields
     for m in mappings:
@@ -3426,9 +4036,39 @@ async def fill_form(
                         if not current:
                             await page.fill(selector, value, timeout=3000)
                     else:
-                        await page.fill(selector, value, timeout=5000)
+                        # Check if this is a Workday input (needs keyboard.type for React)
+                        is_wd_input = 'data-automation-id' in selector or 'myworkdayjobs' in (page.url or '')
+                        if is_wd_input:
+                            await loc.click(timeout=3000)
+                            await asyncio.sleep(0.1)
+                            # Triple-click to select all (works on Mac & Linux; Control+a is emacs-home on Mac)
+                            box = await loc.bounding_box()
+                            if box:
+                                await page.mouse.click(box['x'] + box['width'] / 2, box['y'] + box['height'] / 2, click_count=3)
+                            else:
+                                await page.keyboard.press("Meta+a")
+                            await asyncio.sleep(0.15)
+                            await page.keyboard.type(value, delay=30)
+                            await asyncio.sleep(0.3)
+                            await page.keyboard.press("Tab")  # Blur to trigger validation
+                        else:
+                            await page.fill(selector, value, timeout=5000)
                 except Exception:
-                    # Fallback: use JS to set value
+                    # Fallback: use JS to set value + keyboard.type for Workday
+                    try:
+                        loc = page.locator(selector).first
+                        await loc.click(timeout=3000)
+                        await asyncio.sleep(0.1)
+                        box = await loc.bounding_box()
+                        if box:
+                            await page.mouse.click(box['x'] + box['width'] / 2, box['y'] + box['height'] / 2, click_count=3)
+                        else:
+                            await page.keyboard.press("Meta+a")
+                        await asyncio.sleep(0.15)
+                        await page.keyboard.type(value, delay=30)
+                        await asyncio.sleep(0.3)
+                    except Exception:
+                        pass
                     try:
                         await page.evaluate(
                             """(args) => {
@@ -3910,7 +4550,7 @@ async def fill_application(
         await event_callback("Generate Answers", "start", "Mapping fields to profile (single LLM call)...")
 
     try:
-        mappings = map_fields_to_profile(fields, job_description, company, role, cover_letter_text)
+        mappings = await asyncio.to_thread(map_fields_to_profile, fields, job_description, company, role, cover_letter_text)
         if event_callback:
             fill_count = sum(1 for m in mappings if m.get("action") != "skip")
             await event_callback("Generate Answers", "success", f"Mapped {fill_count} fields to fill")
@@ -3982,7 +4622,7 @@ async def fill_application(
                 await event_callback("Fill Form", "info", f"Pass {pass_num + 1}: {len(unfilled)} fields still empty, retrying...")
 
             try:
-                retry_mappings = map_fields_to_profile(unfilled, job_description, company, role, cover_letter_text)
+                retry_mappings = await asyncio.to_thread(map_fields_to_profile, unfilled, job_description, company, role, cover_letter_text)
                 # Filter out skips for retry - we want to fill everything
                 retry_mappings = [m for m in retry_mappings if m.get("action") != "skip" or m.get("value")]
                 if not retry_mappings:

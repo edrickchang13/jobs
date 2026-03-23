@@ -5,10 +5,683 @@ Steps: My Information → My Experience → Application Questions →
        Voluntary Disclosures → Self Identify → Review
 """
 import asyncio
+import json
 import os
 import yaml
 from pathlib import Path
 from playwright.async_api import Page
+
+
+def _load_personal_info_wd() -> dict:
+    """Load personal info from YAML file."""
+    info_path = Path(__file__).parent.parent / "personal_info.yaml"
+    if info_path.exists():
+        with open(info_path, "r") as f:
+            return yaml.safe_load(f) or {}
+    return {}
+
+
+async def fill_workday_info_hardcoded(page: Page, event_callback=None) -> dict:
+    """Fill Workday 'My Information' step using hardcoded field mappings.
+
+    Bypasses the LLM entirely. Uses Workday-specific DOM queries to find and
+    fill fields. Workday uses custom React components, NOT standard HTML inputs.
+
+    Key Workday DOM patterns:
+    - Text inputs: inside [data-automation-id="formField-XXX"] containers
+    - Radio buttons: <input type="radio" name="..." value="true"/"false">
+      with [data-automation-id="click_filter"] overlays (need isTrusted clicks)
+    - Dropdowns: custom promptList with button + popup pattern
+    """
+    info = _load_personal_info_wd()
+    filled = 0
+    failed = 0
+    errors = []
+
+    if event_callback:
+        await event_callback("Fill Form", "info", "Using hardcoded Workday field filler (no LLM)")
+
+    # Step 0: Diagnostic - dump current page state
+    try:
+        diag = await page.evaluate("""() => {
+            return {
+                url: window.location.href,
+                title: document.title,
+                bodyLen: document.body.innerText.length,
+                formFieldCount: document.querySelectorAll('[data-automation-id^="formField-"]').length,
+                inputCount: document.querySelectorAll('input').length,
+                visibleInputCount: Array.from(document.querySelectorAll('input')).filter(i => i.offsetParent !== null).length,
+                radioCount: document.querySelectorAll('input[type="radio"]').length,
+                progressBar: !!document.querySelector('[data-automation-id="progressBar"]'),
+                activeStep: (() => { const s = document.querySelector('[data-automation-id="progressBarActiveStep"]'); return s ? s.innerText.trim() : 'none'; })(),
+                firstLabels: Array.from(document.querySelectorAll('[data-automation-id^="formField-"] label')).slice(0, 10).map(l => l.innerText.trim()),
+            };
+        }""")
+        if event_callback:
+            await event_callback("Fill Form", "diag", f"Page: {diag.get('url', '?')[:60]}")
+            await event_callback("Fill Form", "diag", f"Step: {diag.get('activeStep')}, formFields: {diag.get('formFieldCount')}, inputs: {diag.get('visibleInputCount')}/{diag.get('inputCount')}, radios: {diag.get('radioCount')}")
+            await event_callback("Fill Form", "diag", f"Labels found: {diag.get('firstLabels', [])}")
+        print(f">>> DIAG: {json.dumps(diag, indent=2)}")
+    except Exception as e:
+        print(f">>> DIAG error: {e}")
+        if event_callback:
+            await event_callback("Fill Form", "warn", f"Diagnostic error: {str(e)[:80]}")
+
+    # Step 1: Scan ALL visible text inputs and fill based on label matching
+    try:
+        text_fields = await page.evaluate("""() => {
+            const results = [];
+            // Scan all formField containers
+            const containers = document.querySelectorAll('[data-automation-id^="formField-"]');
+            for (const c of containers) {
+                if (c.offsetParent === null) continue;
+                const dataid = c.getAttribute('data-automation-id') || '';
+                // Skip nav/menu elements
+                if (dataid.includes('navigation') || dataid.includes('search') || dataid.includes('menu')) continue;
+                // Find label
+                const label = c.querySelector('label');
+                const labelText = label ? label.innerText.trim() : '';
+                // Find input
+                const inp = c.querySelector('input[type="text"], input[type="tel"], input[type="email"], input[type="number"], input:not([type])');
+                if (inp && inp.offsetParent !== null) {
+                    const r = inp.getBoundingClientRect();
+                    results.push({
+                        dataid,
+                        label: labelText.toLowerCase(),
+                        value: inp.value || '',
+                        x: r.x + r.width/2,
+                        y: r.y + r.height/2,
+                        visible: r.width > 0 && r.height > 0,
+                    });
+                }
+            }
+            return results;
+        }""")
+
+        # Log what we found
+        print(f">>> TEXT FIELDS FOUND: {len(text_fields or [])}")
+        if event_callback:
+            await event_callback("Fill Form", "diag", f"Text fields found: {len(text_fields or [])}")
+        for tf in (text_fields or []):
+            print(f">>>   label='{tf.get('label')}' dataid='{tf.get('dataid')}' value='{tf.get('value', '')[:20]}' vis={tf.get('visible')} xy=({tf.get('x'):.0f},{tf.get('y'):.0f})")
+            if event_callback:
+                await event_callback("Fill Form", "diag",
+                    f"  field: label='{tf.get('label', '')[:30]}' val='{tf.get('value', '')[:15]}' vis={tf.get('visible')}")
+
+        # Map labels to values
+        label_values = {
+            "first name": info.get("first_name", "Edrick"),
+            "last name": info.get("last_name", "Chang"),
+            "phone number": info.get("phone", "(408) 806-6495"),
+            "phone": info.get("phone", "(408) 806-6495"),
+            "address line 1": info.get("street_address", ""),
+            "address": info.get("street_address", ""),
+            "city": info.get("city", "Santa Clara"),
+            "postal code": info.get("zip_code", ""),
+            "zip": info.get("zip_code", ""),
+        }
+
+        for tf in (text_fields or []):
+            label = tf.get("label", "")
+            if not tf.get("visible"):
+                continue
+            # Skip if already filled
+            if tf.get("value", "").strip():
+                filled += 1
+                if event_callback:
+                    await event_callback("Fill Form", "info", f"Already filled: {label[:30]} = '{tf['value'][:20]}'")
+                continue
+
+            # Find matching value
+            matched_value = None
+            for pattern, val in label_values.items():
+                if pattern in label and val:
+                    matched_value = val
+                    break
+
+            if matched_value:
+                await page.mouse.click(tf["x"], tf["y"])
+                await asyncio.sleep(0.2)
+                # Triple-click to select all, then type
+                await page.mouse.click(tf["x"], tf["y"], click_count=3)
+                await asyncio.sleep(0.1)
+                await page.keyboard.type(matched_value, delay=20)
+                await asyncio.sleep(0.3)
+                # Click elsewhere to trigger blur/validation
+                await page.keyboard.press("Tab")
+                await asyncio.sleep(0.3)
+                filled += 1
+                if event_callback:
+                    await event_callback("Fill Form", "success", f"Filled '{label[:30]}' = '{matched_value}'")
+
+    except Exception as e:
+        if event_callback:
+            await event_callback("Fill Form", "warn", f"Text field scan error: {str(e)[:80]}")
+
+    # Step 2: Handle radio buttons using Workday's actual DOM
+    # Workday uses <input type="radio" name="candidateIsPreviousWorker" value="true"/"false">
+    # wrapped in labels, with click_filter overlays
+    try:
+        radio_info = await page.evaluate("""() => {
+            // Find all radio inputs (Workday uses standard HTML radios, not role="radio")
+            const radios = document.querySelectorAll('input[type="radio"]');
+            const groups = {};
+            for (const r of radios) {
+                const name = r.getAttribute('name') || '';
+                if (!name) continue;
+                if (!groups[name]) groups[name] = [];
+                // Get the label text
+                const parentLabel = r.closest('label');
+                let labelText = parentLabel ? parentLabel.innerText.trim() : '';
+                if (!labelText) {
+                    const nextSibling = r.nextElementSibling || r.parentElement;
+                    labelText = nextSibling ? nextSibling.innerText?.trim() : '';
+                }
+                // Get the click target (click_filter or the radio itself)
+                const filter = r.closest('div')?.querySelector('[data-automation-id="click_filter"]');
+                const target = filter || r;
+                const rect = target.getBoundingClientRect();
+                groups[name].push({
+                    value: r.value,
+                    checked: r.checked,
+                    labelText: labelText.toLowerCase(),
+                    x: rect.x + rect.width/2,
+                    y: rect.y + rect.height/2,
+                    hasFilter: !!filter,
+                });
+            }
+            return groups;
+        }""")
+
+        print(f">>> RADIO GROUPS FOUND: {len(radio_info or {})}")
+        if event_callback:
+            await event_callback("Fill Form", "diag", f"Radio groups found: {len(radio_info or {})}")
+        for name, options in (radio_info or {}).items():
+            labels = [o.get("labelText", "?") for o in options]
+            checked = [o.get("checked", False) for o in options]
+            print(f">>>   group='{name}' labels={labels} checked={checked}")
+            if event_callback:
+                await event_callback("Fill Form", "diag", f"  radio: name='{name}' labels={labels}")
+
+        for name, options in (radio_info or {}).items():
+            # Skip already-answered groups
+            if any(o.get("checked") for o in options):
+                filled += 1
+                if event_callback:
+                    checked_label = next((o["labelText"] for o in options if o.get("checked")), "?")
+                    await event_callback("Fill Form", "info", f"Radio '{name}' already: {checked_label}")
+                continue
+
+            # Determine answer
+            name_lower = name.lower()
+            target_value = None
+            if "previousworker" in name_lower or "previously" in name_lower:
+                target_value = "false"  # No
+            elif "authorized" in name_lower or "eligible" in name_lower:
+                target_value = "true"  # Yes
+            elif "sponsorship" in name_lower:
+                target_value = "false"  # No
+
+            if target_value:
+                for o in options:
+                    if o["value"] == target_value:
+                        # Use real mouse click (isTrusted=true) for Workday
+                        await page.mouse.click(o["x"], o["y"])
+                        await asyncio.sleep(0.5)
+                        filled += 1
+                        answer_text = "No" if target_value == "false" else "Yes"
+                        if event_callback:
+                            await event_callback("Fill Form", "success",
+                                f"Radio '{name}': clicked {answer_text} (filter={o.get('hasFilter')})")
+                        break
+
+    except Exception as e:
+        if event_callback:
+            await event_callback("Fill Form", "warn", f"Radio button error: {str(e)[:80]}")
+
+    # Step 3: Check country dropdown
+    try:
+        country_text = await page.evaluate("""() => {
+            // Check various selectors for country field
+            for (const sel of ['[data-automation-id="formField-countryDropdown"]',
+                               '[data-automation-id="formField-country"]',
+                               'select[data-automation-id*="country"]']) {
+                const el = document.querySelector(sel);
+                if (el) {
+                    const text = el.innerText || el.value || '';
+                    if (text.includes('United States')) return text.trim().substring(0, 50);
+                }
+            }
+            return '';
+        }""")
+        if country_text:
+            if event_callback:
+                await event_callback("Fill Form", "info", f"Country: {country_text}")
+    except Exception:
+        pass
+
+    if event_callback:
+        await event_callback("Fill Form", "info", f"Hardcoded fill done: {filled} filled, {failed} failed")
+
+    return {"filled": filled, "failed": failed, "skipped": 0, "errors": errors}
+
+
+async def fill_workday_questions_hardcoded(page: Page, company: str = "", role: str = "", event_callback=None) -> dict:
+    """Fill Workday 'Application Questions' and similar steps using hardcoded logic.
+
+    Scans for common question patterns (radio buttons, dropdowns, text fields)
+    and fills them with known values. No LLM required.
+    """
+    info = _load_personal_info_wd()
+    filled = 0
+    failed = 0
+    errors = []
+
+    if event_callback:
+        await event_callback("Fill Form", "info", "Filling Application Questions (hardcoded, no LLM)")
+
+    # Common yes/no question patterns and their answers
+    # Format: (label_pattern, answer)
+    yes_no_answers = {
+        "authorized to work": "Yes",
+        "legally authorized": "Yes",
+        "eligible to work": "Yes",
+        "work authorization": "Yes",
+        "require sponsorship": "No",
+        "need sponsorship": "No",
+        "visa sponsorship": "No",
+        "immigration sponsorship": "No",
+        "previously worked": "No",
+        "previously employed": "No",
+        "previously applied": "No",
+        "worked for": "No",
+        "employed by": "No",
+        "applied to": "No",
+        "relative": "No",
+        "family member": "No",
+        "felony": "No",
+        "convicted": "No",
+        "criminal": "No",
+        "background check": "Yes",
+        "drug test": "Yes",
+        "drug screen": "Yes",
+        "relocate": "Yes",
+        "willing to relocate": "Yes",
+        "able to relocate": "Yes",
+        "on-site": "Yes",
+        "onsite": "Yes",
+        "work on site": "Yes",
+        "currently employed": "No",
+        "18 years": "Yes",
+        "over 18": "Yes",
+        "at least 18": "Yes",
+        "age requirement": "Yes",
+        "non-compete": "No",
+        "non compete": "No",
+        "nda": "No",
+    }
+
+    # Scan all visible radio button groups
+    try:
+        radio_groups = await page.evaluate("""() => {
+            const groups = {};
+            const radios = document.querySelectorAll('input[type="radio"]');
+            for (const r of radios) {
+                if (r.offsetParent === null && !r.closest('label')) continue;
+                const name = r.getAttribute('name') || '';
+                if (!name) continue;
+                if (!groups[name]) groups[name] = [];
+                // Find the label text for this radio
+                const label = r.closest('label');
+                const labelText = label ? label.innerText.trim() : (r.value || '');
+                // Find the question text (usually in a parent or preceding element)
+                let questionText = '';
+                const fieldContainer = r.closest('[data-automation-id^="formField-"]') || r.closest('.css-1q3fhg7') || r.closest('fieldset');
+                if (fieldContainer) {
+                    const lbl = fieldContainer.querySelector('label, legend, [class*="label"]');
+                    questionText = lbl ? lbl.innerText.trim() : '';
+                }
+                const rect = r.getBoundingClientRect();
+                groups[name].push({
+                    value: r.value,
+                    labelText,
+                    questionText,
+                    checked: r.checked,
+                    x: rect.x + rect.width/2,
+                    y: rect.y + rect.height/2,
+                });
+            }
+            return groups;
+        }""")
+
+        for name, options in (radio_groups or {}).items():
+            if not options:
+                continue
+            # Get the question text from the first option
+            question = (options[0].get("questionText", "") or "").lower()
+            if not question:
+                # Try to infer from the radio name
+                question = name.lower()
+
+            # Already answered?
+            if any(o.get("checked") for o in options):
+                filled += 1
+                continue
+
+            # Determine answer
+            answer = None
+            for pattern, ans in yes_no_answers.items():
+                if pattern in question:
+                    answer = ans
+                    break
+
+            if answer:
+                # Find the matching option
+                for o in options:
+                    label = o.get("labelText", "").lower().strip()
+                    if (answer == "Yes" and label in ("yes", "true")) or \
+                       (answer == "No" and label in ("no", "false")):
+                        await page.mouse.click(o["x"], o["y"])
+                        await asyncio.sleep(0.3)
+                        filled += 1
+                        if event_callback:
+                            await event_callback("Fill Form", "success",
+                                f"Answered '{question[:40]}' = {answer}")
+                        break
+    except Exception as e:
+        if event_callback:
+            await event_callback("Fill Form", "warn", f"Radio scan error: {str(e)[:80]}")
+
+    # Scan for select/dropdown fields
+    try:
+        selects = await page.evaluate("""() => {
+            const results = [];
+            const sels = document.querySelectorAll('select');
+            for (const s of sels) {
+                if (s.offsetParent === null) continue;
+                const container = s.closest('[data-automation-id^="formField-"]');
+                let label = '';
+                if (container) {
+                    const lbl = container.querySelector('label');
+                    label = lbl ? lbl.innerText.trim() : '';
+                }
+                const options = Array.from(s.options).map(o => ({value: o.value, text: o.text}));
+                results.push({
+                    label: label.toLowerCase(),
+                    currentValue: s.value,
+                    dataid: s.getAttribute('data-automation-id') || '',
+                    options,
+                    selector: container ? `[data-automation-id="${container.getAttribute('data-automation-id')}"] select` : '',
+                });
+            }
+            return results;
+        }""")
+
+        select_answers = {
+            "country": "United States",
+            "state": "California",
+            "graduation": "2028",
+            "year": "2028",
+            "degree": "Bachelor",
+            "education": "Bachelor",
+            "experience": "0",
+            "intern season": "Summer",
+            "season": "Summer",
+        }
+
+        for sel_info in (selects or []):
+            label = sel_info.get("label", "")
+            if sel_info.get("currentValue"):
+                filled += 1
+                continue
+            for pattern, ans in select_answers.items():
+                if pattern in label:
+                    # Find best matching option
+                    for opt in sel_info.get("options", []):
+                        if ans.lower() in opt.get("text", "").lower():
+                            selector = sel_info.get("selector", "")
+                            if selector:
+                                await page.locator(selector).first.select_option(value=opt["value"])
+                                filled += 1
+                                if event_callback:
+                                    await event_callback("Fill Form", "success",
+                                        f"Selected '{opt['text']}' for '{label[:30]}'")
+                            break
+                    break
+    except Exception as e:
+        if event_callback:
+            await event_callback("Fill Form", "warn", f"Select scan error: {str(e)[:80]}")
+
+    # Scan for text inputs that are still empty
+    try:
+        text_fields = await page.evaluate("""() => {
+            const results = [];
+            const inputs = document.querySelectorAll('input[type="text"], input[type="tel"], input[type="number"], input[type="url"], input:not([type])');
+            for (const inp of inputs) {
+                if (inp.offsetParent === null) continue;
+                if (inp.value && inp.value.trim()) continue;
+                // Skip nav elements
+                const dataid = inp.getAttribute('data-automation-id') || '';
+                if (dataid.includes('navigation') || dataid.includes('search') || dataid.includes('menu')) continue;
+                const container = inp.closest('[data-automation-id^="formField-"]');
+                let label = '';
+                if (container) {
+                    const lbl = container.querySelector('label');
+                    label = lbl ? lbl.innerText.trim() : '';
+                }
+                const rect = inp.getBoundingClientRect();
+                results.push({
+                    label: label.toLowerCase(),
+                    dataid,
+                    x: rect.x + rect.width/2,
+                    y: rect.y + rect.height/2,
+                    placeholder: inp.placeholder || '',
+                });
+            }
+            return results;
+        }""")
+
+        text_answers = {
+            "phone": info.get("phone", "(408) 806-6495"),
+            "linkedin": info.get("linkedin", "https://linkedin.com/in/edrickchang"),
+            "github": info.get("github", "https://github.com/edrickchang"),
+            "gpa": info.get("gpa", "3.78"),
+            "postal": info.get("zip_code", ""),
+            "zip": info.get("zip_code", ""),
+            "city": info.get("city", "Santa Clara"),
+            "address": info.get("street_address", ""),
+            "graduation year": info.get("graduation_year", "2028"),
+        }
+
+        for tf in (text_fields or []):
+            label = tf.get("label", "")
+            for pattern, ans in text_answers.items():
+                if pattern in label and ans:
+                    await page.mouse.click(tf["x"], tf["y"])
+                    await asyncio.sleep(0.1)
+                    await page.keyboard.type(ans, delay=20)
+                    await asyncio.sleep(0.2)
+                    filled += 1
+                    if event_callback:
+                        await event_callback("Fill Form", "success", f"Filled '{label[:30]}' = '{ans}'")
+                    break
+    except Exception as e:
+        if event_callback:
+            await event_callback("Fill Form", "warn", f"Text field scan error: {str(e)[:80]}")
+
+    # Handle Workday promptList dropdowns on this page too
+    try:
+        await _fill_workday_prompt_dropdown(page, event_callback)
+    except Exception:
+        pass
+
+    if event_callback:
+        await event_callback("Fill Form", "info", f"Questions page: {filled} filled, {failed} failed")
+
+    return {"filled": filled, "failed": failed, "skipped": 0, "errors": errors}
+
+
+async def _fill_workday_prompt_dropdown(page: Page, event_callback=None):
+    """Targeted handler for Workday promptList dropdowns like 'How Did You Hear About Us?'.
+
+    Uses direct Playwright interaction: click the dropdown button, wait for popup,
+    then click the matching option with real mouse events.
+    """
+    # Check if "How Did You Hear About Us?" field exists and is empty
+    field_info = await page.evaluate("""() => {
+        // Find formField containers that match "source" or "hear" patterns
+        const candidates = [
+            'sourceType', 'source', 'jobSource', 'howDidYouHear',
+            'referralSource', 'sourceName',
+        ];
+        for (const cand of candidates) {
+            const el = document.querySelector('[data-automation-id="formField-' + cand + '"]');
+            if (el && el.offsetParent !== null) {
+                // Check if it already has a selected value (pill/chip)
+                const pill = el.querySelector('[data-automation-id="selectedItem"], [data-automation-id*="pill"], .css-1wc848c');
+                if (pill) return { found: true, filled: true, dataid: 'formField-' + cand };
+                // Check if input has value
+                const input = el.querySelector('input');
+                if (input && input.value && input.value.trim()) return { found: true, filled: true, dataid: 'formField-' + cand };
+                return { found: true, filled: false, dataid: 'formField-' + cand };
+            }
+        }
+        // Broader search: look for any formField with label containing "hear" or "source"
+        const allFields = document.querySelectorAll('[data-automation-id^="formField-"]');
+        for (const el of allFields) {
+            if (el.offsetParent === null) continue;
+            const label = el.querySelector('label');
+            const labelText = (label ? label.innerText : '').toLowerCase();
+            if (labelText.includes('hear') || labelText.includes('source') || labelText.includes('how did you')) {
+                const pill = el.querySelector('[data-automation-id="selectedItem"], [data-automation-id*="pill"]');
+                if (pill) return { found: true, filled: true, dataid: el.getAttribute('data-automation-id') };
+                return { found: true, filled: false, dataid: el.getAttribute('data-automation-id') };
+            }
+        }
+        return { found: false };
+    }""")
+
+    if not field_info or not field_info.get("found"):
+        return  # No such field on this page
+    if field_info.get("filled"):
+        if event_callback:
+            await event_callback("Fill Form", "info", "How Did You Hear dropdown already filled")
+        return
+
+    dataid = field_info.get("dataid", "")
+    selector = f'[data-automation-id="{dataid}"]'
+
+    if event_callback:
+        await event_callback("Fill Form", "info", f"Filling 'How Did You Hear' dropdown ({dataid})...")
+
+    # Preferred answers in order of priority
+    preferred = ["LinkedIn", "Online Job Board", "Job Board", "Internet", "Online", "Other"]
+
+    try:
+        # Step 1: Scroll the field into view
+        field_el = page.locator(selector).first
+        await field_el.scroll_into_view_if_needed(timeout=3000)
+        await asyncio.sleep(0.3)
+
+        # Step 2: Click the dropdown button/icon to open the popup
+        # Workday dropdowns have a button or the container itself is clickable
+        clicked = False
+        for btn_sel in [
+            f'{selector} button',
+            f'{selector} [data-automation-id="searchBox"]',
+            f'{selector} [role="button"]',
+            f'{selector} svg',
+            selector,
+        ]:
+            try:
+                btn = page.locator(btn_sel).first
+                if await btn.is_visible(timeout=500):
+                    box = await btn.bounding_box()
+                    if box:
+                        await page.mouse.click(box['x'] + box['width'] / 2, box['y'] + box['height'] / 2)
+                        clicked = True
+                        await asyncio.sleep(1.0)  # Wait for popup to render
+                        break
+            except Exception:
+                continue
+
+        if not clicked:
+            if event_callback:
+                await event_callback("Fill Form", "warn", "Could not open 'How Did You Hear' dropdown")
+            return
+
+        # Step 3: Check if a popup/popover appeared with options
+        # Try typing in search if there's an input
+        search_typed = False
+        for search_sel in [
+            '[data-automation-id="searchBox"] input',
+            'input[data-automation-id="searchBox"]',
+            f'{selector} input[type="text"]',
+        ]:
+            try:
+                search = page.locator(search_sel).first
+                if await search.is_visible(timeout=500):
+                    await search.fill("")
+                    await asyncio.sleep(0.1)
+                    await page.keyboard.type("LinkedIn", delay=50)
+                    search_typed = True
+                    await asyncio.sleep(1.0)
+                    break
+            except Exception:
+                continue
+
+        # Step 4: Find and click the best matching option
+        for pref in preferred:
+            for opt_sel in [
+                '[data-automation-id*="promptOption"]',
+                '[role="option"]',
+                '[data-automation-id="menuItem"]',
+            ]:
+                try:
+                    opts = page.locator(f'{opt_sel}:visible')
+                    count = await opts.count()
+                    for i in range(min(count, 20)):
+                        opt = opts.nth(i)
+                        try:
+                            text = (await opt.inner_text(timeout=300)).strip()
+                        except Exception:
+                            continue
+                        if pref.lower() in text.lower() or text.lower() in pref.lower():
+                            box = await opt.bounding_box()
+                            if box:
+                                await page.mouse.click(box['x'] + box['width'] / 2, box['y'] + box['height'] / 2)
+                                await asyncio.sleep(0.5)
+                                if event_callback:
+                                    await event_callback("Fill Form", "success", f"How Did You Hear: selected '{text}'")
+                                return
+                except Exception:
+                    continue
+
+        # Step 5: If no preferred match, just click the first visible option
+        try:
+            first = page.locator('[data-automation-id*="promptOption"]:visible, [role="option"]:visible').first
+            if await first.is_visible(timeout=500):
+                text = await first.inner_text(timeout=500)
+                box = await first.bounding_box()
+                if box:
+                    await page.mouse.click(box['x'] + box['width'] / 2, box['y'] + box['height'] / 2)
+                    await asyncio.sleep(0.5)
+                    if event_callback:
+                        await event_callback("Fill Form", "success", f"How Did You Hear: selected first option '{text[:30]}'")
+                    return
+        except Exception:
+            pass
+
+        # Step 6: Last resort - press Escape and try keyboard approach
+        await page.keyboard.press("Escape")
+        await asyncio.sleep(0.3)
+
+        if event_callback:
+            await event_callback("Fill Form", "warn", "Could not select 'How Did You Hear' option, continuing anyway")
+
+    except Exception as e:
+        if event_callback:
+            await event_callback("Fill Form", "warn", f"How Did You Hear handler error: {str(e)[:100]}")
 
 
 async def check_workday_consent(page: Page, event_callback=None, max_wait_seconds=15) -> bool:
@@ -26,21 +699,98 @@ async def check_workday_consent(page: Page, event_callback=None, max_wait_second
         await event_callback("Checkbox", "info", "Waiting for consent checkbox...")
 
     # Step 1: Poll for checkbox to appear (500ms intervals, up to max_wait_seconds)
+    # Check BOTH role="checkbox" (Workday custom) and input[type="checkbox"] (standard HTML)
+    checkbox_type = None  # "role" or "html"
     for i in range(max_wait_seconds * 2):
         has = await page.evaluate("""() => {
             for (const cb of document.querySelectorAll('[role="checkbox"]'))
-                if (cb.offsetParent !== null) return true;
-            return false;
+                if (cb.offsetParent !== null) return 'role';
+            for (const cb of document.querySelectorAll('input[type="checkbox"]'))
+                if (cb.offsetParent !== null || (cb.offsetWidth === 0 && cb.closest('label, div'))) return 'html';
+            return null;
         }""")
         if has:
+            checkbox_type = has
             if event_callback:
-                await event_callback("Checkbox", "info", f"Checkbox appeared after {i * 0.5}s")
+                await event_callback("Checkbox", "info", f"Checkbox appeared after {i * 0.5}s (type={has})")
             break
         await asyncio.sleep(0.5)
     else:
         if event_callback:
             await event_callback("Checkbox", "info", "No checkbox found — may not be required")
         return True  # No checkbox = nothing to check = proceed
+
+    # Handle regular HTML checkboxes (e.g., "I agree" on some Workday create account pages)
+    if checkbox_type == "html":
+        try:
+            html_cbs = page.locator('input[type="checkbox"]')
+            count = await html_cbs.count()
+            for idx in range(count):
+                cb = html_cbs.nth(idx)
+                is_checked = await cb.is_checked()
+                if is_checked:
+                    continue
+                # Try clicking the checkbox directly
+                try:
+                    await cb.check(force=True, timeout=3000)
+                    if event_callback:
+                        await event_callback("Checkbox", "success", f"Checked HTML checkbox {idx} via .check()")
+                except Exception:
+                    pass
+                # Verify
+                if not await cb.is_checked():
+                    # Try clicking the label or parent element
+                    try:
+                        label = page.locator(f'label[for="{await cb.get_attribute("id")}"]').first
+                        if await label.is_visible(timeout=1000):
+                            await label.click()
+                            if event_callback:
+                                await event_callback("Checkbox", "success", f"Checked via label click")
+                    except Exception:
+                        pass
+                if not await cb.is_checked():
+                    # Try clicking near the checkbox using mouse
+                    try:
+                        box = await cb.bounding_box()
+                        if box:
+                            await page.mouse.click(box['x'] + box['width'] / 2, box['y'] + box['height'] / 2)
+                            await asyncio.sleep(0.5)
+                            if event_callback:
+                                await event_callback("Checkbox", "info", f"Tried mouse.click on checkbox {idx}")
+                    except Exception:
+                        pass
+                if not await cb.is_checked():
+                    # JS fallback
+                    await page.evaluate(f"""() => {{
+                        const cbs = document.querySelectorAll('input[type="checkbox"]');
+                        const cb = cbs[{idx}];
+                        if (cb) {{
+                            cb.checked = true;
+                            cb.dispatchEvent(new Event('change', {{bubbles: true}}));
+                            cb.dispatchEvent(new Event('input', {{bubbles: true}}));
+                            cb.dispatchEvent(new MouseEvent('click', {{bubbles: true}}));
+                        }}
+                    }}""")
+                    if event_callback:
+                        await event_callback("Checkbox", "info", f"Used JS fallback for checkbox {idx}")
+            # Verify all checked
+            all_checked = await page.evaluate("""() => {
+                const cbs = document.querySelectorAll('input[type="checkbox"]');
+                for (const cb of cbs) { if (!cb.checked) return false; }
+                return true;
+            }""")
+            if all_checked:
+                if event_callback:
+                    await event_callback("Checkbox", "success", "All HTML checkboxes checked")
+                return True
+            else:
+                if event_callback:
+                    await event_callback("Checkbox", "error", "Some HTML checkboxes still unchecked")
+                return False
+        except Exception as e:
+            if event_callback:
+                await event_callback("Checkbox", "error", f"HTML checkbox error: {e}")
+            return False
 
     # Step 2: Wait 2s extra for Workday to attach event handlers
     await asyncio.sleep(2)
@@ -641,24 +1391,13 @@ async def handle_my_experience(page: Page, resume_path: str, event_callback=None
 
 async def handle_eeo_page(page: Page, event_callback=None, screenshot_callback=None) -> dict:
     """Handle Voluntary Disclosures / Self Identify / EEO pages."""
-    info = _load_personal_info()
+    info = _load_personal_info_wd()
     filled = 0
 
     if event_callback:
-        await event_callback("Fill Form", "info", "Workday: EEO/Disclosures page")
+        await event_callback("Fill Form", "info", "Workday: EEO/Disclosures page (hardcoded, no LLM)")
 
-    # Try generic form filler first
-    try:
-        from applicator.form_filler import JS_EXTRACT_FIELDS, map_fields_to_profile, fill_form
-        fields = await page.evaluate(JS_EXTRACT_FIELDS)
-        if fields:
-            mappings = map_fields_to_profile(fields, "", "", "")
-            result = await fill_form(page, mappings, "", event_callback=event_callback, screenshot_page=page)
-            filled = result.get("filled", 0)
-    except Exception:
-        pass
-
-    # Also try clicking specific EEO radio/dropdown options
+    # Try clicking specific EEO radio/dropdown options
     eeo_values = [
         info.get('gender', 'Male'),
         info.get('race_ethnicity', 'Asian'),
@@ -695,6 +1434,58 @@ async def handle_workday_application(
     for step_num in range(max_steps):
         await asyncio.sleep(2.0)
 
+        # Dismiss any unexpected dialogs/panels (e.g., "Change Email" panel)
+        try:
+            # First try: find any close button in a panel containing "change email" or "verify"
+            close_info = await page.evaluate("""() => {
+                // Strategy 1: Find close/X buttons near "Change Email" text
+                const closeSelectors = [
+                    '[data-automation-id="closeButton"]',
+                    'button[aria-label="Close"]',
+                    'button[aria-label="close"]',
+                    '[data-automation-id="panelCloseButton"]',
+                    '.css-1fqoep4 button[type="button"]',
+                    'button.css-1qi9rcf',
+                    'div[role="dialog"] button[type="button"]',
+                ];
+                for (const sel of closeSelectors) {
+                    for (const btn of document.querySelectorAll(sel)) {
+                        if (btn.offsetParent === null) continue;
+                        // Check if this button's ancestor contains "change email" text
+                        const ancestor = btn.closest('[role="dialog"], [data-automation-id="panel"], [class*="Panel"], [class*="panel"], [class*="flyout"], [class*="sidebar"], [class*="drawer"]')
+                                      || btn.parentElement?.parentElement;
+                        if (ancestor) {
+                            const text = (ancestor.innerText || '').toLowerCase();
+                            if (text.includes('change email') || text.includes('verify it') || text.includes('new email')) {
+                                const r = btn.getBoundingClientRect();
+                                return {x: r.x + r.width / 2, y: r.y + r.height / 2, found: true};
+                            }
+                        }
+                    }
+                }
+                // Strategy 2: Look for any visible X icon near top-right of a visible panel
+                for (const btn of document.querySelectorAll('button, [role="button"]')) {
+                    if (btn.offsetParent === null) continue;
+                    const text = (btn.textContent || '').trim();
+                    const label = btn.getAttribute('aria-label') || '';
+                    if (text === '×' || text === 'X' || text === '✕' || label.toLowerCase() === 'close') {
+                        const r = btn.getBoundingClientRect();
+                        if (r.x > 800) {  // Right side of viewport = likely a panel close button
+                            return {x: r.x + r.width / 2, y: r.y + r.height / 2, found: true};
+                        }
+                    }
+                }
+                return {found: false};
+            }""")
+            if close_info and close_info.get("found"):
+                # Use real mouse click for Workday compatibility
+                await page.mouse.click(close_info["x"], close_info["y"])
+                await asyncio.sleep(1.0)
+                if event_callback:
+                    await event_callback("Navigate", "info", "Dismissed Change Email panel")
+        except Exception:
+            pass
+
         if screenshot_callback:
             try:
                 ss = await page.screenshot(type="png")
@@ -714,38 +1505,36 @@ async def handle_workday_application(
         result = {"filled": 0, "failed": 0, "errors": []}
 
         if "information" in current_step.lower():
-            from applicator.form_filler import JS_EXTRACT_FIELDS, map_fields_to_profile, fill_form
-            fields = await page.evaluate(JS_EXTRACT_FIELDS)
-            if fields:
-                mappings = map_fields_to_profile(fields, job_description, company, role)
-                result = await fill_form(page, mappings, resume_path, event_callback=event_callback, screenshot_page=page)
+            # Use hardcoded field filler -- bypasses LLM entirely
+            result = await fill_workday_info_hardcoded(page, event_callback)
+
+            # Handle "How Did You Hear About Us?" promptList dropdown
+            try:
+                await _fill_workday_prompt_dropdown(page, event_callback)
+            except Exception as e:
+                if event_callback:
+                    await event_callback("Fill Form", "warn", f"How Did You Hear handler: {str(e)[:80]}")
+
 
         elif "experience" in current_step.lower():
             result = await handle_my_experience(page, resume_path, event_callback, screenshot_callback)
 
         elif "question" in current_step.lower():
-            from applicator.form_filler import JS_EXTRACT_FIELDS, map_fields_to_profile, fill_form
+            # Scroll to reveal all fields
             for i in range(5):
                 await page.evaluate(f"window.scrollTo(0, {i * 500})")
                 await asyncio.sleep(0.2)
             await page.evaluate("window.scrollTo(0, 0)")
-            fields = await page.evaluate(JS_EXTRACT_FIELDS)
-            if fields:
-                mappings = map_fields_to_profile(fields, job_description, company, role)
-                result = await fill_form(page, mappings, resume_path, event_callback=event_callback, screenshot_page=page)
+            result = await fill_workday_questions_hardcoded(page, company, role, event_callback)
 
         elif "disclos" in current_step.lower() or "identify" in current_step.lower():
             result = await handle_eeo_page(page, event_callback, screenshot_callback)
 
         else:
-            # Unknown — try generic
+            # Unknown step -- try hardcoded questions handler
             if event_callback:
-                await event_callback("Fill Form", "info", f"Unknown step '{current_step}', trying generic filler")
-            from applicator.form_filler import JS_EXTRACT_FIELDS, map_fields_to_profile, fill_form
-            fields = await page.evaluate(JS_EXTRACT_FIELDS)
-            if fields:
-                mappings = map_fields_to_profile(fields, job_description, company, role)
-                result = await fill_form(page, mappings, resume_path, event_callback=event_callback, screenshot_page=page)
+                await event_callback("Fill Form", "info", f"Unknown step '{current_step}', trying hardcoded filler")
+            result = await fill_workday_questions_hardcoded(page, company, role, event_callback)
 
         total_filled += result.get("filled", 0)
         total_failed += result.get("failed", 0)

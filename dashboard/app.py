@@ -3,6 +3,7 @@ import sys
 import json
 import os
 import base64
+# Reload trigger - forces uvicorn to restart the stuck worker
 import time
 from datetime import datetime
 from pathlib import Path
@@ -28,6 +29,66 @@ screenshot_version: int = 0  # incremented each time screenshot changes
 browser_instance = None  # Keep browser ref for screenshots
 active_page = None       # Current Playwright page - stays valid while browser open
 active_context = None    # Browser context - needed for new tabs (email verify)
+last_cdp_url = None      # CDP URL for reconnecting to browser-use Chromium
+
+# Persist CDP URL to file so it survives server reloads
+_CDP_URL_FILE = Path(__file__).parent.parent / ".cdp_url"
+def _save_cdp_url(url: str):
+    global last_cdp_url
+    last_cdp_url = url
+    try:
+        _CDP_URL_FILE.write_text(url)
+    except Exception:
+        pass
+
+def _load_cdp_url() -> str:
+    global last_cdp_url
+    if last_cdp_url:
+        return last_cdp_url
+    try:
+        if _CDP_URL_FILE.exists():
+            url = _CDP_URL_FILE.read_text().strip()
+            if url:
+                last_cdp_url = url
+                return url
+    except Exception:
+        pass
+    return ""
+
+async def _reconnect_via_cdp(event_label="Reconnect") -> "Page | None":
+    """Try to reconnect to browser-use Chromium via saved CDP URL."""
+    global active_page, active_context
+    cdp_url = _load_cdp_url()
+    if not cdp_url:
+        return None
+    try:
+        from playwright.async_api import async_playwright
+        add_event(event_label, "info", f"Reconnecting via CDP: {cdp_url[:50]}...")
+        pw = await async_playwright().start()
+        browser_pw = await pw.chromium.connect_over_cdp(cdp_url)
+        contexts = browser_pw.contexts
+        page = None
+        if contexts:
+            pages = contexts[0].pages
+            for p in reversed(pages):
+                if p.url and "about:blank" not in p.url:
+                    page = p
+                    break
+            if not page and pages:
+                page = pages[-1]
+        if page:
+            active_page = page
+            try:
+                active_context = page.context
+            except Exception:
+                pass
+            add_event(event_label, "success", f"Reconnected: {page.url[:60]}")
+            print(f">>> CDP reconnect success: {page.url[:80]}")
+        return page
+    except Exception as e:
+        print(f">>> CDP reconnect failed: {e}")
+        add_event(event_label, "warning", f"CDP reconnect failed: {str(e)[:80]}")
+        return None
 
 # File uploads directory
 UPLOADS_DIR = Path(__file__).parent.parent / "uploads"
@@ -1068,7 +1129,7 @@ async def continue_application_endpoint():
     page = active_page
     print(f">>> active_page: {active_page}")
     if not page:
-        # Fallback: try browser-use browser
+        # Fallback 1: try browser-use browser
         print(">>> trying _bu_browser fallback...")
         try:
             from applicator.form_filler import _bu_browser
@@ -1087,6 +1148,10 @@ async def continue_application_endpoint():
                 print(">>> _bu_browser is None")
         except Exception as e:
             print(f">>> _bu_browser fallback failed: {e}")
+
+    if not page:
+        # Fallback 2: Reconnect via CDP URL (file-backed, survives server reload)
+        page = await _reconnect_via_cdp("Continue")
 
     if not page:
         msg = "No browser page available. Start an application first."
@@ -1116,6 +1181,11 @@ async def continue_application_endpoint():
                     print(f">>> refreshed page from _bu_browser: {current_url[:80]}")
         except Exception as e2:
             print(f">>> _bu_browser refresh also failed: {e2}")
+        # Try CDP reconnect as last resort
+        if not page:
+            page = await _reconnect_via_cdp("Continue")
+            if page:
+                current_url = page.url
         if not page:
             active_page = None
             add_event("Continue", "error", "Browser page closed. Start a new application.")
@@ -1382,7 +1452,7 @@ async def continue_application_endpoint():
             fields = await page.evaluate(JS_EXTRACT_FIELDS)
             if fields:
                 company = await page.evaluate("document.title") or ""
-                mappings = map_fields_to_profile(fields, "", company, "")
+                mappings = await asyncio.to_thread(map_fields_to_profile, fields, "", company, "")
                 mappings = [m for m in mappings if isinstance(m, dict)]
                 async def on_evt(s, st, d=""):
                     add_event(s, st, d)
@@ -2354,7 +2424,7 @@ async def _run_application(url: str, company: str, role: str):
     active_page = None
     active_context = None
 
-    # Close any previous browser before starting a new one
+    # ── Clean restart: kill old browser refs and orphan processes ──
     if browser_instance:
         try:
             await browser_instance.close()
@@ -2367,8 +2437,24 @@ async def _run_application(url: str, company: str, role: str):
         await cba()
     except Exception:
         pass
+    # Reset form_filler module-level browser refs in case uvicorn --reload made them stale
+    try:
+        import applicator.form_filler as _ff
+        _ff._bu_browser = None
+        _ff._pw_for_cdp = None
+        _ff._playwright = None
+        _ff._browser = None
+    except Exception:
+        pass
+    # Kill orphan Chromium processes left behind by previous server reloads
+    try:
+        import subprocess as _sp
+        _sp.run(["pkill", "-f", "chromium.*--remote-debugging"], timeout=5, capture_output=True)
+    except Exception:
+        pass
+    await asyncio.sleep(1)  # Give OS time to clean up
 
-    resume_path = uploaded_resume or r"C:\Users\Owner\Downloads\EdrickChang.pdf"
+    resume_path = uploaded_resume or str(Path(__file__).parent.parent / "uploads" / "EdrickChang_Resume.pdf")
 
     try:
         # Step 1: Extract JD
@@ -2410,6 +2496,16 @@ async def _run_application(url: str, company: str, role: str):
         browser_instance = result.get("browser")
         page = result.get("page")
         completed = result.get("completed", False)
+
+        # Save CDP URL for later reconnection (persisted to file)
+        try:
+            from applicator.form_filler import _bu_browser
+            if _bu_browser and hasattr(_bu_browser, 'cdp_url') and _bu_browser.cdp_url:
+                _save_cdp_url(_bu_browser.cdp_url)
+                print(f">>> Saved CDP URL: {_bu_browser.cdp_url}")
+                add_event("Pipeline", "info", f"Saved CDP URL for reconnection: {_bu_browser.cdp_url[:50]}")
+        except Exception as e:
+            print(f">>> Could not save CDP URL: {e}")
 
         # Set global page refs for Continue/Email Verify buttons
         # If result didn't include a page, try getting it from _bu_browser directly
@@ -2561,7 +2657,7 @@ async def _run_application(url: str, company: str, role: str):
                 from applicator.form_filler import JS_EXTRACT_FIELDS, map_fields_to_profile, fill_form
                 fields = await page.evaluate(JS_EXTRACT_FIELDS)
                 if fields:
-                    mappings = map_fields_to_profile(fields, jd, company, role)
+                    mappings = await asyncio.to_thread(map_fields_to_profile, fields, jd, company, role)
                     mappings = [m for m in mappings if isinstance(m, dict)]
                     async def fallback_evt(s, st, d=""):
                         add_event(s, st, d)
@@ -2788,7 +2884,10 @@ async def _run_application(url: str, company: str, role: str):
                             pass
                         print(f">>> finally: recovered active_page from _bu_browser: {recovered.url[:60]}")
             except Exception as e:
-                print(f">>> finally: could not recover page: {e}")
+                print(f">>> finally: could not recover page from _bu_browser: {e}")
+            # Also try CDP reconnect
+            if not active_page:
+                recovered = await _reconnect_via_cdp("Finally")
         print(f">>> finally: active_page={active_page}")
         pipeline_running = False
 
