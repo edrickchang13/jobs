@@ -1120,6 +1120,42 @@ async def screenshot_stream():
     return StreamingResponse(stream(), media_type="text/event-stream")
 
 
+@app.get("/test_llm")
+async def test_llm_providers():
+    """Test which LLM providers are working. Hit this in browser to check status."""
+    import asyncio as _aio
+    from openai import OpenAI as _OAI
+    import os as _os
+    results = {}
+    ollama_model = _os.getenv("OLLAMA_MODEL", "")
+    ollama_base  = _os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
+    providers = [
+        ("ollama (local)",  ollama_base,                                                   "ollama",                         ollama_model or "qwen2.5:72b"),
+        ("gemini",          "https://generativelanguage.googleapis.com/v1beta/openai/",    _os.getenv("GEMINI_API_KEY"),     "gemini-2.0-flash"),
+        ("cerebras",        "https://api.cerebras.ai/v1",                                  _os.getenv("CEREBRAS_API_KEY"),   "qwen-3-235b-a22b-instruct-2507"),
+        ("groq",            "https://api.groq.com/openai/v1",                              _os.getenv("GROQ_API_KEY"),       "llama-3.3-70b-versatile"),
+    ]
+    for name, base_url, key, model in providers:
+        if name.startswith("ollama") and not ollama_model:
+            results[name] = "NOT CONFIGURED (set OLLAMA_MODEL in .env)"
+            continue
+        if not key and not name.startswith("ollama"):
+            results[name] = "NO KEY"
+            continue
+        try:
+            client = _OAI(base_url=base_url, api_key=key, timeout=15.0)
+            resp = await _aio.to_thread(
+                lambda c=client, m=model: c.chat.completions.create(
+                    model=m, max_tokens=5,
+                    messages=[{"role":"user","content":"Reply OK"}]
+                )
+            )
+            results[name] = f"OK — '{resp.choices[0].message.content.strip()[:30]}'"
+        except Exception as e:
+            results[name] = f"FAIL: {str(e)[:120]}"
+    return JSONResponse(results)
+
+
 @app.post("/continue")
 async def continue_application_endpoint():
     """Analyze current page and TAKE ACTION: fill credentials, run Workday handler, fill forms."""
@@ -1202,7 +1238,7 @@ async def continue_application_endpoint():
     add_event("Continue", "info", f"Analyzing: {current_url[:80]}")
 
     try:
-        state = await page.evaluate("""() => {
+        state = await asyncio.wait_for(page.evaluate("""() => {
             const t = document.body.innerText.toLowerCase();
             const url = window.location.href.toLowerCase();
             return {
@@ -1226,7 +1262,7 @@ async def continue_application_endpoint():
                 activeStep: (() => { const s = document.querySelector('[data-automation-id="progressBarActiveStep"]'); return s ? s.innerText.trim() : ''; })(),
                 buttons: Array.from(document.querySelectorAll('button')).filter(b => b.offsetParent !== null).map(b => b.innerText.trim().substring(0,40)).filter(t => t).slice(0,10),
             };
-        }""")
+        }"""), timeout=15.0)
 
         # --- SUCCESS ---
         if state.get("isSuccess"):
@@ -1430,6 +1466,177 @@ async def continue_application_endpoint():
             step = state.get("activeStep", "Unknown")
             add_event("Continue", "info", f"Workday wizard step: {step}. Running handler...")
 
+            # === DIRECT DROPDOWN FILLER (bypasses workday_handler module caching issues) ===
+            # First try to fill Application Questions dropdowns directly via Playwright
+            try:
+                dropdown_info = await asyncio.wait_for(page.evaluate("""() => {
+                    const results = [];
+                    const containers = document.querySelectorAll('[data-automation-id^="formField-"]');
+                    for (const c of containers) {
+                        if (c.offsetParent === null) continue;
+                        // Look for Workday dropdown buttons or native selects
+                        const btn = c.querySelector('button[aria-haspopup], [data-automation-id="selectWidget"], [data-automation-id="dropdownWidget"]');
+                        const sel = c.querySelector('select');
+                        const dropEl = btn || sel;
+                        if (!dropEl) continue;
+
+                        const dropText = (dropEl.innerText || dropEl.textContent || '').trim();
+                        if (sel) {
+                            if (sel.selectedIndex > 0) continue;
+                        } else {
+                            if (dropText && !dropText.toLowerCase().includes('select') && dropText !== '--') continue;
+                        }
+
+                        // Extract label using multiple strategies
+                        const dataid = c.getAttribute('data-automation-id') || '';
+                        let label = '';
+
+                        // Strategy 1 (PRIMARY): formLabel-<uuid> is a SIBLING of formField-<uuid> in Workday
+                        if (!label && dataid.startsWith('formField-')) {
+                            const uuid = dataid.replace('formField-', '');
+                            const formLabel = document.querySelector('[data-automation-id="formLabel-' + uuid + '"]');
+                            if (formLabel) label = formLabel.innerText.trim();
+                        }
+                        // Strategy 2: check parent element for any label siblings
+                        if (!label) {
+                            const parent = c.parentElement;
+                            if (parent) {
+                                const allLabels = parent.querySelectorAll('[data-automation-id*="formLabel"], [data-automation-id*="label"], label');
+                                for (const pl of allLabels) {
+                                    if (!c.contains(pl)) { label = pl.innerText.trim(); if (label) break; }
+                                }
+                            }
+                        }
+                        // Strategy 3: label inside container
+                        if (!label) { const lbl = c.querySelector('label'); if (lbl) label = lbl.innerText.trim(); }
+                        // Strategy 4: aria-label on the dropdown element
+                        if (!label) { label = dropEl.getAttribute('aria-label') || ''; }
+                        // Strategy 5: aria-labelledby
+                        if (!label) {
+                            const lid = dropEl.getAttribute('aria-labelledby');
+                            if (lid) {
+                                const parts = lid.split(' ');
+                                for (const p of parts) { const r = document.getElementById(p); if (r) { const t = r.innerText.trim(); if (t && !t.toLowerCase().includes('select one')) { label = t; break; } } }
+                            }
+                        }
+                        // Strategy 6: legend
+                        if (!label) { const leg = c.querySelector('legend'); if (leg) label = leg.innerText.trim(); }
+                        const rect = dropEl.getBoundingClientRect();
+                        results.push({
+                            label, dataid, isNativeSelect: !!sel, currentText: dropText,
+                            x: rect.x + rect.width / 2, y: rect.y + rect.height / 2,
+                            tagName: dropEl.tagName, outerSnippet: dropEl.outerHTML.slice(0, 120),
+                        });
+                    }
+                    return results;
+                }"""), timeout=10.0)
+
+                add_event("Continue", "info", f"Direct scan: found {len(dropdown_info or [])} unfilled dropdown(s)")
+                filled_direct = 0
+
+                # Answer mapping for yes/no Application Questions
+                answer_map = {
+                    "unrestricted": "Yes",
+                    "authorization to work": "Yes",
+                    "authorized to work": "Yes",
+                    "sponsorship": "No",
+                    "non-compete": "No",
+                    "employment agreement": "No",
+                    "contractor": "No",
+                    "auditor": "No",
+                    "kpmg": "No",
+                    "bsr": "No",
+                    "previously employed": "No",
+                }
+
+                for dd in (dropdown_info or []):
+                    lbl = dd.get("label", "")
+                    add_event("Continue", "info", f"DD: label='{lbl[:70]}' tag={dd.get('tagName','')} native={dd.get('isNativeSelect')} dataid={dd.get('dataid','')[:30]}")
+
+                    if not lbl:
+                        add_event("Continue", "warn", f"Empty label, snippet: {dd.get('outerSnippet','')[:80]}")
+                        continue
+
+                    lbl_lower = lbl.lower()
+                    answer = None
+                    for pattern, ans in answer_map.items():
+                        if pattern in lbl_lower:
+                            answer = ans
+                            break
+
+                    if not answer:
+                        add_event("Continue", "warn", f"No answer for: '{lbl[:60]}'")
+                        continue
+
+                    add_event("Continue", "info", f"Filling '{answer}' for '{lbl[:50]}'")
+
+                    if dd.get("isNativeSelect"):
+                        try:
+                            sel_locator = f'[data-automation-id="{dd["dataid"]}"] select'
+                            await page.locator(sel_locator).first.select_option(label=answer)
+                            filled_direct += 1
+                            add_event("Continue", "success", f"Selected '{answer}' for '{lbl[:40]}'")
+                        except Exception as e:
+                            add_event("Continue", "warn", f"Native select err: {str(e)[:60]}")
+                    else:
+                        # Custom Workday dropdown: click to open, then pick option
+                        try:
+                            await page.mouse.click(dd["x"], dd["y"])
+                            await asyncio.sleep(0.6)
+
+                            # Try to find and click matching option
+                            option_clicked = False
+                            options = page.locator('[role="option"], [role="listbox"] [role="option"], [data-automation-id*="option"]')
+                            count = await options.count()
+                            add_event("Continue", "info", f"Popup options: {count}")
+                            for i in range(count):
+                                opt = options.nth(i)
+                                text = (await opt.inner_text()).strip()
+                                if text.lower() == answer.lower():
+                                    await opt.click(timeout=3000)
+                                    option_clicked = True
+                                    filled_direct += 1
+                                    add_event("Continue", "success", f"Clicked '{answer}' for '{lbl[:40]}'")
+                                    break
+
+                            if not option_clicked:
+                                # JS fallback
+                                js_ok = await page.evaluate(f"""() => {{
+                                    const opts = document.querySelectorAll('[role="option"], [role="listbox"] li, [data-automation-id*="option"]');
+                                    for (const o of opts) {{
+                                        if (o.innerText.trim().toLowerCase() === '{answer.lower()}') {{ o.click(); return true; }}
+                                    }}
+                                    return false;
+                                }}""")
+                                if js_ok:
+                                    filled_direct += 1
+                                    add_event("Continue", "success", f"JS-clicked '{answer}' for '{lbl[:40]}'")
+                                else:
+                                    await page.keyboard.press("Escape")
+                                    add_event("Continue", "warn", f"No '{answer}' option found for '{lbl[:40]}'")
+                            await asyncio.sleep(0.5)
+                        except Exception as e:
+                            add_event("Continue", "warn", f"Custom DD err: {str(e)[:60]}")
+
+                if filled_direct > 0:
+                    add_event("Continue", "success", f"Direct filler: {filled_direct} dropdown(s) filled!")
+                    # Click Save and Continue
+                    try:
+                        next_btn = page.locator('button:has-text("Save and Continue"), button:has-text("Next"), button[data-automation-id="bottom-navigation-next-button"]')
+                        if await next_btn.count() > 0:
+                            await next_btn.first.click(timeout=5000)
+                            add_event("Continue", "info", "Clicked Save and Continue")
+                    except Exception:
+                        pass
+                    return JSONResponse({"status": "ok", "action": "workday_direct"})
+
+            except Exception as e:
+                add_event("Continue", "warn", f"Direct dropdown scan error: {str(e)[:80]}")
+
+            # === FALLBACK: Use workday_handler module ===
+            import importlib
+            import applicator.workday_handler as _wh_mod
+            importlib.reload(_wh_mod)
             from applicator.workday_handler import handle_workday_application
             async def on_evt(s, st, d=""):
                 add_event(s, st, d)
@@ -1439,7 +1646,14 @@ async def continue_application_endpoint():
                     latest_screenshot_b64 = base64.b64encode(b).decode("utf-8")
                     screenshot_version += 1
 
-            result = await handle_workday_application(page, resume_path, "", "", "", on_evt, on_ss)
+            try:
+                result = await asyncio.wait_for(
+                    handle_workday_application(page, resume_path, "", "", "", on_evt, on_ss),
+                    timeout=180.0  # 3 minute max for Workday handler
+                )
+            except asyncio.TimeoutError:
+                add_event("Continue", "error", "Workday handler timed out after 3 minutes. Click Continue to retry.")
+                return JSONResponse({"status": "ok", "action": "timeout"})
             add_event("Continue", "success" if not result.get("errors") else "info",
                 f"Workday: {result.get('filled',0)} filled, {result.get('failed',0)} failed. Click Continue if more steps remain.")
             return JSONResponse({"status": "ok", "action": "workday"})
@@ -2921,4 +3135,5 @@ async def _background_screenshot_loop():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8080, loop="asyncio")
+    _host = "0.0.0.0" if os.getenv("REMOTE", "0") == "1" else "127.0.0.1"
+    uvicorn.run(app, host=_host, port=8080, loop="asyncio")

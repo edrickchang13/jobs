@@ -120,6 +120,11 @@ async def _detect_workday_page_state(page) -> str:
         return await page.evaluate("""() => {
             const t = document.body.innerText.toLowerCase();
 
+            // Error page ("Something went wrong") — check FIRST since error page still has progress bar
+            if (t.includes('something went wrong') || t.includes('please refresh the page')) {
+                return 'error';
+            }
+
             // Auth page (sign in or create account)
             if (document.querySelector('[data-automation-id="signInContent"]')
                 || document.querySelector('[data-automation-id="createAccountLink"]')
@@ -207,7 +212,8 @@ async def fill_with_browser_agent(
         dont_force_structured_output=True,
     )
 
-    _bu_browser = Browser(headless=False, keep_alive=True, disable_security=True)
+    _headless = os.getenv("HEADLESS", "false").lower() == "true"
+    _bu_browser = Browser(headless=_headless, keep_alive=True, disable_security=True)
 
     # ====================================================================
     # PHASE 1: Agent ONLY navigates + clicks Apply. Does NOT handle auth.
@@ -220,7 +226,7 @@ YOUR TASK IS LIMITED — do ONLY these steps, then STOP:
 
 1. Navigate to the URL above
 2. Click "Apply" or "Apply Now" button. On Workday sites the button may be a link with text "Apply" inside an element with data-uxi-element-id="Apply_adventureButton".
-3. If you see a "Start Your Application" dialog with options like "Apply Manually", "Autofill with Resume", or "Use My Last Application": click "Use My Last Application" if available, otherwise click "Apply Manually". Do NOT click "Autofill with Resume".
+3. If you see a "Start Your Application" dialog with options like "Apply Manually", "Autofill with Resume", or "Use My Last Application": click "Autofill with Resume" (preferred). If not available, click "Apply Manually". Do NOT click "Use My Last Application" (it causes errors).
 4. If you see a cookie consent banner, click "Accept" or "Accept All"
 
 STOP CONDITIONS — stop immediately when you see ANY of these:
@@ -402,7 +408,7 @@ Report what page you're on when you stop."""
                 const btns = document.querySelectorAll('button, a[role="button"], div[role="button"]');
                 for (const btn of btns) {
                     const text = (btn.innerText || btn.textContent || '').trim().toLowerCase();
-                    if (text === 'use my last application' || text === 'apply manually') {
+                    if (text === 'autofill with resume' || text === 'apply manually') {
                         const r = btn.getBoundingClientRect();
                         return {text: text, x: r.x + r.width / 2, y: r.y + r.height / 2, found: true};
                     }
@@ -413,7 +419,7 @@ Report what page you're on when you stop."""
                 btn_text = modal_handled.get("text", "")
                 if event_callback:
                     await event_callback("Navigate", "info", f"Found '{btn_text}' modal button, clicking...")
-                # Prefer "Use My Last Application" to re-use previous data
+                # Click "Autofill with Resume" or "Apply Manually" (avoid "Use My Last Application")
                 await page.mouse.click(modal_handled["x"], modal_handled["y"])
                 await asyncio.sleep(5.0)
                 state = await _detect_workday_page_state(page)
@@ -478,8 +484,8 @@ Report what page you're on when you stop."""
                     try:
                         modal_btn = await page.evaluate("""() => {
                             const btns = document.querySelectorAll('button, a[role="button"], div[role="button"], [data-automation-id="applyManually"]');
-                            // Prefer "Use My Last Application" > "Apply Manually"
-                            const preferred = ['use my last application', 'apply manually'];
+                            // Prefer "Autofill with Resume" > "Apply Manually" (avoid "Use My Last Application")
+                            const preferred = ['autofill with resume', 'apply manually'];
                             for (const pref of preferred) {
                                 for (const btn of btns) {
                                     const text = (btn.innerText || btn.textContent || '').trim().toLowerCase();
@@ -586,6 +592,61 @@ Report what page you're on when you stop."""
                     if event_callback:
                         await event_callback("Auth", "error", f"Verification error: {e}")
 
+        # Handle "Something went wrong" error page — reload and retry
+        if state == "error":
+            if event_callback:
+                await event_callback("Navigate", "warning", "Workday error page detected. Refreshing...")
+            try:
+                await page.reload(wait_until="domcontentloaded")
+                await asyncio.sleep(5)
+                state = await _detect_workday_page_state(page)
+                if event_callback:
+                    await event_callback("Navigate", "info", f"After refresh: state={state}")
+            except Exception:
+                pass
+
+            # If still error after refresh, navigate to the application URL directly
+            if state == "error" or state == "unknown":
+                if event_callback:
+                    await event_callback("Navigate", "info", "Still error. Re-navigating to application URL...")
+                try:
+                    await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                    await asyncio.sleep(5)
+                    state = await _detect_workday_page_state(page)
+                    if event_callback:
+                        await event_callback("Navigate", "info", f"After re-navigate: state={state}")
+
+                    # Handle the Start Your Application modal again
+                    if state == "unknown":
+                        modal_btn = await page.evaluate("""() => {
+                            const btns = document.querySelectorAll('button, a[role="button"], div[role="button"]');
+                            for (const btn of btns) {
+                                const text = (btn.innerText || btn.textContent || '').trim().toLowerCase();
+                                if (text === 'apply manually') {
+                                    const r = btn.getBoundingClientRect();
+                                    return {text: text, x: r.x + r.width / 2, y: r.y + r.height / 2, found: true};
+                                }
+                            }
+                            // Try Apply button if no modal
+                            const applyLink = document.querySelector('a[data-uxi-element-id="Apply_adventureButton"]');
+                            if (applyLink) {
+                                const r = applyLink.getBoundingClientRect();
+                                return {text: 'apply', x: r.x + r.width / 2, y: r.y + r.height / 2, found: true};
+                            }
+                            return {found: false};
+                        }""")
+                        if modal_btn and modal_btn.get("found"):
+                            await page.mouse.click(modal_btn["x"], modal_btn["y"])
+                            await asyncio.sleep(5)
+                            state = await _detect_workday_page_state(page)
+                            if state == "auth":
+                                await _handle_workday_auth(page, event_callback)
+                                await asyncio.sleep(3)
+                                state = await _detect_workday_page_state(page)
+                except Exception as e:
+                    if event_callback:
+                        await event_callback("Navigate", "error", f"Re-navigate error: {e}")
+
         # ====================================================================
         # PHASE 3: Fill multi-step Workday form automatically
         # ====================================================================
@@ -637,16 +698,27 @@ Report what page you're on when you stop."""
                   current_url = page.url.lower()
               except Exception:
                   current_url = (await page.evaluate("window.location.href")).lower()
-              has_apply_in_url = "/apply" in current_url or "application" in current_url
+              has_apply_in_url = "/apply" in current_url or "/application" in current_url
               if not has_apply_in_url:
                   if event_callback:
                       await event_callback("Navigate", "info", "Not on application form yet — clicking Apply button...")
                   apply_selectors = [
-                      'a:text-is("Apply")', 'button:text-is("Apply")',
-                      'a:has-text("Apply Now")', 'button:has-text("Apply Now")',
+                      # Greenhouse-specific
+                      'a[href*="/apply"]',                         # any href containing /apply
+                      '[data-qa="btn-apply"]',                    # Greenhouse data-qa
+                      '[data-qa="btn-apply-now"]',
+                      '#apply_button',                            # Greenhouse legacy id
+                      '.btn-apply', 'a.js-btn-apply',
+                      'a.btn[href*="apply"]',
+                      # Generic apply button text (case insensitive via has-text)
                       'a:has-text("Apply for this job")', 'button:has-text("Apply for this job")',
-                      '#apply_button', '.apply-button', '[data-qa="btn-apply"]',
-                      'a.postings-btn',  # Lever
+                      'a:has-text("Apply for this Job")', 'button:has-text("Apply for this Job")',
+                      'a:has-text("Apply Now")', 'button:has-text("Apply Now")',
+                      'a:has-text("Apply now")', 'button:has-text("Apply now")',
+                      'a:text-is("Apply")', 'button:text-is("Apply")',
+                      '.apply-button', '[class*="apply-btn"]', '[class*="applyBtn"]',
+                      'a.postings-btn',                           # Lever
+                      '[data-automation-id="btn-apply"]',
                   ]
                   apply_clicked = False
                   for sel in apply_selectors:
@@ -661,6 +733,33 @@ Report what page you're on when you stop."""
                               break
                       except Exception:
                           continue
+
+                  # JS fallback: find any visible button/link with "apply" in text
+                  if not apply_clicked:
+                      try:
+                          clicked = await page.evaluate("""() => {
+                              const els = [...document.querySelectorAll('a, button, [role="button"]')];
+                              for (const el of els) {
+                                  if (el.offsetParent === null) continue;
+                                  const text = (el.innerText || el.textContent || '').trim().toLowerCase();
+                                  const href = (el.href || '').toLowerCase();
+                                  if (text === 'apply' || text.startsWith('apply for') || text === 'apply now'
+                                      || href.includes('/apply')) {
+                                      el.click();
+                                      return el.tagName + ': ' + (el.innerText || '').trim().slice(0, 40);
+                                  }
+                              }
+                              return null;
+                          }""")
+                          if clicked:
+                              apply_clicked = True
+                              if event_callback:
+                                  await event_callback("Navigate", "success", f"Clicked Apply via JS fallback: {clicked}")
+                              await asyncio.sleep(3.0)
+                      except Exception as e:
+                          if event_callback:
+                              await event_callback("Navigate", "info", f"JS Apply fallback error: {e}")
+
                   if not apply_clicked and event_callback:
                       await event_callback("Navigate", "warning", "Could not find Apply button — trying to fill current page")
                   # Take screenshot after clicking Apply
@@ -673,6 +772,72 @@ Report what page you're on when you stop."""
           except Exception as e:
               if event_callback:
                   await event_callback("Navigate", "info", f"Apply button check error: {e}")
+
+          # === DIRECT PRE-FILL: fill standard personal info fields without LLM ===
+          # These never change so we fill them immediately via Playwright keyboard input.
+          # This handles both main-page and iframe-embedded forms (Greenhouse embedded boards).
+          try:
+              pi = _load_personal_info()
+              direct_fills = {
+                  # label patterns → value
+                  "first": pi.get("first_name", "Edrick"),
+                  "last": pi.get("last_name", "Chang"),
+                  "email": pi.get("email", "eachang@scu.edu"),
+                  "phone": pi.get("phone", "4088066495"),
+                  "linkedin": pi.get("linkedin_url", "https://linkedin.com/in/edrickchang"),
+                  "github": pi.get("github_url", "https://github.com/edrickchang"),
+                  "website": pi.get("portfolio_url", ""),
+              }
+              # Try both main page and all frames
+              fill_targets = [page] + [f for f in page.frames if f != page.main_frame]
+              for fill_ctx in fill_targets:
+                  try:
+                      inputs = await fill_ctx.evaluate("""() => {
+                          const results = [];
+                          for (const el of document.querySelectorAll('input[type="text"], input[type="email"], input[type="tel"], input:not([type])')) {
+                              if (el.offsetParent === null) continue;
+                              if (el.value && el.value.trim()) continue;  // already filled
+                              const label = (el.getAttribute('aria-label') || el.placeholder || el.name || el.id || '').toLowerCase();
+                              const r = el.getBoundingClientRect();
+                              results.push({label, x: r.x + r.width/2, y: r.y + r.height/2,
+                                  name: el.name || '', id: el.id || '', placeholder: el.placeholder || ''});
+                          }
+                          return results;
+                      }""")
+                      for inp in (inputs or []):
+                          lbl = inp.get("label", "")
+                          val = None
+                          if any(k in lbl for k in ["first", "fname", "given"]):
+                              val = direct_fills["first"]
+                          elif any(k in lbl for k in ["last", "lname", "surname", "family"]):
+                              val = direct_fills["last"]
+                          elif "email" in lbl:
+                              val = direct_fills["email"]
+                          elif any(k in lbl for k in ["phone", "mobile", "cell"]):
+                              val = direct_fills["phone"]
+                          elif "linkedin" in lbl:
+                              val = direct_fills["linkedin"]
+                          elif "github" in lbl:
+                              val = direct_fills["github"]
+                          elif any(k in lbl for k in ["website", "portfolio", "url"]):
+                              val = direct_fills.get("website", "")
+                          if val:
+                              try:
+                                  await fill_ctx.mouse.click(inp["x"], inp["y"])
+                                  await asyncio.sleep(0.1)
+                                  await fill_ctx.keyboard.press("Control+a")
+                                  await fill_ctx.keyboard.type(val, delay=20)
+                                  await fill_ctx.keyboard.press("Tab")
+                                  if event_callback:
+                                      await event_callback("Pre-Fill", "info", f"Filled '{lbl[:30]}' = '{val[:30]}'")
+                              except Exception as pfe:
+                                  if event_callback:
+                                      await event_callback("Pre-Fill", "info", f"Skip '{lbl[:30]}': {pfe}")
+                  except Exception:
+                      continue
+          except Exception as pre_e:
+              if event_callback:
+                  await event_callback("Pre-Fill", "info", f"Pre-fill error: {pre_e}")
 
           for page_num in range(max_pages):
             try:
@@ -764,12 +929,19 @@ Report what page you're on when you stop."""
                             if len(fields) == 0:
                                 break
 
+                        if event_callback:
+                            field_labels = [f.get("label") or f.get("name") or f.get("placeholder","?") for f in fields[:8]]
+                            await event_callback("LLM Map", "info", f"Sending {len(fields)} fields to LLM: {field_labels}")
                         mappings = await asyncio.to_thread(map_fields_to_profile, fields, job_description, company, role)
                         # Ensure all mappings are dicts (LLM may return strings)
                         mappings = [m for m in mappings if isinstance(m, dict)]
+                        if event_callback:
+                            await event_callback("LLM Map", "info", f"LLM returned {len(mappings)} mappings")
                         if pass_num > 0:
                             mappings = [m for m in mappings if m.get("action") != "skip" or m.get("value")]
                         if not mappings:
+                            if event_callback:
+                                await event_callback("LLM Map", "error", "LLM returned no mappings — check API key or rate limit")
                             break
 
                         result = await fill_form(form_ctx, mappings, resume_path,
@@ -784,9 +956,14 @@ Report what page you're on when you stop."""
                     except Exception as e:
                         import traceback as _tb
                         tb_str = _tb.format_exc()
+                        err_str = str(e)
                         if event_callback:
-                            await event_callback("Form Fill", "error", f"Page {page_num+1} pass {pass_num+1} error: {e}")
-                            await event_callback("Form Fill", "info", f"Traceback: {tb_str[:800]}")
+                            await event_callback("Form Fill", "error", f"Page {page_num+1} pass {pass_num+1}: {err_str[:200]}")
+                            # Surface rate limit / auth errors clearly
+                            if any(k in err_str.lower() for k in ["rate", "429", "quota", "api key", "auth", "context"]):
+                                await event_callback("LLM Error", "error", f"LLM provider failed: {err_str[:300]}")
+                            else:
+                                await event_callback("Form Fill", "info", f"Traceback: {tb_str[:600]}")
                         break
 
                 total_filled += page_filled
@@ -1330,24 +1507,38 @@ JS_EXTRACT_FIELDS = """
 """
 
 
-def _get_llm_client(provider="cerebras"):
-    """Get LLM client. Supports 'cerebras' (primary) and 'groq' (fallback)."""
+def _get_llm_client(provider="gemini"):
+    """Get LLM client.
+    Priority: ollama (local DGX) > gemini > cerebras > groq.
+    Set OLLAMA_MODEL in .env to activate local inference.
+    """
+    if provider == "ollama":
+        base = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
+        return OpenAI(base_url=base, api_key="ollama", timeout=120.0)
     if provider == "groq":
         return OpenAI(
             base_url="https://api.groq.com/openai/v1",
             api_key=os.getenv("GROQ_API_KEY"),
-            timeout=30.0,  # 30 second timeout to prevent server hangs
+            timeout=30.0,
         )
-    # Default: Cerebras API (free tier, 1M tokens/day)
+    if provider == "cerebras":
+        return OpenAI(
+            base_url="https://api.cerebras.ai/v1",
+            api_key=os.getenv("CEREBRAS_API_KEY"),
+            timeout=30.0,
+        )
+    # Default: Gemini via OpenAI-compatible endpoint (1M context, free tier)
     return OpenAI(
-        base_url="https://api.cerebras.ai/v1",
-        api_key=os.getenv("CEREBRAS_API_KEY"),
-        timeout=30.0,  # 30 second timeout to prevent server hangs
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+        api_key=os.getenv("GEMINI_API_KEY"),
+        timeout=60.0,
     )
 
-# Model to use for field mapping LLM calls
-_LLM_MODEL = "qwen-3-235b-a22b-instruct-2507"
-_GROQ_MODEL = "llama-3.3-70b-versatile"
+# Model names per provider
+_OLLAMA_MODEL   = os.getenv("OLLAMA_MODEL", "qwen2.5:72b")   # local DGX Spark (no limits)
+_GEMINI_MODEL   = "gemini-2.0-flash"                          # 1M context, 1500 req/day free
+_LLM_MODEL      = "qwen-3-235b-a22b-instruct-2507"            # Cerebras (8K ctx fallback)
+_GROQ_MODEL     = "llama-3.3-70b-versatile"                   # Groq last resort
 
 
 def _parse_json_response(text: str) -> list:
@@ -1490,10 +1681,14 @@ REMEMBER: Fill EVERY actual form field. Only use "skip" for optional cover lette
     # this in a thread pool (asyncio.to_thread) to avoid blocking the event loop.
     import time as _time
 
-    # Try providers in order: Cerebras (primary), then Groq (fallback)
-    providers = [
-        ("cerebras", _LLM_MODEL, client),
-        ("groq", _GROQ_MODEL, _get_llm_client("groq")),
+    # Build provider list. Ollama (local DGX) goes first if OLLAMA_MODEL is set.
+    providers = []
+    if os.getenv("OLLAMA_MODEL"):
+        providers.append(("ollama", _OLLAMA_MODEL, _get_llm_client("ollama")))
+    providers += [
+        ("gemini",   _GEMINI_MODEL, _get_llm_client("gemini")),
+        ("cerebras", _LLM_MODEL,    _get_llm_client("cerebras")),
+        ("groq",     _GROQ_MODEL,   _get_llm_client("groq")),
     ]
     last_error = None
     for provider_name, model, llm_client in providers:
@@ -2323,6 +2518,45 @@ async def _handle_workday_apply(page, resume_path, event_callback=None, screensh
             if event_callback:
                 await event_callback("Fill Form", "success", "Workday: Reached Review page - stopping before submit")
             break
+
+        # Check for "Something went wrong" error page — refresh to recover
+        try:
+            page_text = await page.evaluate("() => document.body.innerText.toLowerCase()")
+            if "something went wrong" in page_text or "please refresh the page" in page_text:
+                if event_callback:
+                    await event_callback("Fill Form", "warning", "Workday error page detected. Refreshing...")
+                await page.reload(wait_until="domcontentloaded")
+                await asyncio.sleep(5)
+                # Check if still errored after refresh
+                page_text2 = await page.evaluate("() => document.body.innerText.toLowerCase()")
+                if "something went wrong" in page_text2:
+                    if event_callback:
+                        await event_callback("Fill Form", "error", "Still error after refresh. Navigating back to application...")
+                    # Try going back to the job posting URL and re-entering
+                    if job_url:
+                        await page.goto(job_url, wait_until="domcontentloaded", timeout=30000)
+                    else:
+                        await page.go_back()
+                        await asyncio.sleep(3)
+                    await asyncio.sleep(5)
+                    # Click Apply again
+                    try:
+                        apply_btn = page.locator('a[data-uxi-element-id="Apply_adventureButton"]').first
+                        if await apply_btn.is_visible(timeout=3000):
+                            box = await apply_btn.bounding_box()
+                            if box:
+                                await page.mouse.click(box['x'] + box['width']/2, box['y'] + box['height']/2)
+                                await asyncio.sleep(5)
+                    except Exception:
+                        pass
+                    continue  # Retry the step loop
+                else:
+                    if event_callback:
+                        await event_callback("Fill Form", "success", "Page recovered after refresh!")
+                    continue  # Retry with the refreshed page
+        except Exception as e:
+            if event_callback:
+                await event_callback("Fill Form", "warning", f"Error check failed: {e}")
 
         # Scroll to load all content
         for i in range(5):
@@ -3974,15 +4208,17 @@ async def fill_form(
                 label_lower = m.get("label", "").lower()
                 is_location = ("location" in selector.lower() or "location" in label_lower
                                or "city" in label_lower)
+                is_school = any(k in label_lower for k in ["school", "university", "college", "institution", "degree", "major", "discipline"])
                 try:
                     loc = page.locator(selector).first
                     await loc.scroll_into_view_if_needed(timeout=3000)
-                    if is_location:
-                        # Location fields often have autocomplete - type slowly and select best suggestion
+                    if is_location or is_school:
+                        # Autocomplete fields: click, type, then pick first matching suggestion
                         await loc.click(timeout=3000)
                         await loc.fill("", timeout=2000)  # Clear first
-                        # Type just "Santa Clara, CA" to help autocomplete narrow to California
-                        await page.keyboard.type(value, delay=80)
+                        # For school, type enough to get a unique match
+                        type_val = value[:20] if is_school else value
+                        await page.keyboard.type(type_val, delay=80)
                         await asyncio.sleep(2.0)
                         # Look through visible autocomplete suggestions for one matching CA/California/USA
                         picked = await page.evaluate("""() => {
@@ -3991,7 +4227,8 @@ async def fill_form(
                                 '.autocomplete-suggestion, [class*="suggestion"], [class*="Suggestion"], ' +
                                 '[class*="dropdown"] li, [class*="listbox"] li, ul[class*="auto"] li'
                             );
-                            const preferred = ["california", "ca,", "ca ", ", ca", "united states", "usa"];
+                            // preferred keywords cover both location and school lookups
+                            const preferred = ["santa clara", "california", "ca,", "ca ", ", ca", "united states", "usa"];
                             const avoid = ["peru", "cuba", "colombia", "mexico", "brazil", "chile", "argentina"];
                             for (const s of suggestions) {
                                 if (s.offsetParent === null) continue;
@@ -4023,7 +4260,8 @@ async def fill_form(
                         }""")
                         if picked:
                             if event_callback:
-                                await event_callback("Fill Form", "info", f"Location autocomplete: {picked[:60]}")
+                                lbl_kind = "School" if is_school else "Location"
+                                await event_callback("Fill Form", "info", f"{lbl_kind} autocomplete: {picked[:60]}")
                             await asyncio.sleep(0.5)
                         else:
                             # Fallback: ArrowDown + Enter for first suggestion
@@ -4296,7 +4534,7 @@ async def fill_application(
 
     # Launch browser
     _playwright = await async_playwright().start()
-    _browser = await _playwright.chromium.launch(headless=False)
+    _browser = await _playwright.chromium.launch(headless=os.getenv("HEADLESS", "false").lower() == "true")
     page = await _browser.new_page(viewport={"width": 1280, "height": 900})
 
     if event_callback:

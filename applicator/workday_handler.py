@@ -67,6 +67,37 @@ async def fill_workday_info_hardcoded(page: Page, event_callback=None) -> dict:
         if event_callback:
             await event_callback("Fill Form", "warn", f"Diagnostic error: {str(e)[:80]}")
 
+    # Step 0.5: Check for "Something went wrong" error page — refresh to recover
+    try:
+        page_text_check = await page.evaluate("() => document.body.innerText.toLowerCase()")
+        if "something went wrong" in page_text_check or "please refresh the page" in page_text_check:
+            if event_callback:
+                await event_callback("Fill Form", "warning", "Workday error page detected! Refreshing...")
+            await page.reload(wait_until="domcontentloaded")
+            await asyncio.sleep(5)
+            # Check again after refresh
+            page_text_check2 = await page.evaluate("() => document.body.innerText.toLowerCase()")
+            if "something went wrong" in page_text_check2:
+                if event_callback:
+                    await event_callback("Fill Form", "warning", "Still error after refresh. Trying page.goto on current URL...")
+                current_url = page.url
+                await page.goto(current_url, wait_until="domcontentloaded", timeout=30000)
+                await asyncio.sleep(5)
+                page_text_check3 = await page.evaluate("() => document.body.innerText.toLowerCase()")
+                if "something went wrong" in page_text_check3:
+                    if event_callback:
+                        await event_callback("Fill Form", "error", "Persistent Workday error. Application state may be corrupted.")
+                    return {"filled": 0, "failed": 0, "errors": ["Workday error page - application state corrupted"]}
+                else:
+                    if event_callback:
+                        await event_callback("Fill Form", "success", "Page recovered after re-navigation!")
+            else:
+                if event_callback:
+                    await event_callback("Fill Form", "success", "Page recovered after refresh!")
+    except Exception as e:
+        if event_callback:
+            await event_callback("Fill Form", "warning", f"Error page check failed: {str(e)[:80]}")
+
     # Step 1: Scan ALL visible text inputs and fill based on label matching
     try:
         text_fields = await page.evaluate("""() => {
@@ -81,10 +112,17 @@ async def fill_workday_info_hardcoded(page: Page, event_callback=None) -> dict:
                 // Find label
                 const label = c.querySelector('label');
                 const labelText = label ? label.innerText.trim() : '';
-                // Find input
+                // Find input — build a CSS selector we can use with Playwright locator
                 const inp = c.querySelector('input[type="text"], input[type="tel"], input[type="email"], input[type="number"], input:not([type])');
                 if (inp && inp.offsetParent !== null) {
                     const r = inp.getBoundingClientRect();
+                    // Build a unique CSS selector for this input
+                    let cssSelector = '';
+                    if (inp.getAttribute('data-automation-id')) {
+                        cssSelector = '[data-automation-id="' + inp.getAttribute('data-automation-id') + '"]';
+                    } else {
+                        cssSelector = '[data-automation-id="' + dataid + '"] input';
+                    }
                     results.push({
                         dataid,
                         label: labelText.toLowerCase(),
@@ -92,6 +130,7 @@ async def fill_workday_info_hardcoded(page: Page, event_callback=None) -> dict:
                         x: r.x + r.width/2,
                         y: r.y + r.height/2,
                         visible: r.width > 0 && r.height > 0,
+                        cssSelector,
                     });
                 }
             }
@@ -108,22 +147,31 @@ async def fill_workday_info_hardcoded(page: Page, event_callback=None) -> dict:
                 await event_callback("Fill Form", "diag",
                     f"  field: label='{tf.get('label', '')[:30]}' val='{tf.get('value', '')[:15]}' vis={tf.get('visible')}")
 
-        # Map labels to values
-        label_values = {
-            "first name": info.get("first_name", "Edrick"),
-            "last name": info.get("last_name", "Chang"),
-            "phone number": info.get("phone", "(408) 806-6495"),
-            "phone": info.get("phone", "(408) 806-6495"),
-            "address line 1": info.get("street_address", ""),
-            "address": info.get("street_address", ""),
-            "city": info.get("city", "Santa Clara"),
-            "postal code": info.get("zip_code", ""),
-            "zip": info.get("zip_code", ""),
-        }
+        # Map labels to values — use tuples (pattern, exclude_patterns, value) for precise matching
+        # Exclude patterns prevent "country phone code" from matching "phone"
+        label_rules = [
+            ("first name", [], info.get("first_name", "Edrick")),
+            ("last name", [], info.get("last_name", "Chang")),
+            ("phone number", ["country", "extension"], info.get("phone", "(408) 806-6495")),
+            ("address line 1", [], info.get("street_address", "")),
+            ("address", ["email"], info.get("street_address", "")),
+            ("city", [], info.get("city", "Santa Clara")),
+            ("postal code", [], info.get("zip_code", "")),
+            ("zip", [], info.get("zip_code", "")),
+        ]
+
+        # Labels to explicitly skip — these are dropdown/readonly fields
+        skip_labels = ["country phone code", "phone extension", "phone device type",
+                       "country", "state", "how did you hear"]
 
         for tf in (text_fields or []):
             label = tf.get("label", "")
             if not tf.get("visible"):
+                continue
+            # Skip explicitly excluded labels
+            if any(skip in label for skip in skip_labels):
+                if event_callback:
+                    await event_callback("Fill Form", "info", f"Skipping '{label[:30]}' (excluded)")
                 continue
             # Skip if already filled
             if tf.get("value", "").strip():
@@ -132,24 +180,54 @@ async def fill_workday_info_hardcoded(page: Page, event_callback=None) -> dict:
                     await event_callback("Fill Form", "info", f"Already filled: {label[:30]} = '{tf['value'][:20]}'")
                 continue
 
-            # Find matching value
+            # Find matching value using rules
             matched_value = None
-            for pattern, val in label_values.items():
+            for pattern, excludes, val in label_rules:
                 if pattern in label and val:
+                    if excludes and any(exc in label for exc in excludes):
+                        continue  # Skip this rule — excluded
                     matched_value = val
                     break
 
             if matched_value:
-                await page.mouse.click(tf["x"], tf["y"])
-                await asyncio.sleep(0.2)
-                # Triple-click to select all, then type
-                await page.mouse.click(tf["x"], tf["y"], click_count=3)
-                await asyncio.sleep(0.1)
-                await page.keyboard.type(matched_value, delay=20)
-                await asyncio.sleep(0.3)
-                # Click elsewhere to trigger blur/validation
-                await page.keyboard.press("Tab")
-                await asyncio.sleep(0.3)
+                # Use Playwright locator.fill() which triggers React synthetic events
+                css_sel = tf.get("cssSelector", "")
+                try:
+                    if css_sel:
+                        loc = page.locator(css_sel).first
+                        await loc.scroll_into_view_if_needed(timeout=2000)
+                        await asyncio.sleep(0.1)
+                        await loc.fill(matched_value, timeout=3000)
+                        await asyncio.sleep(0.3)
+                        # Tab to trigger blur/validation
+                        await loc.press("Tab")
+                        await asyncio.sleep(0.3)
+                    else:
+                        # Fallback: click + type
+                        await page.mouse.click(tf["x"], tf["y"])
+                        await asyncio.sleep(0.2)
+                        await page.mouse.click(tf["x"], tf["y"], click_count=3)
+                        await asyncio.sleep(0.1)
+                        await page.keyboard.type(matched_value, delay=20)
+                        await asyncio.sleep(0.3)
+                        await page.keyboard.press("Tab")
+                        await asyncio.sleep(0.3)
+                except Exception as fill_err:
+                    # Fallback: click + type
+                    if event_callback:
+                        await event_callback("Fill Form", "warn", f"locator.fill failed for '{label[:20]}': {str(fill_err)[:50]}, trying click+type")
+                    try:
+                        await page.mouse.click(tf["x"], tf["y"])
+                        await asyncio.sleep(0.2)
+                        await page.mouse.click(tf["x"], tf["y"], click_count=3)
+                        await asyncio.sleep(0.1)
+                        await page.keyboard.type(matched_value, delay=20)
+                        await asyncio.sleep(0.3)
+                        await page.keyboard.press("Tab")
+                        await asyncio.sleep(0.3)
+                    except Exception:
+                        failed += 1
+                        continue
                 filled += 1
                 if event_callback:
                     await event_callback("Fill Form", "success", f"Filled '{label[:30]}' = '{matched_value}'")
@@ -403,7 +481,22 @@ async def fill_workday_questions_hardcoded(page: Page, company: str = "", role: 
                 let label = '';
                 if (container) {
                     const lbl = container.querySelector('label');
-                    label = lbl ? lbl.innerText.trim() : '';
+                    if (lbl) label = lbl.innerText.trim();
+                    if (!label) {
+                        const autoLabel = container.querySelector('[data-automation-id*="label"], [data-automation-id*="Label"], [data-automation-id*="prompt"]');
+                        if (autoLabel) label = autoLabel.innerText.trim();
+                    }
+                    if (!label) label = s.getAttribute('aria-label') || '';
+                    if (!label) {
+                        const labelledBy = s.getAttribute('aria-labelledby');
+                        if (labelledBy) { const refEl = document.getElementById(labelledBy); if (refEl) label = refEl.innerText.trim(); }
+                    }
+                    if (!label) { const legend = container.querySelector('legend'); if (legend) label = legend.innerText.trim(); }
+                    if (!label) {
+                        const allText = container.innerText || '';
+                        const lines = allText.split('\\n').map(l => l.trim()).filter(l => l.length > 5 && !l.toLowerCase().includes('select one'));
+                        if (lines.length > 0) label = lines[0];
+                    }
                 }
                 const options = Array.from(s.options).map(o => ({value: o.value, text: o.text}));
                 results.push({
@@ -451,6 +544,176 @@ async def fill_workday_questions_hardcoded(page: Page, company: str = "", role: 
     except Exception as e:
         if event_callback:
             await event_callback("Fill Form", "warn", f"Select scan error: {str(e)[:80]}")
+
+    # Scan for Workday custom dropdown questions (Yes/No "Select One" dropdowns)
+    # Workday uses custom button-based dropdowns, not native <select> elements.
+    # Pattern: formField container → button with "Select One" text → click opens popup → [role="option"] items
+    try:
+        wd_dropdowns = await page.evaluate("""() => {
+            const results = [];
+            const containers = document.querySelectorAll('[data-automation-id^="formField-"]');
+            for (const c of containers) {
+                if (c.offsetParent === null) continue;
+                // Look for Workday dropdown buttons or native selects
+                const btn = c.querySelector('button[aria-haspopup], [data-automation-id="selectWidget"], [data-automation-id="dropdownWidget"]');
+                const sel = c.querySelector('select');
+                const dropEl = btn || sel;
+                if (!dropEl) continue;
+
+                // Check if unfilled (shows "Select One" or similar placeholder)
+                const dropText = (dropEl.innerText || dropEl.textContent || '').trim();
+                if (sel) {
+                    // Native select
+                    if (sel.selectedIndex > 0) continue;  // Already filled
+                } else {
+                    // Custom dropdown - check for "Select One" or empty
+                    if (dropText && !dropText.toLowerCase().includes('select') && dropText !== '--') continue;
+                }
+
+                // Try multiple label sources (Workday uses various label patterns)
+                let label = '';
+                const lbl = c.querySelector('label');
+                if (lbl) label = lbl.innerText.trim();
+                if (!label) {
+                    // Try data-automation-id based label elements
+                    const autoLabel = c.querySelector('[data-automation-id*="label"], [data-automation-id*="Label"], [data-automation-id*="prompt"]');
+                    if (autoLabel) label = autoLabel.innerText.trim();
+                }
+                if (!label) {
+                    // Try aria-label on the dropdown element itself
+                    label = dropEl.getAttribute('aria-label') || '';
+                }
+                if (!label) {
+                    // Try aria-labelledby reference
+                    const labelledBy = dropEl.getAttribute('aria-labelledby');
+                    if (labelledBy) {
+                        const refEl = document.getElementById(labelledBy);
+                        if (refEl) label = refEl.innerText.trim();
+                    }
+                }
+                if (!label) {
+                    // Try legend element (used in fieldset-style layouts)
+                    const legend = c.querySelector('legend');
+                    if (legend) label = legend.innerText.trim();
+                }
+                if (!label) {
+                    // Fallback: grab first meaningful text from container that isn't the dropdown text
+                    const allText = c.innerText || '';
+                    const lines = allText.split('\\n').map(l => l.trim()).filter(l => l.length > 5 && !l.toLowerCase().includes('select one') && l !== dropText);
+                    if (lines.length > 0) label = lines[0];
+                }
+                const dataid = c.getAttribute('data-automation-id') || '';
+                const rect = dropEl.getBoundingClientRect();
+                const isNativeSelect = !!sel;
+                results.push({
+                    label, dataid, isNativeSelect, currentText: dropText,
+                    x: rect.x + rect.width / 2, y: rect.y + rect.height / 2,
+                });
+            }
+            return results;
+        }""")
+
+        if event_callback and wd_dropdowns:
+            await event_callback("Fill Form", "info", f"Found {len(wd_dropdowns)} unfilled dropdown(s)")
+
+        for dd in (wd_dropdowns or []):
+            label_lower = dd.get("label", "").lower()
+            if event_callback:
+                await event_callback("Fill Form", "diag",
+                    f"Dropdown: label='{dd.get('label','')[:60]}' native={dd.get('isNativeSelect')} dataid={dd.get('dataid','')[:40]}")
+            if not label_lower:
+                continue
+
+            # Match against yes_no_answers patterns
+            answer = None
+            for pattern, ans in yes_no_answers.items():
+                if pattern in label_lower:
+                    answer = ans
+                    break
+
+            # Additional specific patterns
+            if answer is None:
+                if "contractor" in label_lower:
+                    answer = "No"
+                elif "auditor" in label_lower or "kpmg" in label_lower or "bsr" in label_lower:
+                    answer = "No"
+                elif "unrestricted" in label_lower or "authorization to work" in label_lower or "authorized to work" in label_lower:
+                    answer = "Yes"
+
+            if not answer:
+                if event_callback:
+                    await event_callback("Fill Form", "warn", f"No answer pattern for: '{dd['label'][:80]}'")
+                continue
+
+            if event_callback:
+                await event_callback("Fill Form", "info", f"Trying '{answer}' for '{dd['label'][:50]}' (native={dd.get('isNativeSelect')})")
+
+            if dd.get("isNativeSelect"):
+                # Handle native <select>
+                selector = f'[data-automation-id="{dd["dataid"]}"] select'
+                if event_callback:
+                    await event_callback("Fill Form", "diag", f"Native select selector: {selector[:60]}")
+                try:
+                    await page.locator(selector).first.select_option(label=answer)
+                    filled += 1
+                    if event_callback:
+                        await event_callback("Fill Form", "success", f"Selected '{answer}' for '{dd['label'][:50]}'")
+                except Exception as e2:
+                    if event_callback:
+                        await event_callback("Fill Form", "warn", f"Native select error: {str(e2)[:60]}")
+            else:
+                # Handle Workday custom dropdown: click to open, then select option
+                try:
+                    await page.mouse.click(dd["x"], dd["y"])
+                    await asyncio.sleep(0.5)
+
+                    # Look for popup options
+                    option_clicked = False
+                    try:
+                        options = page.locator(f'[role="option"], [role="listbox"] [role="option"], [data-automation-id="selectWidget-option"]')
+                        count = await options.count()
+                        for i in range(count):
+                            opt = options.nth(i)
+                            text = (await opt.inner_text()).strip()
+                            if text.lower() == answer.lower():
+                                await opt.click(timeout=3000)
+                                option_clicked = True
+                                filled += 1
+                                if event_callback:
+                                    await event_callback("Fill Form", "success", f"Selected '{answer}' for '{dd['label'][:50]}'")
+                                break
+                    except Exception:
+                        pass
+
+                    if not option_clicked:
+                        # Fallback: try JS click on matching option text
+                        js_clicked = await page.evaluate(f"""() => {{
+                            const opts = document.querySelectorAll('[role="option"], [role="listbox"] li, [data-automation-id*="option"]');
+                            for (const o of opts) {{
+                                if (o.innerText.trim().toLowerCase() === '{answer.lower()}') {{
+                                    o.click();
+                                    return true;
+                                }}
+                            }}
+                            return false;
+                        }}""")
+                        if js_clicked:
+                            filled += 1
+                            if event_callback:
+                                await event_callback("Fill Form", "success", f"JS-selected '{answer}' for '{dd['label'][:50]}'")
+                        else:
+                            # Close dropdown by pressing Escape
+                            await page.keyboard.press("Escape")
+                            if event_callback:
+                                await event_callback("Fill Form", "warn", f"Could not find '{answer}' option for '{dd['label'][:50]}'")
+
+                    await asyncio.sleep(0.5)
+                except Exception as e2:
+                    if event_callback:
+                        await event_callback("Fill Form", "warn", f"Custom dropdown error: {str(e2)[:60]}")
+    except Exception as e:
+        if event_callback:
+            await event_callback("Fill Form", "warn", f"Workday dropdown scan error: {str(e)[:80]}")
 
     # Scan for text inputs that are still empty
     try:
@@ -524,45 +787,43 @@ async def fill_workday_questions_hardcoded(page: Page, company: str = "", role: 
 async def _fill_workday_prompt_dropdown(page: Page, event_callback=None):
     """Targeted handler for Workday promptList dropdowns like 'How Did You Hear About Us?'.
 
-    Uses direct Playwright interaction: click the dropdown button, wait for popup,
-    then click the matching option with real mouse events.
+    CRITICAL: This is a TWO-STEP hierarchical dropdown:
+    Step 1: Click promptIcon → popup shows categories (Online Job Board, Referral, etc.)
+    Step 2: Click "Online Job Board" → SECOND popup/input appears for specific source
+    Step 3: Select "Glassdoor" from second popup → pill/chip finally appears
+
+    Previous iterations failed because we checked for pill AFTER step 2, but the pill only
+    appears after BOTH steps are complete.
     """
     # Check if "How Did You Hear About Us?" field exists and is empty
     field_info = await page.evaluate("""() => {
-        // Find formField containers that match "source" or "hear" patterns
-        const candidates = [
-            'sourceType', 'source', 'jobSource', 'howDidYouHear',
-            'referralSource', 'sourceName',
-        ];
-        for (const cand of candidates) {
-            const el = document.querySelector('[data-automation-id="formField-' + cand + '"]');
-            if (el && el.offsetParent !== null) {
-                // Check if it already has a selected value (pill/chip)
-                const pill = el.querySelector('[data-automation-id="selectedItem"], [data-automation-id*="pill"], .css-1wc848c');
-                if (pill) return { found: true, filled: true, dataid: 'formField-' + cand };
-                // Check if input has value
-                const input = el.querySelector('input');
-                if (input && input.value && input.value.trim()) return { found: true, filled: true, dataid: 'formField-' + cand };
-                return { found: true, filled: false, dataid: 'formField-' + cand };
-            }
-        }
-        // Broader search: look for any formField with label containing "hear" or "source"
         const allFields = document.querySelectorAll('[data-automation-id^="formField-"]');
         for (const el of allFields) {
             if (el.offsetParent === null) continue;
             const label = el.querySelector('label');
             const labelText = (label ? label.innerText : '').toLowerCase();
-            if (labelText.includes('hear') || labelText.includes('source') || labelText.includes('how did you')) {
+            if (labelText.includes('hear') || labelText.includes('how did you')) {
                 const pill = el.querySelector('[data-automation-id="selectedItem"], [data-automation-id*="pill"]');
-                if (pill) return { found: true, filled: true, dataid: el.getAttribute('data-automation-id') };
-                return { found: true, filled: false, dataid: el.getAttribute('data-automation-id') };
+                if (pill) return { found: true, filled: true, dataid: el.getAttribute('data-automation-id'), label: labelText };
+                const chips = el.querySelectorAll('[data-automation-id*="chip"], [data-automation-id*="CHIP"]');
+                if (chips.length > 0) return { found: true, filled: true, dataid: el.getAttribute('data-automation-id'), label: labelText };
+                return { found: true, filled: false, dataid: el.getAttribute('data-automation-id'), label: labelText };
+            }
+        }
+        const candidates = ['sourceType', 'jobSource', 'howDidYouHear', 'referralSource', 'source'];
+        for (const cand of candidates) {
+            const el = document.querySelector('[data-automation-id="formField-' + cand + '"]');
+            if (el && el.offsetParent !== null) {
+                const pill = el.querySelector('[data-automation-id="selectedItem"], [data-automation-id*="pill"]');
+                if (pill) return { found: true, filled: true, dataid: 'formField-' + cand };
+                return { found: true, filled: false, dataid: 'formField-' + cand };
             }
         }
         return { found: false };
     }""")
 
     if not field_info or not field_info.get("found"):
-        return  # No such field on this page
+        return
     if field_info.get("filled"):
         if event_callback:
             await event_callback("Fill Form", "info", "How Did You Hear dropdown already filled")
@@ -574,114 +835,342 @@ async def _fill_workday_prompt_dropdown(page: Page, event_callback=None):
     if event_callback:
         await event_callback("Fill Form", "info", f"Filling 'How Did You Hear' dropdown ({dataid})...")
 
-    # Preferred answers in order of priority
-    preferred = ["LinkedIn", "Online Job Board", "Job Board", "Internet", "Online", "Other"]
-
     try:
-        # Step 1: Scroll the field into view
+        # Step 1: Scroll field into view
         field_el = page.locator(selector).first
         await field_el.scroll_into_view_if_needed(timeout=3000)
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.5)
 
-        # Step 2: Click the dropdown button/icon to open the popup
-        # Workday dropdowns have a button or the container itself is clickable
-        clicked = False
-        for btn_sel in [
-            f'{selector} button',
-            f'{selector} [data-automation-id="searchBox"]',
-            f'{selector} [role="button"]',
-            f'{selector} svg',
-            selector,
-        ]:
+        # Step 2: Close any stale popups
+        await page.keyboard.press("Escape")
+        await asyncio.sleep(0.5)
+
+        # ============================================================
+        # TWO-STEP SELECTION: "Online Job Board" → "Glassdoor"
+        # The HDYH is a hierarchical dropdown:
+        # 1) Click promptIcon to open category popup
+        # 2) Click "Online Job Board" category
+        # 3) A SECOND popup/input appears to pick specific source
+        # 4) Select "Glassdoor" from second popup
+        # Only after BOTH steps does a pill/chip appear.
+        # ============================================================
+
+        # Helper to click option by text using multiple methods
+        async def click_option(text_match, description="option"):
+            """Click a [role="option"] matching text_match. Returns True if click executed."""
+            opt_locator = page.locator('[role="option"]').filter(has_text=text_match).first
             try:
-                btn = page.locator(btn_sel).first
-                if await btn.is_visible(timeout=500):
-                    box = await btn.bounding_box()
-                    if box:
-                        await page.mouse.click(box['x'] + box['width'] / 2, box['y'] + box['height'] / 2)
-                        clicked = True
-                        await asyncio.sleep(1.0)  # Wait for popup to render
-                        break
+                if await opt_locator.is_visible(timeout=2000):
+                    await opt_locator.click(timeout=3000)
+                    if event_callback:
+                        await event_callback("Fill Form", "info", f"Clicked {description}: '{text_match}'")
+                    return True
             except Exception:
-                continue
+                pass
+            # Fallback: coordinates
+            coords = await page.evaluate(f"""() => {{
+                const opts = document.querySelectorAll('[role="option"]');
+                for (const o of opts) {{
+                    if (o.offsetParent === null) continue;
+                    if (o.innerText.trim().toLowerCase().includes('{text_match.lower()}')) {{
+                        const r = o.getBoundingClientRect();
+                        return {{ x: r.x + r.width/2, y: r.y + r.height/2 }};
+                    }}
+                }}
+                return null;
+            }}""")
+            if coords:
+                await page.mouse.click(coords["x"], coords["y"])
+                if event_callback:
+                    await event_callback("Fill Form", "info", f"Mouse-clicked {description}: '{text_match}'")
+                return True
+            return False
 
-        if not clicked:
+        # Helper to get visible non-phone options
+        async def get_visible_options():
+            return await page.evaluate("""() => {
+                const opts = document.querySelectorAll('[role="option"]');
+                return Array.from(opts)
+                    .filter(o => o.offsetParent !== null && !/\\+\\d/.test(o.innerText))
+                    .map(o => o.innerText.trim());
+            }""")
+
+        # ---- STEP A: Open dropdown and click "Online Job Board" ----
+        try:
+            icon = page.locator(f'{selector} [data-automation-id="promptIcon"]').first
+            await icon.click(timeout=5000)
+            await asyncio.sleep(2.0)
             if event_callback:
-                await event_callback("Fill Form", "warn", "Could not open 'How Did You Hear' dropdown")
+                await event_callback("Fill Form", "info", "Opened HDYH dropdown via promptIcon")
+        except Exception as e:
+            if event_callback:
+                await event_callback("Fill Form", "warn", f"promptIcon click failed: {str(e)[:60]}")
             return
 
-        # Step 3: Check if a popup/popover appeared with options
-        # Try typing in search if there's an input
-        search_typed = False
-        for search_sel in [
-            '[data-automation-id="searchBox"] input',
-            'input[data-automation-id="searchBox"]',
-            f'{selector} input[type="text"]',
-        ]:
-            try:
-                search = page.locator(search_sel).first
-                if await search.is_visible(timeout=500):
-                    await search.fill("")
-                    await asyncio.sleep(0.1)
-                    await page.keyboard.type("LinkedIn", delay=50)
-                    search_typed = True
-                    await asyncio.sleep(1.0)
+        # Gather HDYH options
+        hdyh_opts = await get_visible_options()
+        if event_callback:
+            await event_callback("Fill Form", "diag", f"HDYH options: {hdyh_opts}")
+
+        if not hdyh_opts:
+            if event_callback:
+                await event_callback("Fill Form", "warn", "No HDYH options visible")
+            await page.keyboard.press("Escape")
+            return
+
+        # Click "Online Job Board"
+        clicked = await click_option("Online Job Board", "category")
+        if not clicked:
+            # Fallback: try any option with "online" or "job board"
+            for fallback in ["Online", "Job Board", "Internet"]:
+                clicked = await click_option(fallback, "category fallback")
+                if clicked:
                     break
-            except Exception:
-                continue
+        if not clicked:
+            if event_callback:
+                await event_callback("Fill Form", "warn", "Could not click 'Online Job Board' option")
+            await page.keyboard.press("Escape")
+            return
 
-        # Step 4: Find and click the best matching option
-        for pref in preferred:
-            for opt_sel in [
-                '[data-automation-id*="promptOption"]',
-                '[role="option"]',
-                '[data-automation-id="menuItem"]',
-            ]:
-                try:
-                    opts = page.locator(f'{opt_sel}:visible')
-                    count = await opts.count()
-                    for i in range(min(count, 20)):
-                        opt = opts.nth(i)
-                        try:
-                            text = (await opt.inner_text(timeout=300)).strip()
-                        except Exception:
-                            continue
-                        if pref.lower() in text.lower() or text.lower() in pref.lower():
-                            box = await opt.bounding_box()
-                            if box:
-                                await page.mouse.click(box['x'] + box['width'] / 2, box['y'] + box['height'] / 2)
-                                await asyncio.sleep(0.5)
-                                if event_callback:
-                                    await event_callback("Fill Form", "success", f"How Did You Hear: selected '{text}'")
-                                return
-                except Exception:
-                    continue
+        await asyncio.sleep(2.5)
 
-        # Step 5: If no preferred match, just click the first visible option
-        try:
-            first = page.locator('[data-automation-id*="promptOption"]:visible, [role="option"]:visible').first
-            if await first.is_visible(timeout=500):
-                text = await first.inner_text(timeout=500)
-                box = await first.bounding_box()
-                if box:
-                    await page.mouse.click(box['x'] + box['width'] / 2, box['y'] + box['height'] / 2)
-                    await asyncio.sleep(0.5)
-                    if event_callback:
-                        await event_callback("Fill Form", "success", f"How Did You Hear: selected first option '{text[:30]}'")
-                    return
-        except Exception:
-            pass
+        # ---- STEP B: Check what happened after clicking the category ----
+        # Possible outcomes:
+        # 1. A second popup with specific sources (Glassdoor, Indeed, etc.)
+        # 2. A pill/chip appeared (single-level selection)
+        # 3. The input now needs text entry for the specific source
 
-        # Step 6: Last resort - press Escape and try keyboard approach
-        await page.keyboard.press("Escape")
-        await asyncio.sleep(0.3)
+        # First check if it's already complete (single-level)
+        filled = await _verify_dropdown_filled(page, selector, event_callback)
+        if filled:
+            if event_callback:
+                await event_callback("Fill Form", "success", "How Did You Hear: completed (single-level selection)")
+            return
 
         if event_callback:
-            await event_callback("Fill Form", "warn", "Could not select 'How Did You Hear' option, continuing anyway")
+            await event_callback("Fill Form", "info", "Category selected — checking for second-level dropdown...")
+
+        # Check for new options (the specific sources like Glassdoor)
+        new_opts = await get_visible_options()
+        if event_callback:
+            await event_callback("Fill Form", "diag", f"After category click, visible options: {new_opts}")
+
+        # Also check if the input field now has different content or a new input appeared
+        input_state = await page.evaluate(f"""() => {{
+            const c = document.querySelector('{selector}');
+            if (!c) return null;
+            const inp = c.querySelector('input');
+            return {{
+                value: inp ? inp.value : null,
+                expanded: inp ? inp.getAttribute('aria-expanded') : null,
+                placeholder: inp ? inp.placeholder : null,
+            }};
+        }}""")
+        if event_callback:
+            await event_callback("Fill Form", "diag", f"Input state after category: {input_state}")
+
+        # ---- STEP C: Select "Glassdoor" from second-level options ----
+        if new_opts:
+            # Try to click "Glassdoor" directly
+            clicked2 = await click_option("Glassdoor", "specific source")
+            if not clicked2:
+                # Try "glassdoor" case-insensitive
+                clicked2 = await click_option("glassdoor", "specific source (lowercase)")
+            if not clicked2:
+                # If Glassdoor not in options, try typing it
+                if event_callback:
+                    await event_callback("Fill Form", "info", "Glassdoor not visible, trying type-ahead...")
+                inp_loc = page.locator(f'{selector} input').first
+                try:
+                    await inp_loc.fill("")
+                    await asyncio.sleep(0.3)
+                    await inp_loc.type("Glassdoor", delay=80)
+                    await asyncio.sleep(2.0)
+
+                    # Check for filtered options
+                    filtered = await get_visible_options()
+                    if event_callback:
+                        await event_callback("Fill Form", "diag", f"After typing 'Glassdoor': {filtered}")
+
+                    if filtered:
+                        await page.keyboard.press("ArrowDown")
+                        await asyncio.sleep(0.3)
+                        await page.keyboard.press("Enter")
+                        await asyncio.sleep(2.0)
+                    else:
+                        # Just press Enter on what's typed
+                        await page.keyboard.press("Enter")
+                        await asyncio.sleep(2.0)
+                except Exception as e:
+                    if event_callback:
+                        await event_callback("Fill Form", "diag", f"Type glassdoor err: {str(e)[:60]}")
+            else:
+                await asyncio.sleep(2.0)
+
+            # Verify final state
+            filled = await _verify_dropdown_filled(page, selector, event_callback)
+            if filled:
+                if event_callback:
+                    await event_callback("Fill Form", "success", "How Did You Hear: Online Job Board → Glassdoor")
+                return
+            if event_callback:
+                await event_callback("Fill Form", "diag", "Two-step selection didn't produce pill")
+
+        # ---- STEP D: Maybe second-level needs type-ahead instead of popup ----
+        # Some Workday configs show a text input after category selection
+        try:
+            if event_callback:
+                await event_callback("Fill Form", "info", "Trying type-ahead for second level: 'Glassdoor'")
+
+            inp_loc = page.locator(f'{selector} input').first
+            await inp_loc.click(timeout=3000)
+            await asyncio.sleep(0.5)
+            await inp_loc.fill("")
+            await asyncio.sleep(0.3)
+            await inp_loc.type("Glassdoor", delay=80)
+            await asyncio.sleep(2.0)
+
+            filtered = await get_visible_options()
+            if event_callback:
+                await event_callback("Fill Form", "diag", f"Type-ahead results: {filtered}")
+
+            if filtered:
+                # Click the first match
+                await click_option("Glassdoor", "type-ahead result")
+                await asyncio.sleep(2.0)
+            else:
+                await page.keyboard.press("ArrowDown")
+                await asyncio.sleep(0.2)
+                await page.keyboard.press("Enter")
+                await asyncio.sleep(2.0)
+
+            filled = await _verify_dropdown_filled(page, selector, event_callback)
+            if filled:
+                if event_callback:
+                    await event_callback("Fill Form", "success", "How Did You Hear: via type-ahead Glassdoor")
+                return
+        except Exception as e:
+            if event_callback:
+                await event_callback("Fill Form", "diag", f"Type-ahead step D err: {str(e)[:80]}")
+
+        # ---- STEP E: Last resort — re-do everything with CDP clicks ----
+        try:
+            if event_callback:
+                await event_callback("Fill Form", "info", "Strategy: full CDP two-step click")
+
+            await page.keyboard.press("Escape")
+            await asyncio.sleep(0.5)
+
+            # Re-open
+            icon = page.locator(f'{selector} [data-automation-id="promptIcon"]').first
+            await icon.click(timeout=5000)
+            await asyncio.sleep(2.0)
+
+            # CDP click "Online Job Board"
+            coords1 = await page.evaluate("""() => {
+                const opts = document.querySelectorAll('[role="option"]');
+                for (const o of opts) {
+                    if (o.offsetParent === null) continue;
+                    if (o.innerText.trim().toLowerCase().includes('online job board')) {
+                        const r = o.getBoundingClientRect();
+                        return { x: r.x + r.width/2, y: r.y + r.height/2 };
+                    }
+                }
+                return null;
+            }""")
+
+            if coords1:
+                cdp = await page.context.new_cdp_session(page)
+                await cdp.send("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": int(coords1["x"]), "y": int(coords1["y"])})
+                await asyncio.sleep(0.1)
+                await cdp.send("Input.dispatchMouseEvent", {"type": "mousePressed", "x": int(coords1["x"]), "y": int(coords1["y"]), "button": "left", "clickCount": 1})
+                await asyncio.sleep(0.05)
+                await cdp.send("Input.dispatchMouseEvent", {"type": "mouseReleased", "x": int(coords1["x"]), "y": int(coords1["y"]), "button": "left", "clickCount": 1})
+                await asyncio.sleep(3.0)
+
+                if event_callback:
+                    await event_callback("Fill Form", "info", "CDP clicked 'Online Job Board'")
+
+                # Check for second-level options
+                opts2 = await get_visible_options()
+                if event_callback:
+                    await event_callback("Fill Form", "diag", f"After CDP category: {opts2}")
+
+                # CDP click Glassdoor
+                coords2 = await page.evaluate("""() => {
+                    const opts = document.querySelectorAll('[role="option"]');
+                    for (const o of opts) {
+                        if (o.offsetParent === null) continue;
+                        if (o.innerText.trim().toLowerCase().includes('glassdoor')) {
+                            const r = o.getBoundingClientRect();
+                            return { x: r.x + r.width/2, y: r.y + r.height/2 };
+                        }
+                    }
+                    return null;
+                }""")
+
+                if coords2:
+                    await cdp.send("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": int(coords2["x"]), "y": int(coords2["y"])})
+                    await asyncio.sleep(0.1)
+                    await cdp.send("Input.dispatchMouseEvent", {"type": "mousePressed", "x": int(coords2["x"]), "y": int(coords2["y"]), "button": "left", "clickCount": 1})
+                    await asyncio.sleep(0.05)
+                    await cdp.send("Input.dispatchMouseEvent", {"type": "mouseReleased", "x": int(coords2["x"]), "y": int(coords2["y"]), "button": "left", "clickCount": 1})
+                    if event_callback:
+                        await event_callback("Fill Form", "info", "CDP clicked 'Glassdoor'")
+                else:
+                    if event_callback:
+                        await event_callback("Fill Form", "diag", "Glassdoor not found in second-level options")
+                await cdp.detach()
+
+                await asyncio.sleep(2.0)
+                filled = await _verify_dropdown_filled(page, selector, event_callback)
+                if filled:
+                    if event_callback:
+                        await event_callback("Fill Form", "success", "How Did You Hear: Online Job Board → Glassdoor via CDP")
+                    return
+
+        except Exception as e:
+            if event_callback:
+                await event_callback("Fill Form", "diag", f"CDP two-step err: {str(e)[:80]}")
+
+        await page.keyboard.press("Escape")
+        if event_callback:
+            await event_callback("Fill Form", "warn", "Could not fill HDYH dropdown after all strategies")
 
     except Exception as e:
+        import traceback
         if event_callback:
-            await event_callback("Fill Form", "warn", f"How Did You Hear handler error: {str(e)[:100]}")
+            await event_callback("Fill Form", "warn", f"How Did You Hear error: {str(e)[:100]}")
+        print(f">>> How Did You Hear error: {traceback.format_exc()[:500]}")
+
+
+async def _verify_dropdown_filled(page: Page, selector: str, event_callback=None) -> bool:
+    """Check if the Workday promptList dropdown has a selected value (pill/chip/selectedItem)."""
+    result = await page.evaluate(f"""() => {{
+        const el = document.querySelector('{selector}');
+        if (!el) return {{ filled: false, reason: 'container not found' }};
+        // Check for pill/chip/selectedItem
+        const pill = el.querySelector('[data-automation-id="selectedItem"]');
+        if (pill) return {{ filled: true, value: pill.innerText.trim().substring(0, 50), via: 'selectedItem' }};
+        const chip = el.querySelector('[data-automation-id*="pill"], [data-automation-id*="chip"], [data-automation-id*="CHIP"]');
+        if (chip) return {{ filled: true, value: chip.innerText.trim().substring(0, 50), via: 'chip' }};
+        // Check for multi-select container with values
+        const multi = el.querySelector('[data-automation-id="multiSelectContainer"]');
+        if (multi && multi.children.length > 1) return {{ filled: true, value: multi.innerText.trim().substring(0, 50), via: 'multiSelect' }};
+        // Check input value (some dropdowns keep the selected text in the input)
+        const inp = el.querySelector('input');
+        if (inp && inp.value && inp.value.trim()) {{
+            // But if the input is still just a search box, this might be a false positive
+            // Check if there's also an aria-expanded=false (popup closed = selection made)
+            const expanded = inp.getAttribute('aria-expanded');
+            if (expanded === 'false') return {{ filled: true, value: inp.value.trim().substring(0, 50), via: 'input-closed' }};
+        }}
+        return {{ filled: false, reason: 'no pill/chip/value found', inputVal: inp ? inp.value : null }};
+    }}""")
+    if event_callback:
+        await event_callback("Fill Form", "diag", f"Dropdown verify: {result}")
+    print(f">>> DROPDOWN VERIFY: {result}")
+    return result.get("filled", False) if result else False
 
 
 async def check_workday_consent(page: Page, event_callback=None, max_wait_seconds=15) -> bool:
@@ -1344,6 +1833,61 @@ async def handle_my_experience(page: Page, resume_path: str, event_callback=None
         if event_callback:
             await event_callback("Fill Form", "info", f"Education error: {e}")
 
+    # --- Delete empty Work Experience entries ---
+    # Workday's resume parser sometimes creates blank entries with required fields.
+    # Delete them to avoid validation errors on Save and Continue.
+    try:
+        deleted_count = 0
+        for attempt in range(5):  # Max 5 entries to delete
+            delete_result = await page.evaluate("""() => {
+                // Find Work Experience sections with a Delete button
+                const deleteButtons = document.querySelectorAll('button');
+                for (const btn of deleteButtons) {
+                    if (!btn.innerText.trim().toLowerCase().includes('delete')) continue;
+                    // Check if it's near a Work Experience header
+                    const parent = btn.closest('[data-automation-id]') || btn.parentElement?.parentElement;
+                    if (parent) {
+                        const text = parent.innerText.toLowerCase();
+                        if (text.includes('work experience') || text.includes('job title')) {
+                            // Check if the entry is empty (required fields have no value)
+                            const inputs = parent.querySelectorAll('input');
+                            const allEmpty = Array.from(inputs).every(i => !i.value || i.value.trim() === '');
+                            if (allEmpty || inputs.length === 0) {
+                                const r = btn.getBoundingClientRect();
+                                return { found: true, x: r.x + r.width/2, y: r.y + r.height/2 };
+                            }
+                        }
+                    }
+                }
+                return { found: false };
+            }""")
+
+            if not delete_result or not delete_result.get("found"):
+                break
+
+            # Click the delete button
+            await page.mouse.click(delete_result["x"], delete_result["y"])
+            await asyncio.sleep(1.0)
+
+            # Confirm deletion if dialog appears
+            try:
+                confirm = page.locator('button:has-text("Delete"), button:has-text("Yes"), button:has-text("OK"), button:has-text("Confirm")').first
+                if await confirm.is_visible(timeout=2000):
+                    await confirm.click(timeout=3000)
+                    await asyncio.sleep(1.5)
+            except Exception:
+                pass
+
+            deleted_count += 1
+            if event_callback:
+                await event_callback("Fill Form", "info", f"Deleted empty Work Experience entry {deleted_count}")
+
+        if deleted_count > 0 and event_callback:
+            await event_callback("Fill Form", "info", f"Deleted {deleted_count} empty Work Experience entries")
+    except Exception as e:
+        if event_callback:
+            await event_callback("Fill Form", "info", f"Work exp cleanup error: {e}")
+
     # --- Websites (LinkedIn/GitHub) ---
     try:
         linkedin = info.get('linkedin', '')
@@ -1437,7 +1981,7 @@ async def handle_workday_application(
         # Dismiss any unexpected dialogs/panels (e.g., "Change Email" panel)
         try:
             # First try: find any close button in a panel containing "change email" or "verify"
-            close_info = await page.evaluate("""() => {
+            close_info = await asyncio.wait_for(page.evaluate("""() => {
                 // Strategy 1: Find close/X buttons near "Change Email" text
                 const closeSelectors = [
                     '[data-automation-id="closeButton"]',
@@ -1476,7 +2020,7 @@ async def handle_workday_application(
                     }
                 }
                 return {found: false};
-            }""")
+            }"""), timeout=10.0)
             if close_info and close_info.get("found"):
                 # Use real mouse click for Workday compatibility
                 await page.mouse.click(close_info["x"], close_info["y"])
@@ -1493,7 +2037,13 @@ async def handle_workday_application(
             except Exception:
                 pass
 
-        current_step = await detect_workday_step(page)
+        try:
+            current_step = await asyncio.wait_for(detect_workday_step(page), timeout=10.0)
+        except (asyncio.TimeoutError, Exception) as e:
+            if event_callback:
+                await event_callback("Navigate", "error", f"Step detection failed: {str(e)[:60]}. Page may be disconnected.")
+            all_errors.append(f"Step detection failed: {e}")
+            break
         if event_callback:
             await event_callback("Navigate", "info", f"Workday step {step_num + 1}: {current_step}")
 
