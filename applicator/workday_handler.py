@@ -325,24 +325,163 @@ async def fill_workday_info_hardcoded(page: Page, event_callback=None) -> dict:
         if event_callback:
             await event_callback("Fill Form", "warn", f"Radio button error: {str(e)[:80]}")
 
-    # Step 3: Check country dropdown
+    # Step 3: Phone country code dropdown ("+1 United States") + phone device type
+    # Workday has a separate dropdown for the country code that must be set to +1
     try:
-        country_text = await page.evaluate("""() => {
-            // Check various selectors for country field
-            for (const sel of ['[data-automation-id="formField-countryDropdown"]',
-                               '[data-automation-id="formField-country"]',
-                               'select[data-automation-id*="country"]']) {
-                const el = document.querySelector(sel);
-                if (el) {
-                    const text = el.innerText || el.value || '';
-                    if (text.includes('United States')) return text.trim().substring(0, 50);
+        phone_dd = await page.evaluate("""() => {
+            // Find the phone country code dropdown button
+            const results = {countryCode: null, deviceType: null};
+            for (const c of document.querySelectorAll('[data-automation-id^="formField-"]')) {
+                if (c.offsetParent === null) continue;
+                const dataid = c.getAttribute('data-automation-id') || '';
+                const uuid = dataid.replace('formField-', '');
+                const sib = document.querySelector('[data-automation-id="formLabel-' + uuid + '"]');
+                const label = (sib ? sib.innerText : (c.querySelector('label')?.innerText || '')).toLowerCase();
+                const btn = c.querySelector('button[aria-haspopup], [data-automation-id="selectWidget"]');
+                if (!btn) continue;
+                const r = btn.getBoundingClientRect();
+                const btnText = (btn.innerText || '').trim().toLowerCase();
+                if (label.includes('country phone') || label.includes('phone code') || label.includes('country code')) {
+                    // Check if already set to US
+                    if (!btnText.includes('united states') && !btnText.includes('+1')) {
+                        results.countryCode = {x: r.x + r.width/2, y: r.y + r.height/2};
+                    }
+                } else if (label.includes('device type') || label.includes('phone type')) {
+                    if (btnText.includes('select') || !btnText) {
+                        results.deviceType = {x: r.x + r.width/2, y: r.y + r.height/2};
+                    }
                 }
             }
-            return '';
+            return results;
         }""")
-        if country_text:
+
+        if phone_dd and phone_dd.get("countryCode"):
+            await page.mouse.click(phone_dd["countryCode"]["x"], phone_dd["countryCode"]["y"])
+            await asyncio.sleep(0.8)
+            # Type to filter the list
+            await page.keyboard.type("United States", delay=40)
+            await asyncio.sleep(1.0)
+            try:
+                opt = page.locator('[role="option"]:has-text("United States"), [role="option"]:has-text("+1")').first
+                if await opt.is_visible(timeout=2000):
+                    await opt.click(timeout=3000)
+                    filled += 1
+                    if event_callback:
+                        await event_callback("Fill Form", "success", "Set phone country code: +1 United States")
+            except Exception:
+                await page.keyboard.press("Escape")
+
+        if phone_dd and phone_dd.get("deviceType"):
+            await page.mouse.click(phone_dd["deviceType"]["x"], phone_dd["deviceType"]["y"])
+            await asyncio.sleep(0.5)
+            try:
+                opt = page.locator('[role="option"]:has-text("Mobile"), [role="option"]:has-text("Cell")').first
+                if await opt.is_visible(timeout=1500):
+                    await opt.click(timeout=2000)
+                    filled += 1
+                    if event_callback:
+                        await event_callback("Fill Form", "success", "Set phone device type: Mobile")
+                else:
+                    await page.keyboard.press("Escape")
+            except Exception:
+                await page.keyboard.press("Escape")
+
+    except Exception as e:
+        if event_callback:
+            await event_callback("Fill Form", "warn", f"Phone dropdown error: {str(e)[:60]}")
+
+    # Step 4: Country and State dropdowns
+    try:
+        geo_dropdowns = await page.evaluate("""() => {
+            const results = [];
+            for (const c of document.querySelectorAll('[data-automation-id^="formField-"]')) {
+                if (c.offsetParent === null) continue;
+                const dataid = c.getAttribute('data-automation-id') || '';
+                const uuid = dataid.replace('formField-', '');
+                const sib = document.querySelector('[data-automation-id="formLabel-' + uuid + '"]');
+                const label = (sib ? sib.innerText : (c.querySelector('label')?.innerText || '')).toLowerCase();
+                // Country-level field (not phone country code)
+                if ((label === 'country' || label.includes('country of residence') || label.includes('country/region'))
+                    && !label.includes('phone')) {
+                    const btn = c.querySelector('button[aria-haspopup], [data-automation-id="selectWidget"]');
+                    const sel = c.querySelector('select');
+                    const el = btn || sel;
+                    if (!el) continue;
+                    const text = (el.innerText || el.value || '').trim();
+                    if (!text.includes('United States')) {
+                        const r = el.getBoundingClientRect();
+                        results.push({type: btn ? 'button' : 'select', field: 'country',
+                                      x: r.x + r.width/2, y: r.y + r.height/2,
+                                      selector: sel ? `[data-automation-id="${dataid}"] select` : ''});
+                    }
+                }
+                if (label === 'state' || label.includes('state/province') || label.includes('province')) {
+                    const btn = c.querySelector('button[aria-haspopup], [data-automation-id="selectWidget"]');
+                    const sel = c.querySelector('select');
+                    const el = btn || sel;
+                    if (!el) continue;
+                    const text = (el.innerText || el.value || '').trim();
+                    if (!text.includes('California') && !text.includes('CA')) {
+                        const r = el.getBoundingClientRect();
+                        results.push({type: btn ? 'button' : 'select', field: 'state',
+                                      x: r.x + r.width/2, y: r.y + r.height/2,
+                                      selector: sel ? `[data-automation-id="${dataid}"] select` : ''});
+                    }
+                }
+            }
+            return results;
+        }""")
+
+        for dd in (geo_dropdowns or []):
+            target = "United States" if dd["field"] == "country" else "California"
+            if dd["type"] == "select":
+                try:
+                    await page.locator(dd["selector"]).first.select_option(label=target)
+                    filled += 1
+                    if event_callback:
+                        await event_callback("Fill Form", "success", f"Set {dd['field']}: {target}")
+                except Exception:
+                    pass
+            else:
+                await page.mouse.click(dd["x"], dd["y"])
+                await asyncio.sleep(0.8)
+                await page.keyboard.type(target[:6], delay=40)
+                await asyncio.sleep(1.0)
+                try:
+                    opt = page.locator(f'[role="option"]:has-text("{target}")').first
+                    if await opt.is_visible(timeout=2000):
+                        await opt.click(timeout=3000)
+                        filled += 1
+                        if event_callback:
+                            await event_callback("Fill Form", "success", f"Set {dd['field']}: {target}")
+                    else:
+                        await page.keyboard.press("Escape")
+                except Exception:
+                    await page.keyboard.press("Escape")
+
+    except Exception as e:
+        if event_callback:
+            await event_callback("Fill Form", "warn", f"Geo dropdown error: {str(e)[:60]}")
+
+    # Step 5: Handle "Use previous application?" or "Returning candidate" modal
+    try:
+        modal_handled = await page.evaluate("""() => {
+            // Detect and click "Start from scratch" / "No" / "Create new application"
+            for (const btn of document.querySelectorAll('button, [role="button"]')) {
+                if (btn.offsetParent === null) continue;
+                const text = btn.innerText.trim().toLowerCase();
+                if (text.includes('start fresh') || text.includes('start from scratch') ||
+                    text.includes('create new') || text.includes('new application')) {
+                    btn.click();
+                    return true;
+                }
+            }
+            return false;
+        }""")
+        if modal_handled:
+            await asyncio.sleep(2.0)
             if event_callback:
-                await event_callback("Fill Form", "info", f"Country: {country_text}")
+                await event_callback("Navigate", "info", "Dismissed 'returning candidate' modal — starting fresh")
     except Exception:
         pass
 
@@ -2332,6 +2471,39 @@ async def handle_workday_application(
     total_filled = 0
     total_failed = 0
     all_errors = []
+
+    # Pre-step: handle "returning candidate" / "previous application" modal
+    # Some Workday portals show this before the wizard starts
+    try:
+        await asyncio.sleep(2.0)
+        modal_result = await page.evaluate("""() => {
+            // Look for "returning candidate" or "use previous profile" modals
+            for (const btn of document.querySelectorAll('button, [role="button"]')) {
+                if (btn.offsetParent === null) continue;
+                const text = btn.innerText.trim().toLowerCase();
+                if (text.includes('start fresh') || text.includes('start from scratch') ||
+                    text.includes('create new') || text.includes('new application') ||
+                    text === 'no' || text.includes('different account')) {
+                    btn.click();
+                    return {clicked: true, text: btn.innerText.trim()};
+                }
+            }
+            // Check if there's a modal/dialog blocking
+            const dialog = document.querySelector('[role="dialog"], [data-automation-id="modal"]');
+            if (dialog && dialog.offsetParent !== null) {
+                return {found: true, text: dialog.innerText.substring(0, 100)};
+            }
+            return {found: false};
+        }""")
+        if modal_result and modal_result.get("clicked"):
+            await asyncio.sleep(2.0)
+            if event_callback:
+                await event_callback("Navigate", "info", f"Dismissed returning-candidate modal: '{modal_result.get('text', '')}'")
+        elif modal_result and modal_result.get("found"):
+            if event_callback:
+                await event_callback("Navigate", "warning", f"Modal detected but not auto-dismissed: {modal_result.get('text', '')[:80]}")
+    except Exception:
+        pass
 
     for step_num in range(max_steps):
         await asyncio.sleep(2.0)
