@@ -796,322 +796,366 @@ Report what page you're on when you stop."""
               if event_callback:
                   await event_callback("Navigate", "info", f"Apply button check error: {e}")
 
-          # === DIRECT PRE-FILL: fill standard personal info fields without LLM ===
-          # These never change so we fill them immediately via Playwright keyboard input.
-          # This handles both main-page and iframe-embedded forms (Greenhouse embedded boards).
+
+          # ─────────────────────────────────────────────────────────────────
+          # GREENHOUSE: dedicated handler — skip generic LLM fill if handled
+          # ─────────────────────────────────────────────────────────────────
+          _gh_handled = False
           try:
-              pi = _load_personal_info()
-              direct_fills = {
-                  # label patterns → value
-                  "first": pi.get("first_name", "Edrick"),
-                  "last": pi.get("last_name", "Chang"),
-                  "email": pi.get("email", "eachang@scu.edu"),
-                  "phone": pi.get("phone", "4088066495"),
-                  "linkedin": pi.get("linkedin_url", "https://linkedin.com/in/edrickchang"),
-                  "github": pi.get("github_url", "https://github.com/edrickchang"),
-                  "website": pi.get("portfolio_url", ""),
-              }
-              # Try both main page and all frames
-              fill_targets = [page] + [f for f in page.frames if f != page.main_frame]
-              for fill_ctx in fill_targets:
-                  try:
-                      inputs = await fill_ctx.evaluate("""() => {
-                          const results = [];
-                          for (const el of document.querySelectorAll('input[type="text"], input[type="email"], input[type="tel"], input:not([type])')) {
-                              if (el.offsetParent === null) continue;
-                              if (el.value && el.value.trim()) continue;  // already filled
-                              const label = (el.getAttribute('aria-label') || el.placeholder || el.name || el.id || '').toLowerCase();
-                              const r = el.getBoundingClientRect();
-                              results.push({label, x: r.x + r.width/2, y: r.y + r.height/2,
-                                  name: el.name || '', id: el.id || '', placeholder: el.placeholder || ''});
-                          }
-                          return results;
-                      }""")
-                      for inp in (inputs or []):
-                          lbl = inp.get("label", "")
-                          val = None
-                          if any(k in lbl for k in ["first", "fname", "given"]):
-                              val = direct_fills["first"]
-                          elif any(k in lbl for k in ["last", "lname", "surname", "family"]):
-                              val = direct_fills["last"]
-                          elif "email" in lbl:
-                              val = direct_fills["email"]
-                          elif any(k in lbl for k in ["phone", "mobile", "cell"]):
-                              val = direct_fills["phone"]
-                          elif "linkedin" in lbl:
-                              val = direct_fills["linkedin"]
-                          elif "github" in lbl:
-                              val = direct_fills["github"]
-                          elif any(k in lbl for k in ["website", "portfolio", "url"]):
-                              val = direct_fills.get("website", "")
-                          if val:
-                              try:
-                                  await fill_ctx.mouse.click(inp["x"], inp["y"])
-                                  await asyncio.sleep(0.1)
-                                  await fill_ctx.keyboard.press("Control+a")
-                                  await fill_ctx.keyboard.type(val, delay=20)
-                                  await fill_ctx.keyboard.press("Tab")
-                                  if event_callback:
-                                      await event_callback("Pre-Fill", "info", f"Filled '{lbl[:30]}' = '{val[:30]}'")
-                              except Exception as pfe:
-                                  if event_callback:
-                                      await event_callback("Pre-Fill", "info", f"Skip '{lbl[:30]}': {pfe}")
-                  except Exception:
-                      continue
-          except Exception as pre_e:
+              _gh_cur = ""
+              try: _gh_cur = page.url.lower()
+              except Exception: pass
+              if (ats_key == "greenhouse" or "boards.greenhouse.io" in _gh_cur
+                      or "gh_jid=" in _gh_cur):
+                  if event_callback:
+                      await event_callback("Form Fill", "info",
+                          "Greenhouse form detected — using dedicated handler (skipping generic fill)...")
+                  from applicator.greenhouse_handler import handle_greenhouse_apply
+                  from applicator.field_generator_cerebras import generate_field_answer as _gen_fn
+                  _gh_summary = await handle_greenhouse_apply(
+                      page=page,
+                      resume_path=resume_path,
+                      personal_info=_load_personal_info(),
+                      job_description=job_description,
+                      company=company,
+                      role=role,
+                      generate_answer_fn=_gen_fn,
+                      event_callback=event_callback,
+                      screenshot_callback=screenshot_callback,
+                  )
+                  _gh_handled = True
+                  completed = _gh_summary.get("filled", 0) > 0
+                  if event_callback:
+                      await event_callback(
+                          "Form Fill",
+                          "success" if completed else "warning",
+                          f"Greenhouse: {_gh_summary.get('filled', 0)} filled, "
+                          f"{_gh_summary.get('failed', 0)} failed — review and click Submit when ready.",
+                      )
+          except Exception as _gh_e:
+              import traceback as _gh_tb
               if event_callback:
-                  await event_callback("Pre-Fill", "info", f"Pre-fill error: {pre_e}")
+                  await event_callback("Form Fill", "error", f"Greenhouse handler error: {_gh_e}")
+                  await event_callback("Form Fill", "info", _gh_tb.format_exc()[:600])
+          # ─────────────────────────────────────────────────────────────────
 
-          for page_num in range(max_pages):
+          if not _gh_handled:
+            # === DIRECT PRE-FILL: fill standard personal info fields without LLM ===
+            # These never change so we fill them immediately via Playwright keyboard input.
+            # This handles both main-page and iframe-embedded forms (Greenhouse embedded boards).
             try:
-                # Scroll down to load lazy content (Greenhouse loads sections on scroll)
-                try:
-                    page_height = await page.evaluate("document.body.scrollHeight")
-                    for scroll_pos in range(0, page_height + 900, 900):
-                        await page.evaluate(f"window.scrollTo(0, {scroll_pos})")
-                        await asyncio.sleep(0.4)
-                    await page.evaluate("window.scrollTo(0, 0)")
-                    await asyncio.sleep(0.5)
-                except Exception:
-                    pass
-
-                # Extract fields from main page
-                fields = await page.evaluate(JS_EXTRACT_FIELDS)
-                form_ctx = page
-
-                # If no fields on main page, check iframes (Greenhouse, etc.)
-                if len(fields) == 0:
-                    for frame in page.frames:
-                        if frame == page.main_frame:
-                            continue
-                        try:
-                            frame_fields = await frame.evaluate(JS_EXTRACT_FIELDS)
-                            if len(frame_fields) > len(fields):
-                                fields = frame_fields
-                                form_ctx = frame
-                        except Exception:
-                            continue
-
-                # If still nothing on first page, wait for JS-heavy pages
-                if len(fields) == 0 and page_num == 0:
-                    if event_callback:
-                        await event_callback("Form Fill", "info", "No fields yet, waiting for page to render...")
-                    await asyncio.sleep(5.0)
-                    fields = await page.evaluate(JS_EXTRACT_FIELDS)
-                    form_ctx = page
-                    if len(fields) == 0:
-                        for frame in page.frames:
-                            if frame == page.main_frame:
-                                continue
-                            try:
-                                frame_fields = await frame.evaluate(JS_EXTRACT_FIELDS)
-                                if len(frame_fields) > len(fields):
-                                    fields = frame_fields
-                                    form_ctx = frame
-                            except Exception:
-                                continue
-
-                # Filter out non-dict entries (JS may return strings/nulls)
-                fields = [f for f in fields if isinstance(f, dict)]
-
-                # Sanity check: if we got a huge number of fields, we're probably
-                # on the JD page, not the application form. Skip filling.
-                if len(fields) > 200:
-                    if event_callback:
-                        await event_callback("Form Fill", "warning",
-                            f"Page {page_num + 1}: {len(fields)} fields found — too many, likely not an application form. Skipping.")
-                    break
-
-                if len(fields) == 0:
-                    if page_num == 0 and event_callback:
-                        await event_callback("Form Fill", "info", "No form fields found on this page")
-                    break
-
-                if event_callback:
-                    await event_callback("Form Fill", "info",
-                        f"Page {page_num + 1}: {len(fields)} fields found. Filling...")
-
-                # Map and fill with retry passes (up to 2 per page)
-                page_filled = 0
-                for pass_num in range(2):
+                pi = _load_personal_info()
+                direct_fills = {
+                    # label patterns → value
+                    "first": pi.get("first_name", "Edrick"),
+                    "last": pi.get("last_name", "Chang"),
+                    "email": pi.get("email", "eachang@scu.edu"),
+                    "phone": pi.get("phone", "4088066495"),
+                    "linkedin": pi.get("linkedin_url", "https://linkedin.com/in/edrickchang"),
+                    "github": pi.get("github_url", "https://github.com/edrickchang"),
+                    "website": pi.get("portfolio_url", ""),
+                }
+                # Try both main page and all frames
+                fill_targets = [page] + [f for f in page.frames if f != page.main_frame]
+                for fill_ctx in fill_targets:
                     try:
-                        if pass_num > 0:
-                            # Re-extract and filter to unfilled only
-                            await asyncio.sleep(1.5)
-                            re_fields = await form_ctx.evaluate(JS_EXTRACT_FIELDS)
-                            fields = []
-                            for f in re_fields:
-                                if not isinstance(f, dict):
-                                    continue
-                                val = f.get("value", "")
-                                tag = f.get("tag", "")
-                                if not str(val).strip():
-                                    fields.append(f)
-                                elif tag == "select" and val in ("", "0", "--"):
-                                    fields.append(f)
-                            if len(fields) == 0:
-                                break
-
-                        if event_callback:
-                            field_labels = [f.get("label") or f.get("name") or f.get("placeholder","?") for f in fields[:8]]
-                            await event_callback("LLM Map", "info", f"Sending {len(fields)} fields to LLM: {field_labels}")
-                        mappings = await asyncio.to_thread(map_fields_to_profile, fields, job_description, company, role)
-                        # Ensure all mappings are dicts (LLM may return strings)
-                        mappings = [m for m in mappings if isinstance(m, dict)]
-                        if event_callback:
-                            await event_callback("LLM Map", "info", f"LLM returned {len(mappings)} mappings")
-                        if pass_num > 0:
-                            mappings = [m for m in mappings if m.get("action") != "skip" or m.get("value")]
-                        if not mappings:
-                            if event_callback:
-                                await event_callback("LLM Map", "error", "LLM returned no mappings — check API key or rate limit")
-                            break
-
-                        result = await fill_form(form_ctx, mappings, resume_path,
-                            event_callback=event_callback, screenshot_page=page)
-                        if isinstance(result, dict):
-                            page_filled += result.get("filled", 0)
-                            total_failed += result.get("failed", 0)
-                            if result.get("failed", 0) == 0:
-                                break
-                        else:
-                            break
-                    except Exception as e:
-                        import traceback as _tb
-                        tb_str = _tb.format_exc()
-                        err_str = str(e)
-                        if event_callback:
-                            await event_callback("Form Fill", "error", f"Page {page_num+1} pass {pass_num+1}: {err_str[:200]}")
-                            # Surface rate limit / auth errors clearly
-                            if any(k in err_str.lower() for k in ["rate", "429", "quota", "api key", "auth", "context"]):
-                                await event_callback("LLM Error", "error", f"LLM provider failed: {err_str[:300]}")
-                            else:
-                                await event_callback("Form Fill", "info", f"Traceback: {tb_str[:600]}")
-                        break
-
-                total_filled += page_filled
-
-                # Screenshot after filling this page
-                if screenshot_callback:
-                    try:
-                        ss = await page.screenshot(type="png")
-                        await screenshot_callback(ss)
-                    except Exception:
-                        pass
-
-                # Try to advance to the next page (Next/Continue/Submit)
-                await asyncio.sleep(1.0)
-                url_before_next = page.url
-                next_clicked = False
-                next_selectors = [
-                    'button:has-text("Next")', 'button:has-text("Continue")',
-                    'button:has-text("Save and Continue")',
-                    'input[type="submit"][value*="Next" i]',
-                    'input[type="submit"][value*="Continue" i]',
-                    '[data-automation-id="bottom-navigation-next-button"]',
-                    # NOTE: Do NOT include Submit Application / #submit_app here.
-                    # The user must review and submit manually. Auto-clicking Submit
-                    # causes loops on single-page forms (Greenhouse, Lever).
-                ]
-                for sel in next_selectors:
-                    try:
-                        btn = page.locator(sel).first
-                        if await btn.is_visible(timeout=1500):
-                            await btn.scroll_into_view_if_needed(timeout=3000)
-                            await asyncio.sleep(0.5)
-                            await btn.click(timeout=5000)
-                            next_clicked = True
-                            if event_callback:
-                                await event_callback("Navigate", "info", f"Clicked '{sel}' to advance")
-                            await asyncio.sleep(3.0)
-                            break
+                        inputs = await fill_ctx.evaluate("""() => {
+                            const results = [];
+                            for (const el of document.querySelectorAll('input[type="text"], input[type="email"], input[type="tel"], input:not([type])')) {
+                                if (el.offsetParent === null) continue;
+                                if (el.value && el.value.trim()) continue;  // already filled
+                                const label = (el.getAttribute('aria-label') || el.placeholder || el.name || el.id || '').toLowerCase();
+                                const r = el.getBoundingClientRect();
+                                results.push({label, x: r.x + r.width/2, y: r.y + r.height/2,
+                                    name: el.name || '', id: el.id || '', placeholder: el.placeholder || ''});
+                            }
+                            return results;
+                        }""")
+                        for inp in (inputs or []):
+                            lbl = inp.get("label", "")
+                            val = None
+                            if any(k in lbl for k in ["first", "fname", "given"]):
+                                val = direct_fills["first"]
+                            elif any(k in lbl for k in ["last", "lname", "surname", "family"]):
+                                val = direct_fills["last"]
+                            elif "email" in lbl:
+                                val = direct_fills["email"]
+                            elif any(k in lbl for k in ["phone", "mobile", "cell"]):
+                                val = direct_fills["phone"]
+                            elif "linkedin" in lbl:
+                                val = direct_fills["linkedin"]
+                            elif "github" in lbl:
+                                val = direct_fills["github"]
+                            elif any(k in lbl for k in ["website", "portfolio", "url"]):
+                                val = direct_fills.get("website", "")
+                            if val:
+                                try:
+                                    await page.mouse.click(inp["x"], inp["y"])
+                                    await asyncio.sleep(0.1)
+                                    await fill_ctx.keyboard.press("Control+a")
+                                    await fill_ctx.keyboard.type(val, delay=20)
+                                    await fill_ctx.keyboard.press("Tab")
+                                    if event_callback:
+                                        await event_callback("Pre-Fill", "info", f"Filled '{lbl[:30]}' = '{val[:30]}'")
+                                except Exception as pfe:
+                                    if event_callback:
+                                        await event_callback("Pre-Fill", "info", f"Skip '{lbl[:30]}': {pfe}")
                     except Exception:
                         continue
-
-                # Also check iframes for Next buttons
-                if not next_clicked:
-                    for frame in page.frames:
-                        if frame == page.main_frame:
-                            continue
-                        for sel in next_selectors[:6]:
-                            try:
-                                btn = frame.locator(sel).first
-                                if await btn.is_visible(timeout=1000):
-                                    await btn.click(timeout=5000)
-                                    next_clicked = True
-                                    if event_callback:
-                                        await event_callback("Navigate", "info", "Clicked Next in iframe")
-                                    await asyncio.sleep(3.0)
-                                    break
-                            except Exception:
-                                continue
-                        if next_clicked:
-                            break
-
-                # After clicking Next, check if the page actually advanced.
-                # If URL is the same, look for validation errors and try to fix them.
-                if next_clicked and page.url == url_before_next:
-                    await asyncio.sleep(1.5)
-                    try:
-                        validation_info = await page.evaluate("""() => {
-                            // Collect all visible error messages
-                            const errorSelectors = [
-                                '[class*="error"]:not([style*="display:none"])',
-                                '[class*="invalid"]:not([style*="display:none"])',
-                                '[aria-invalid="true"]',
-                                '.field-error', '.form-error', '.help-block.error',
-                                '[data-automation-id*="error"]',
-                                '.validation-message', '.error-message',
-                            ];
-                            const errors = [];
-                            const emptyRequired = [];
-                            for (const sel of errorSelectors) {
-                                for (const el of document.querySelectorAll(sel)) {
-                                    const txt = (el.innerText || '').trim();
-                                    if (txt && txt.length < 200) errors.push(txt);
-                                }
-                            }
-                            // Find empty required inputs
-                            for (const inp of document.querySelectorAll('input[required], select[required], textarea[required], [aria-required="true"]')) {
-                                if (!inp.value || !inp.value.trim()) {
-                                    const lbl = inp.getAttribute('aria-label') || inp.placeholder || inp.name || inp.id || '';
-                                    if (lbl) emptyRequired.push(lbl);
-                                }
-                            }
-                            return { errors: [...new Set(errors)].slice(0, 8), emptyRequired: [...new Set(emptyRequired)].slice(0, 8) };
-                        }""")
-                        if validation_info and (validation_info.get("errors") or validation_info.get("emptyRequired")):
-                            err_msgs = validation_info.get("errors", [])
-                            empty = validation_info.get("emptyRequired", [])
-                            if event_callback:
-                                await event_callback("Validation", "warning",
-                                    f"Page didn't advance — validation errors detected. "
-                                    f"Errors: {err_msgs[:3]}. Empty required: {empty[:3]}")
-                            # Scroll to first error and continue to next pass
-                            await page.evaluate("() => { const el = document.querySelector('[aria-invalid=\"true\"], [class*=\"error\"]'); if (el) el.scrollIntoView({behavior:'smooth', block:'center'}); }")
-                            # Don't break — outer pass loop will re-extract and retry unfilled fields
-                        else:
-                            if event_callback:
-                                await event_callback("Navigate", "info", "Clicked Next but page didn't advance — may be last page or JS redirect pending")
-                    except Exception:
-                        pass
-
-                if not next_clicked:
-                    if event_callback:
-                        await event_callback("Form Fill", "info",
-                            f"No Next/Continue button found. Filled {total_filled} fields total. "
-                            f"Form may be complete — review and submit manually.")
-                    break
-
-            except Exception as e:
+            except Exception as pre_e:
                 if event_callback:
-                    await event_callback("Form Fill", "error", f"Page {page_num + 1} error: {e}")
-                import traceback
-                if event_callback:
-                    await event_callback("Form Fill", "info", traceback.format_exc()[:500])
-                break
+                    await event_callback("Pre-Fill", "info", f"Pre-fill error: {pre_e}")
 
-          completed = total_filled > 0
+            for page_num in range(max_pages):
+              try:
+                  # Scroll down to load lazy content (Greenhouse loads sections on scroll)
+                  try:
+                      page_height = await page.evaluate("document.body.scrollHeight")
+                      for scroll_pos in range(0, page_height + 900, 900):
+                          await page.evaluate(f"window.scrollTo(0, {scroll_pos})")
+                          await asyncio.sleep(0.4)
+                      await page.evaluate("window.scrollTo(0, 0)")
+                      await asyncio.sleep(0.5)
+                  except Exception:
+                      pass
+
+                  # Extract fields from main page
+                  fields = await page.evaluate(JS_EXTRACT_FIELDS)
+                  form_ctx = page
+
+                  # If no fields on main page, check iframes (Greenhouse, etc.)
+                  if len(fields) == 0:
+                      for frame in page.frames:
+                          if frame == page.main_frame:
+                              continue
+                          try:
+                              frame_fields = await frame.evaluate(JS_EXTRACT_FIELDS)
+                              if len(frame_fields) > len(fields):
+                                  fields = frame_fields
+                                  form_ctx = frame
+                          except Exception:
+                              continue
+
+                  # If still nothing on first page, wait for JS-heavy pages
+                  if len(fields) == 0 and page_num == 0:
+                      if event_callback:
+                          await event_callback("Form Fill", "info", "No fields yet, waiting for page to render...")
+                      await asyncio.sleep(5.0)
+                      fields = await page.evaluate(JS_EXTRACT_FIELDS)
+                      form_ctx = page
+                      if len(fields) == 0:
+                          for frame in page.frames:
+                              if frame == page.main_frame:
+                                  continue
+                              try:
+                                  frame_fields = await frame.evaluate(JS_EXTRACT_FIELDS)
+                                  if len(frame_fields) > len(fields):
+                                      fields = frame_fields
+                                      form_ctx = frame
+                              except Exception:
+                                  continue
+
+                  # Filter out non-dict entries (JS may return strings/nulls)
+                  fields = [f for f in fields if isinstance(f, dict)]
+
+                  # Sanity check: if we got a huge number of fields, we're probably
+                  # on the JD page, not the application form. Skip filling.
+                  if len(fields) > 200:
+                      if event_callback:
+                          await event_callback("Form Fill", "warning",
+                              f"Page {page_num + 1}: {len(fields)} fields found — too many, likely not an application form. Skipping.")
+                      break
+
+                  if len(fields) == 0:
+                      if page_num == 0 and event_callback:
+                          await event_callback("Form Fill", "info", "No form fields found on this page")
+                      break
+
+                  if event_callback:
+                      await event_callback("Form Fill", "info",
+                          f"Page {page_num + 1}: {len(fields)} fields found. Filling...")
+
+                  # Map and fill with retry passes (up to 2 per page)
+                  page_filled = 0
+                  for pass_num in range(2):
+                      try:
+                          if pass_num > 0:
+                              # Re-extract and filter to unfilled only
+                              await asyncio.sleep(1.5)
+                              re_fields = await form_ctx.evaluate(JS_EXTRACT_FIELDS)
+                              fields = []
+                              for f in re_fields:
+                                  if not isinstance(f, dict):
+                                      continue
+                                  val = f.get("value", "")
+                                  tag = f.get("tag", "")
+                                  if not str(val).strip():
+                                      fields.append(f)
+                                  elif tag == "select" and val in ("", "0", "--"):
+                                      fields.append(f)
+                              if len(fields) == 0:
+                                  break
+
+                          if event_callback:
+                              field_labels = [f.get("label") or f.get("name") or f.get("placeholder","?") for f in fields[:8]]
+                              await event_callback("LLM Map", "info", f"Sending {len(fields)} fields to LLM: {field_labels}")
+                          mappings = await asyncio.to_thread(map_fields_to_profile, fields, job_description, company, role)
+                          # Ensure all mappings are dicts (LLM may return strings)
+                          mappings = [m for m in mappings if isinstance(m, dict)]
+                          if event_callback:
+                              await event_callback("LLM Map", "info", f"LLM returned {len(mappings)} mappings")
+                          if pass_num > 0:
+                              mappings = [m for m in mappings if m.get("action") != "skip" or m.get("value")]
+                          if not mappings:
+                              if event_callback:
+                                  await event_callback("LLM Map", "error", "LLM returned no mappings — check API key or rate limit")
+                              break
+
+                          result = await fill_form(form_ctx, mappings, resume_path,
+                              event_callback=event_callback, screenshot_page=page)
+                          if isinstance(result, dict):
+                              page_filled += result.get("filled", 0)
+                              total_failed += result.get("failed", 0)
+                              if result.get("failed", 0) == 0:
+                                  break
+                          else:
+                              break
+                      except Exception as e:
+                          import traceback as _tb
+                          tb_str = _tb.format_exc()
+                          err_str = str(e)
+                          if event_callback:
+                              await event_callback("Form Fill", "error", f"Page {page_num+1} pass {pass_num+1}: {err_str[:200]}")
+                              # Surface rate limit / auth errors clearly
+                              if any(k in err_str.lower() for k in ["rate", "429", "quota", "api key", "auth", "context"]):
+                                  await event_callback("LLM Error", "error", f"LLM provider failed: {err_str[:300]}")
+                              else:
+                                  await event_callback("Form Fill", "info", f"Traceback: {tb_str[:600]}")
+                          break
+
+                  total_filled += page_filled
+
+                  # Screenshot after filling this page
+                  if screenshot_callback:
+                      try:
+                          ss = await page.screenshot(type="png")
+                          await screenshot_callback(ss)
+                      except Exception:
+                          pass
+
+                  # Try to advance to the next page (Next/Continue/Submit)
+                  await asyncio.sleep(1.0)
+                  url_before_next = page.url
+                  next_clicked = False
+                  next_selectors = [
+                      'button:has-text("Next")', 'button:has-text("Continue")',
+                      'button:has-text("Save and Continue")',
+                      'input[type="submit"][value*="Next" i]',
+                      'input[type="submit"][value*="Continue" i]',
+                      '[data-automation-id="bottom-navigation-next-button"]',
+                      # NOTE: Do NOT include Submit Application / #submit_app here.
+                      # The user must review and submit manually. Auto-clicking Submit
+                      # causes loops on single-page forms (Greenhouse, Lever).
+                  ]
+                  for sel in next_selectors:
+                      try:
+                          btn = page.locator(sel).first
+                          if await btn.is_visible(timeout=1500):
+                              await btn.scroll_into_view_if_needed(timeout=3000)
+                              await asyncio.sleep(0.5)
+                              await btn.click(timeout=5000)
+                              next_clicked = True
+                              if event_callback:
+                                  await event_callback("Navigate", "info", f"Clicked '{sel}' to advance")
+                              await asyncio.sleep(3.0)
+                              break
+                      except Exception:
+                          continue
+
+                  # Also check iframes for Next buttons
+                  if not next_clicked:
+                      for frame in page.frames:
+                          if frame == page.main_frame:
+                              continue
+                          for sel in next_selectors[:6]:
+                              try:
+                                  btn = frame.locator(sel).first
+                                  if await btn.is_visible(timeout=1000):
+                                      await btn.click(timeout=5000)
+                                      next_clicked = True
+                                      if event_callback:
+                                          await event_callback("Navigate", "info", "Clicked Next in iframe")
+                                      await asyncio.sleep(3.0)
+                                      break
+                              except Exception:
+                                  continue
+                          if next_clicked:
+                              break
+
+                  # After clicking Next, check if the page actually advanced.
+                  # If URL is the same, look for validation errors and try to fix them.
+                  if next_clicked and page.url == url_before_next:
+                      await asyncio.sleep(1.5)
+                      try:
+                          validation_info = await page.evaluate("""() => {
+                              // Collect all visible error messages
+                              const errorSelectors = [
+                                  '[class*="error"]:not([style*="display:none"])',
+                                  '[class*="invalid"]:not([style*="display:none"])',
+                                  '[aria-invalid="true"]',
+                                  '.field-error', '.form-error', '.help-block.error',
+                                  '[data-automation-id*="error"]',
+                                  '.validation-message', '.error-message',
+                              ];
+                              const errors = [];
+                              const emptyRequired = [];
+                              for (const sel of errorSelectors) {
+                                  for (const el of document.querySelectorAll(sel)) {
+                                      const txt = (el.innerText || '').trim();
+                                      if (txt && txt.length < 200) errors.push(txt);
+                                  }
+                              }
+                              // Find empty required inputs
+                              for (const inp of document.querySelectorAll('input[required], select[required], textarea[required], [aria-required="true"]')) {
+                                  if (!inp.value || !inp.value.trim()) {
+                                      const lbl = inp.getAttribute('aria-label') || inp.placeholder || inp.name || inp.id || '';
+                                      if (lbl) emptyRequired.push(lbl);
+                                  }
+                              }
+                              return { errors: [...new Set(errors)].slice(0, 8), emptyRequired: [...new Set(emptyRequired)].slice(0, 8) };
+                          }""")
+                          if validation_info and (validation_info.get("errors") or validation_info.get("emptyRequired")):
+                              err_msgs = validation_info.get("errors", [])
+                              empty = validation_info.get("emptyRequired", [])
+                              if event_callback:
+                                  await event_callback("Validation", "warning",
+                                      f"Page didn't advance — validation errors detected. "
+                                      f"Errors: {err_msgs[:3]}. Empty required: {empty[:3]}")
+                              # Scroll to first error and continue to next pass
+                              await page.evaluate("() => { const el = document.querySelector('[aria-invalid=\"true\"], [class*=\"error\"]'); if (el) el.scrollIntoView({behavior:'smooth', block:'center'}); }")
+                              # Don't break — outer pass loop will re-extract and retry unfilled fields
+                          else:
+                              if event_callback:
+                                  await event_callback("Navigate", "info", "Clicked Next but page didn't advance — may be last page or JS redirect pending")
+                      except Exception:
+                          pass
+
+                  if not next_clicked:
+                      if event_callback:
+                          await event_callback("Form Fill", "info",
+                              f"No Next/Continue button found. Filled {total_filled} fields total. "
+                              f"Form may be complete — review and submit manually.")
+                      break
+
+              except Exception as e:
+                  if event_callback:
+                      await event_callback("Form Fill", "error", f"Page {page_num + 1} error: {e}")
+                  import traceback
+                  if event_callback:
+                      await event_callback("Form Fill", "info", traceback.format_exc()[:500])
+                  break
+
+            completed = total_filled > 0
 
           # Final page scan — report anything that still needs human attention
           if event_callback and page:
