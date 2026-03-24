@@ -1001,6 +1001,7 @@ Report what page you're on when you stop."""
 
                 # Try to advance to the next page (Next/Continue/Submit)
                 await asyncio.sleep(1.0)
+                url_before_next = page.url
                 next_clicked = False
                 next_selectors = [
                     'button:has-text("Next")', 'button:has-text("Continue")',
@@ -1047,10 +1048,59 @@ Report what page you're on when you stop."""
                         if next_clicked:
                             break
 
+                # After clicking Next, check if the page actually advanced.
+                # If URL is the same, look for validation errors and try to fix them.
+                if next_clicked and page.url == url_before_next:
+                    await asyncio.sleep(1.5)
+                    try:
+                        validation_info = await page.evaluate("""() => {
+                            // Collect all visible error messages
+                            const errorSelectors = [
+                                '[class*="error"]:not([style*="display:none"])',
+                                '[class*="invalid"]:not([style*="display:none"])',
+                                '[aria-invalid="true"]',
+                                '.field-error', '.form-error', '.help-block.error',
+                                '[data-automation-id*="error"]',
+                                '.validation-message', '.error-message',
+                            ];
+                            const errors = [];
+                            const emptyRequired = [];
+                            for (const sel of errorSelectors) {
+                                for (const el of document.querySelectorAll(sel)) {
+                                    const txt = (el.innerText || '').trim();
+                                    if (txt && txt.length < 200) errors.push(txt);
+                                }
+                            }
+                            // Find empty required inputs
+                            for (const inp of document.querySelectorAll('input[required], select[required], textarea[required], [aria-required="true"]')) {
+                                if (!inp.value || !inp.value.trim()) {
+                                    const lbl = inp.getAttribute('aria-label') || inp.placeholder || inp.name || inp.id || '';
+                                    if (lbl) emptyRequired.push(lbl);
+                                }
+                            }
+                            return { errors: [...new Set(errors)].slice(0, 8), emptyRequired: [...new Set(emptyRequired)].slice(0, 8) };
+                        }""")
+                        if validation_info and (validation_info.get("errors") or validation_info.get("emptyRequired")):
+                            err_msgs = validation_info.get("errors", [])
+                            empty = validation_info.get("emptyRequired", [])
+                            if event_callback:
+                                await event_callback("Validation", "warning",
+                                    f"Page didn't advance — validation errors detected. "
+                                    f"Errors: {err_msgs[:3]}. Empty required: {empty[:3]}")
+                            # Scroll to first error and continue to next pass
+                            await page.evaluate("() => { const el = document.querySelector('[aria-invalid=\"true\"], [class*=\"error\"]'); if (el) el.scrollIntoView({behavior:'smooth', block:'center'}); }")
+                            # Don't break — outer pass loop will re-extract and retry unfilled fields
+                        else:
+                            if event_callback:
+                                await event_callback("Navigate", "info", "Clicked Next but page didn't advance — may be last page or JS redirect pending")
+                    except Exception:
+                        pass
+
                 if not next_clicked:
                     if event_callback:
                         await event_callback("Form Fill", "info",
-                            f"No Next/Continue button found. Filled {total_filled} fields total.")
+                            f"No Next/Continue button found. Filled {total_filled} fields total. "
+                            f"Form may be complete — review and submit manually.")
                     break
 
             except Exception as e:
@@ -1062,6 +1112,48 @@ Report what page you're on when you stop."""
                 break
 
           completed = total_filled > 0
+
+          # Final page scan — report anything that still needs human attention
+          if event_callback and page:
+              try:
+                  final_check = await page.evaluate("""() => {
+                      const needsHuman = [];
+                      // Still-empty required fields
+                      for (const inp of document.querySelectorAll('input[required], select[required], textarea[required], [aria-required="true"]')) {
+                          if (inp.offsetParent === null) continue;
+                          if (!inp.value || !inp.value.trim()) {
+                              const lbl = inp.getAttribute('aria-label') || inp.placeholder || inp.name || '';
+                              if (lbl && !lbl.toLowerCase().includes('search')) needsHuman.push(lbl.trim().slice(0, 50));
+                          }
+                      }
+                      // Visible validation errors
+                      const errs = [];
+                      for (const sel of ['[aria-invalid="true"]', '[class*="error-message"]', '.validation-message']) {
+                          for (const el of document.querySelectorAll(sel)) {
+                              const t = (el.innerText||'').trim();
+                              if (t && t.length < 150 && el.offsetParent !== null) errs.push(t);
+                          }
+                      }
+                      // File inputs still needing upload
+                      const fileInputs = document.querySelectorAll('input[type="file"]');
+                      const hasUnfilledFile = [...fileInputs].some(f => f.offsetParent !== null && (!f.files || f.files.length === 0));
+                      return { needsHuman: [...new Set(needsHuman)].slice(0, 6), errors: [...new Set(errs)].slice(0, 4), hasUnfilledFile };
+                  }""")
+                  if final_check:
+                      if final_check.get("needsHuman"):
+                          await event_callback("Review Needed", "warning",
+                              f"These fields still need attention: {final_check['needsHuman']}")
+                      if final_check.get("errors"):
+                          await event_callback("Review Needed", "warning",
+                              f"Validation errors on page: {final_check['errors']}")
+                      if final_check.get("hasUnfilledFile"):
+                          await event_callback("Review Needed", "warning",
+                              "A file upload field is still empty — resume may not have uploaded")
+                      if not final_check.get("needsHuman") and not final_check.get("errors") and not final_check.get("hasUnfilledFile"):
+                          await event_callback("Form Fill", "success",
+                              f"Form filled successfully ({total_filled} fields). Review and click Submit when ready.")
+              except Exception:
+                  pass
 
     # Take final screenshot
     if screenshot_callback and page:
