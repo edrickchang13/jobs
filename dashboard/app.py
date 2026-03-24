@@ -466,7 +466,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 </div>
 
                 <div style="border-top: 1px solid #222; padding-top: 8px;">
-                    <button class="filter-btn" onclick="loadJobs()" style="width:100%; margin-bottom: 6px;">Refresh Jobs</button>
+                    <button class="filter-btn" onclick="loadJobs(true)" style="width:100%; margin-bottom: 6px;">Refresh Jobs</button>
                     <button class="filter-btn secondary" onclick="resetFilters()" style="width:100%;">Reset Filters</button>
                 </div>
 
@@ -574,6 +574,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         let allJobs = [];
         let appliedUrls = new Set();
         let eventSource = null;
+        let seenEventIds = new Set();  // dedup SSE events on reconnect
 
         const BAY_AREA_CITIES = [
             'san francisco', 'sf', 'san jose', 'palo alto', 'mountain view',
@@ -600,15 +601,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         }
 
         // ===== JOBS LIST =====
-        function loadJobs() {
-            document.getElementById('jobsBody').innerHTML = '<tr><td colspan="6" class="loading-msg">Loading jobs from GitHub...</td></tr>';
+        function loadJobs(forceRefresh) {
+            const isRefresh = !!forceRefresh;
+            document.getElementById('jobsBody').innerHTML = '<tr><td colspan="6" class="loading-msg">' + (isRefresh ? 'Refreshing from GitHub...' : 'Loading jobs...') + '</td></tr>';
             document.getElementById('jobsCount').textContent = 'Loading...';
-            // Load applied URLs first, then jobs
             fetch('/api/applied').then(r => r.json()).then(data => {
                 appliedUrls = new Set(data.urls || []);
             }).catch(() => {}).finally(() => {
-                fetch('/api/jobs').then(r => r.json()).then(data => {
+                const url = isRefresh ? '/api/jobs?refresh=true' : '/api/jobs';
+                fetch(url).then(r => r.json()).then(data => {
                     allJobs = data.jobs || [];
+                    const cacheNote = data.cached ? ' (cached)' : '';
+                    if (data.warning) console.warn('Jobs warning:', data.warning);
                     applyFilters();
                 }).catch(err => {
                     document.getElementById('jobsBody').innerHTML = '<tr><td colspan="6" class="loading-msg">Failed to load jobs: ' + err + '</td></tr>';
@@ -738,21 +742,39 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
             document.querySelectorAll('.step-pill').forEach(p => p.className = 'step-pill');
 
-            if (eventSource) eventSource.close();
-            eventSource = new EventSource('/events');
-            eventSource.onmessage = function(e) {
-                const event = JSON.parse(e.data);
-                addEvent(event);
-                updatePills(event);
-            };
+            // Reset dedup set for new run
+            seenEventIds = new Set();
+            if (eventSource) { eventSource.close(); eventSource = null; }
 
-            // Start screenshot SSE stream
-            startScreenshotStream();
-
+            // POST /run first so pipeline_events.clear() runs server-side BEFORE
+            // the EventSource connects (prevents old events from replaying).
             fetch('/run', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({url, company, role})
+            }).then(() => {
+                eventSource = new EventSource('/events');
+                eventSource.onmessage = function(e) {
+                    const event = JSON.parse(e.data);
+                    // Deduplicate by server-assigned event ID (handles SSE auto-reconnect)
+                    if (event.id !== undefined && seenEventIds.has(event.id)) return;
+                    if (event.id !== undefined) seenEventIds.add(event.id);
+                    addEvent(event);
+                    updatePills(event);
+                };
+                // Start screenshot SSE stream only after run is confirmed started
+                startScreenshotStream();
+            }).catch(() => {
+                // Even on fetch error, try to connect (server might be busy)
+                eventSource = new EventSource('/events');
+                eventSource.onmessage = function(e) {
+                    const event = JSON.parse(e.data);
+                    if (event.id !== undefined && seenEventIds.has(event.id)) return;
+                    if (event.id !== undefined) seenEventIds.add(event.id);
+                    addEvent(event);
+                    updatePills(event);
+                };
+                startScreenshotStream();
             });
         }
 
@@ -996,15 +1018,31 @@ async def index():
     return DASHBOARD_HTML
 
 
+_jobs_cache: list = []
+_jobs_cache_time: float = 0.0
+_JOBS_CACHE_TTL = 1800  # 30 minutes
+
 @app.get("/api/jobs")
-async def get_jobs():
-    """Fetch and parse internship listings from SimplifyJobs GitHub repo."""
+async def get_jobs(refresh: bool = False):
+    """Fetch and parse internship listings from SimplifyJobs GitHub repo.
+    Cached for 30 minutes. Pass ?refresh=true to force a fresh fetch.
+    """
+    global _jobs_cache, _jobs_cache_time
+    import time as _time
+    now = _time.time()
+    if not refresh and _jobs_cache and (now - _jobs_cache_time) < _JOBS_CACHE_TTL:
+        return JSONResponse({"jobs": _jobs_cache, "total": len(_jobs_cache), "cached": True})
     try:
         from scraper.github_scraper import fetch_readme, parse_internship_table
-        readme = fetch_readme()
+        readme = await asyncio.to_thread(fetch_readme)
         postings = parse_internship_table(readme)
-        return JSONResponse({"jobs": postings, "total": len(postings)})
+        _jobs_cache = postings
+        _jobs_cache_time = now
+        return JSONResponse({"jobs": postings, "total": len(postings), "cached": False})
     except Exception as e:
+        # Return stale cache if available rather than empty
+        if _jobs_cache:
+            return JSONResponse({"jobs": _jobs_cache, "total": len(_jobs_cache), "cached": True, "warning": str(e)})
         return JSONResponse({"jobs": [], "total": 0, "error": str(e)}, status_code=500)
 
 
@@ -1071,13 +1109,24 @@ async def upload_document(doc_type: str, file: UploadFile = File(...)):
 
 
 @app.get("/events")
-async def events():
+async def events(request: Request):
+    # Support Last-Event-ID header for reconnect (browser sends this automatically)
+    last_event_id_header = request.headers.get("last-event-id", "")
+    try:
+        resume_from = int(last_event_id_header) + 1 if last_event_id_header else 0
+    except ValueError:
+        resume_from = 0
+
     async def event_stream():
-        last_id = 0
+        # Yield control immediately so any concurrent /run POST can clear
+        # pipeline_events before we start streaming (prevents old-event replay).
+        await asyncio.sleep(0)
+        last_id = max(resume_from, 0)
         while True:
             if last_id < len(pipeline_events):
                 for event in pipeline_events[last_id:]:
-                    yield f"data: {json.dumps(event)}\n\n"
+                    # Include SSE `id:` so browser sends Last-Event-ID on reconnect
+                    yield f"id: {event['id']}\ndata: {json.dumps(event)}\n\n"
                 last_id = len(pipeline_events)
             await asyncio.sleep(0.3)
     return StreamingResponse(event_stream(), media_type="text/event-stream")

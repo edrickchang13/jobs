@@ -1041,8 +1041,29 @@ def detect_ats(url: str, page_html: str = "") -> str | None:
         ATS key string (e.g. 'lever', 'greenhouse') or None if unrecognized.
     """
     import re
+    from urllib.parse import urlparse, parse_qs, unquote
 
-    url_lower = url.lower()
+    if not url:
+        return None
+
+    # Unwrap Simplify redirect URLs — they encode the real destination in
+    # the 'redirectUrl' or 'url' query parameter, or embed it in the path.
+    # e.g. https://simplify.jobs/p/abc?utm_source=...
+    #      https://redirect.simplify.jobs?redirectUrl=https%3A%2F%2Fjobs.lever.co%2F...
+    url_to_check = url
+    try:
+        parsed = urlparse(url)
+        host = parsed.netloc.lower()
+        if "simplify" in host:
+            qs = parse_qs(parsed.query)
+            for param in ("redirectUrl", "redirect_url", "url", "target", "dest"):
+                if param in qs:
+                    url_to_check = unquote(qs[param][0])
+                    break
+    except Exception:
+        pass
+
+    url_lower = url_to_check.lower()
 
     for ats_key, profile in ATS_PROFILES.items():
         # Skip alias entries for primary detection
@@ -1063,8 +1084,6 @@ def detect_ats(url: str, page_html: str = "") -> str | None:
                 continue
             detection = profile.get("detection", {})
             for marker in detection.get("dom_markers", []):
-                # Convert CSS selector to a simple string search
-                # Strip brackets and attribute selectors for basic matching
                 search_term = marker.strip("[]#.").split("=")[0].split("*")[0]
                 if search_term and search_term in page_html:
                     return ats_key

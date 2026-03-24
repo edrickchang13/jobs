@@ -79,7 +79,6 @@ def parse_internship_table(readme_text: str) -> list[dict]:
             if not apply_link:
                 continue
 
-            # Clean UTM params for dedup but keep original for applying
             url = apply_link
 
             # --- Age ---
@@ -94,7 +93,24 @@ def parse_internship_table(readme_text: str) -> list[dict]:
                 "ats": detect_ats(url) or "unknown",
             })
 
-    return postings
+    # Deduplicate: prefer first occurrence, dedupe by (company, role) keeping
+    # the one with the most specific URL (non-Simplify redirect preferred).
+    seen_keys: set = set()
+    seen_urls: set = set()
+    deduped = []
+    for p in postings:
+        # Strip UTM params for URL-level dedup
+        clean_url = re.sub(r'[?&](utm_[^&]*|ref=[^&]*|source=[^&]*)', '', p["url"]).rstrip('?&')
+        key = (p["company"].lower(), p["role"].lower())
+        if clean_url in seen_urls:
+            continue
+        seen_urls.add(clean_url)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        deduped.append(p)
+
+    return deduped
 
 
 def get_new_postings() -> list[dict]:
