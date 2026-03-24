@@ -800,6 +800,102 @@ async def fill_workday_questions_hardcoded(page: Page, company: str = "", role: 
     except Exception:
         pass
 
+    # Scan for textarea fields (free-text application questions) — use LLM if available
+    try:
+        textareas = await page.evaluate("""() => {
+            const results = [];
+            const tas = document.querySelectorAll('textarea, [contenteditable="true"]');
+            for (const ta of tas) {
+                if (ta.offsetParent === null) continue;
+                if (ta.value && ta.value.trim()) continue;  // Already filled
+                if (ta.innerText && ta.innerText.trim()) continue;  // contenteditable with content
+                const container = ta.closest('[data-automation-id^="formField-"]');
+                let label = '';
+                if (container) {
+                    const dataid = container.getAttribute('data-automation-id') || '';
+                    if (dataid.startsWith('formField-')) {
+                        const uuid = dataid.replace('formField-', '');
+                        const sib = document.querySelector('[data-automation-id="formLabel-' + uuid + '"]');
+                        if (sib) label = sib.innerText.trim();
+                    }
+                    if (!label) {
+                        const lbl = container.querySelector('label');
+                        if (lbl) label = lbl.innerText.trim();
+                    }
+                }
+                if (!label) {
+                    const prev = ta.closest('[class]')?.previousElementSibling;
+                    if (prev) label = prev.innerText.trim().split('\\n')[0];
+                }
+                const rect = ta.getBoundingClientRect();
+                results.push({label, x: rect.x + rect.width/2, y: rect.y + rect.height/2,
+                               isContentEditable: ta.contentEditable === 'true'});
+            }
+            return results;
+        }""")
+
+        if textareas:
+            # Try to use LLM for free-text answers
+            try:
+                from applicator.field_generator_cerebras import generate_field_answer
+                use_llm = True
+            except ImportError:
+                use_llm = False
+
+            for ta in textareas:
+                q_label = ta.get("label", "").strip()
+                if not q_label:
+                    continue
+                if event_callback:
+                    await event_callback("Fill Form", "info", f"Textarea question: '{q_label[:60]}'")
+
+                answer = None
+                if use_llm:
+                    try:
+                        answer = await asyncio.to_thread(
+                            generate_field_answer,
+                            q_label,
+                            company,
+                            role,
+                        )
+                    except Exception as e:
+                        if event_callback:
+                            await event_callback("Fill Form", "warning", f"LLM failed for textarea: {str(e)[:60]}")
+
+                # Fallback: generic short answer
+                if not answer:
+                    label_lower = q_label.lower()
+                    if "cover letter" in label_lower:
+                        answer = f"I am excited to apply for the {role} role at {company}. My background in Computer Science and Engineering at Santa Clara University, combined with hands-on project experience, makes me a strong candidate. I am eager to contribute to your team and grow professionally."
+                    elif "why" in label_lower and ("company" in label_lower or company.lower() in label_lower):
+                        answer = f"I'm drawn to {company} because of its innovative work and strong engineering culture. As a CS student passionate about building impactful software, I see this internship as an ideal opportunity to apply my skills while learning from an experienced team."
+                    elif "experience" in label_lower or "background" in label_lower:
+                        answer = "I have experience building full-stack applications, working with Python, JavaScript, and various frameworks. I enjoy solving complex problems and collaborating on cross-functional teams."
+                    elif "strength" in label_lower:
+                        answer = "My key strengths are strong problem-solving skills, quick learning ability, and attention to code quality. I thrive in collaborative environments and enjoy tackling challenging technical problems."
+                    else:
+                        answer = f"I am very interested in this opportunity and confident my background in Computer Science and Engineering makes me a strong fit for the {role} role."
+
+                # Fill the textarea
+                try:
+                    await page.mouse.click(ta["x"], ta["y"])
+                    await asyncio.sleep(0.3)
+                    if ta.get("isContentEditable"):
+                        await page.keyboard.type(answer, delay=15)
+                    else:
+                        await page.keyboard.type(answer, delay=15)
+                    filled += 1
+                    if event_callback:
+                        await event_callback("Fill Form", "success", f"Filled textarea '{q_label[:40]}'")
+                except Exception as e2:
+                    failed += 1
+                    if event_callback:
+                        await event_callback("Fill Form", "warning", f"Textarea fill error: {str(e2)[:60]}")
+
+    except Exception as e:
+        if event_callback:
+            await event_callback("Fill Form", "warn", f"Textarea scan error: {str(e)[:80]}")
+
     if event_callback:
         await event_callback("Fill Form", "info", f"Questions page: {filled} filled, {failed} failed")
 
@@ -1822,6 +1918,35 @@ async def handle_my_experience(page: Page, resume_path: str, event_callback=None
                 except Exception:
                     continue
 
+            # Field of Study / Major
+            major = info.get("major", "Computer Science and Engineering")
+            for sel in [
+                '[data-automation-id="fieldOfStudy"]',
+                '[data-automation-id="major"]',
+                'input[aria-label*="Field of Study" i]',
+                'input[aria-label*="Major" i]',
+                'input[placeholder*="Field of Study" i]',
+            ]:
+                try:
+                    el = page.locator(sel).first
+                    if await el.is_visible(timeout=1500):
+                        await el.click(timeout=2000)
+                        await page.keyboard.type("Computer Science", delay=50)
+                        await asyncio.sleep(1.0)
+                        # Try to select from autocomplete
+                        try:
+                            opt = page.locator('[role="option"], li[class*="option"]').first
+                            if await opt.is_visible(timeout=1500):
+                                await opt.click(timeout=2000)
+                        except Exception:
+                            await page.keyboard.press("Tab")
+                        filled += 1
+                        if event_callback:
+                            await event_callback("Fill Form", "info", f"Filled field of study: {major}")
+                        break
+                except Exception:
+                    continue
+
             # GPA
             for sel in ['[data-automation-id="gpa"]', 'input[aria-label*="GPA" i]']:
                 try:
@@ -1832,6 +1957,49 @@ async def handle_my_experience(page: Page, resume_path: str, event_callback=None
                         if event_callback:
                             await event_callback("Fill Form", "info", f"Filled GPA: {gpa}")
                         break
+                except Exception:
+                    continue
+
+            # Start Date (year/month) — Workday uses dropdown selectors
+            for date_sel, date_val in [
+                ('[data-automation-id="startDateYear"] button, select[data-automation-id*="startYear"]', "2024"),
+                ('[data-automation-id="startDateMonth"] button, select[data-automation-id*="startMonth"]', "September"),
+            ]:
+                try:
+                    el = page.locator(date_sel).first
+                    if await el.is_visible(timeout=1000):
+                        tag = await el.evaluate("el => el.tagName.toLowerCase()")
+                        if tag == "select":
+                            await el.select_option(label=date_val)
+                        else:
+                            await el.click(timeout=2000)
+                            await asyncio.sleep(0.5)
+                            opt = page.locator(f'[role="option"]:has-text("{date_val}"), li:has-text("{date_val}")').first
+                            if await opt.is_visible(timeout=1500):
+                                await opt.click(timeout=2000)
+                        filled += 1
+                except Exception:
+                    continue
+
+            # End Date (graduation)
+            grad_year = str(info.get("graduation_year", "2028"))
+            for date_sel, date_val in [
+                ('[data-automation-id="endDateYear"] button, select[data-automation-id*="endYear"]', grad_year),
+                ('[data-automation-id="endDateMonth"] button, select[data-automation-id*="endMonth"]', "June"),
+            ]:
+                try:
+                    el = page.locator(date_sel).first
+                    if await el.is_visible(timeout=1000):
+                        tag = await el.evaluate("el => el.tagName.toLowerCase()")
+                        if tag == "select":
+                            await el.select_option(label=date_val)
+                        else:
+                            await el.click(timeout=2000)
+                            await asyncio.sleep(0.5)
+                            opt = page.locator(f'[role="option"]:has-text("{date_val}"), li:has-text("{date_val}")').first
+                            if await opt.is_visible(timeout=1500):
+                                await opt.click(timeout=2000)
+                        filled += 1
                 except Exception:
                     continue
 
@@ -1956,28 +2124,196 @@ async def handle_my_experience(page: Page, resume_path: str, event_callback=None
 
 
 async def handle_eeo_page(page: Page, event_callback=None, screenshot_callback=None) -> dict:
-    """Handle Voluntary Disclosures / Self Identify / EEO pages."""
+    """Handle Voluntary Disclosures / Self Identify / EEO pages.
+
+    Workday EEO pages vary widely — they use custom dropdowns, radio buttons,
+    and sometimes native selects. This handler tries all patterns.
+    """
     info = _load_personal_info_wd()
     filled = 0
 
     if event_callback:
-        await event_callback("Fill Form", "info", "Workday: EEO/Disclosures page (hardcoded, no LLM)")
+        await event_callback("Fill Form", "info", "Workday: EEO/Disclosures page")
 
-    # Try clicking specific EEO radio/dropdown options
-    eeo_values = [
-        info.get('gender', 'Male'),
-        info.get('race_ethnicity', 'Asian'),
-        info.get('veteran_status', 'I am not a protected veteran'),
-        info.get('disability_status', 'I do not wish to answer'),
+    # Scroll to reveal all EEO fields
+    for scroll_pos in [0, 500, 1000, 1500]:
+        await page.evaluate(f"window.scrollTo(0, {scroll_pos})")
+        await asyncio.sleep(0.3)
+    await page.evaluate("window.scrollTo(0, 0)")
+    await asyncio.sleep(0.5)
+
+    # ── EEO value mappings: (label_patterns, value_to_select, fallback_values) ──
+    eeo_mappings = [
+        # Gender
+        {
+            "patterns": ["gender", "sex"],
+            "value": info.get("gender", "Male"),
+            "fallbacks": ["Male", "Man", "I prefer not to say", "Decline to Identify"],
+        },
+        # Race / Ethnicity
+        {
+            "patterns": ["race", "ethnic", "ethnicity"],
+            "value": info.get("race_ethnicity", "Asian"),
+            "fallbacks": ["Asian", "I prefer not to say", "Decline to identify"],
+        },
+        # Veteran status
+        {
+            "patterns": ["veteran", "military"],
+            "value": info.get("veteran_status", "I am not a protected veteran"),
+            "fallbacks": ["I am not a protected veteran", "Not a protected veteran",
+                          "Not a Veteran", "No", "I choose not to self-identify"],
+        },
+        # Disability
+        {
+            "patterns": ["disability", "disabled", "impairment"],
+            "value": info.get("disability_status", "No, I don't have a disability"),
+            "fallbacks": ["No, I don't have a disability", "I do not have a disability",
+                          "No disability", "No", "I choose not to self-identify"],
+        },
+        # Pronouns (some portals ask)
+        {
+            "patterns": ["pronoun"],
+            "value": info.get("pronouns", "He/Him"),
+            "fallbacks": ["He/Him", "He/him", "I prefer not to say"],
+        },
     ]
-    for value in eeo_values:
+
+    for mapping in eeo_mappings:
+        patterns = mapping["patterns"]
+        desired = mapping["value"]
+        fallbacks = mapping["fallbacks"]
+
+        # Find all custom Workday dropdown containers whose labels match
         try:
-            opt = page.locator(f'label:has-text("{value}"), [role="radio"]:has-text("{value}"), [role="option"]:has-text("{value}")').first
-            if await opt.is_visible(timeout=1000):
-                await opt.click(timeout=3000)
-                filled += 1
+            dd_info = await page.evaluate("""(patterns) => {
+                const results = [];
+                for (const c of document.querySelectorAll('[data-automation-id^="formField-"]')) {
+                    if (c.offsetParent === null) continue;
+                    let label = '';
+                    const dataid = c.getAttribute('data-automation-id') || '';
+                    if (dataid.startsWith('formField-')) {
+                        const uuid = dataid.replace('formField-', '');
+                        const sib = document.querySelector('[data-automation-id="formLabel-' + uuid + '"]');
+                        if (sib) label = sib.innerText.trim();
+                    }
+                    if (!label) { const lbl = c.querySelector('label, legend'); if (lbl) label = lbl.innerText.trim(); }
+                    if (!label) label = c.innerText.split('\\n')[0].trim();
+                    const lowerLabel = label.toLowerCase();
+                    const matches = patterns.some(p => lowerLabel.includes(p));
+                    if (!matches) continue;
+                    // Check for custom dropdown button
+                    const btn = c.querySelector('button[aria-haspopup], [data-automation-id="selectWidget"]');
+                    const sel = c.querySelector('select');
+                    if (btn) {
+                        const r = btn.getBoundingClientRect();
+                        results.push({type: 'button', label, x: r.x + r.width/2, y: r.y + r.height/2, dataid});
+                    } else if (sel) {
+                        const opts = Array.from(sel.options).map(o => o.text);
+                        results.push({type: 'select', label, dataid, selector: `[data-automation-id="${dataid}"] select`, options: opts});
+                    }
+                    // Also check for radio groups
+                    const radios = c.querySelectorAll('input[type="radio"]');
+                    if (radios.length > 0) {
+                        const radioData = Array.from(radios).map(r => {
+                            const lbl = r.closest('label') || document.querySelector(`label[for="${r.id}"]`);
+                            const rect = r.getBoundingClientRect();
+                            return {value: r.value, text: lbl ? lbl.innerText.trim() : r.value, x: rect.x + rect.width/2, y: rect.y + rect.height/2};
+                        });
+                        results.push({type: 'radio', label, dataid, radios: radioData});
+                    }
+                }
+                return results;
+            }""", patterns)
+
+            for item in (dd_info or []):
+                if event_callback:
+                    await event_callback("Fill Form", "info", f"EEO field: '{item.get('label', '')}' ({item.get('type')})")
+
+                if item["type"] == "select":
+                    # Native select
+                    all_candidates = [desired] + fallbacks
+                    for candidate in all_candidates:
+                        try:
+                            await page.locator(item["selector"]).first.select_option(label=candidate)
+                            filled += 1
+                            if event_callback:
+                                await event_callback("Fill Form", "success", f"EEO '{item['label'][:40]}' = '{candidate}'")
+                            break
+                        except Exception:
+                            continue
+
+                elif item["type"] == "radio":
+                    all_candidates = [desired] + fallbacks
+                    selected = False
+                    for candidate in all_candidates:
+                        for radio in item.get("radios", []):
+                            if candidate.lower() in radio["text"].lower():
+                                await page.mouse.click(radio["x"], radio["y"])
+                                await asyncio.sleep(0.3)
+                                filled += 1
+                                if event_callback:
+                                    await event_callback("Fill Form", "success", f"EEO radio '{item['label'][:40]}' = '{radio['text']}'")
+                                selected = True
+                                break
+                        if selected:
+                            break
+
+                elif item["type"] == "button":
+                    # Click to open custom dropdown
+                    await page.mouse.click(item["x"], item["y"])
+                    await asyncio.sleep(0.8)
+                    all_candidates = [desired] + fallbacks
+                    selected = False
+                    for candidate in all_candidates:
+                        try:
+                            opts = page.locator('[role="option"], [data-automation-id="selectWidget-option"]')
+                            count = await opts.count()
+                            for i in range(count):
+                                text = (await opts.nth(i).inner_text()).strip()
+                                if candidate.lower() in text.lower():
+                                    await opts.nth(i).click(timeout=3000)
+                                    filled += 1
+                                    if event_callback:
+                                        await event_callback("Fill Form", "success", f"EEO dropdown '{item['label'][:40]}' = '{text}'")
+                                    selected = True
+                                    break
+                        except Exception:
+                            pass
+                        if selected:
+                            break
+                    if not selected:
+                        await page.keyboard.press("Escape")
+                        if event_callback:
+                            await event_callback("Fill Form", "warning", f"Could not find EEO option for '{item['label'][:40]}'")
+
+        except Exception as e:
+            if event_callback:
+                await event_callback("Fill Form", "warning", f"EEO mapping error for {patterns}: {str(e)[:60]}")
+
+    # Also try simple label-click approach for any radio/checkboxes not caught above
+    simple_clicks = [
+        info.get("veteran_status", "I am not a protected veteran"),
+        "I do not have a disability",
+        "I choose not to self-identify",
+    ]
+    for value in simple_clicks:
+        try:
+            locators = [
+                f'label:has-text("{value}")',
+                f'[role="radio"]:has-text("{value}")',
+                f'[role="option"]:has-text("{value}")',
+            ]
+            for loc in locators:
+                el = page.locator(loc).first
+                if await el.is_visible(timeout=500):
+                    await el.click(timeout=2000)
+                    filled += 1
+                    break
         except Exception:
             pass
+
+    if event_callback:
+        await event_callback("Fill Form", "info", f"EEO page done: {filled} fields handled")
 
     return {"filled": filled, "failed": 0, "skipped": 0, "errors": []}
 
