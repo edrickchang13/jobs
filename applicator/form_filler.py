@@ -200,17 +200,40 @@ async def fill_with_browser_agent(
     if event_callback:
         await event_callback("Navigate", "info", f"Starting pipeline (ATS: {ats_key or 'unknown'})")
 
-    # Set up LLM
+    # Set up LLM — priority: Ollama (local DGX) > Gemini > Cerebras
     from browser_use import Agent, Browser
     from browser_use.llm import ChatOpenAI
 
-    llm = ChatOpenAI(
-        model="qwen-3-235b-a22b-instruct-2507",
-        base_url="https://api.cerebras.ai/v1",
-        api_key=os.getenv("CEREBRAS_API_KEY"),
-        frequency_penalty=None,
-        dont_force_structured_output=True,
-    )
+    def _make_bu_llm():
+        """Build browser-use LLM with provider fallback priority."""
+        if os.getenv("OLLAMA_MODEL"):
+            return ChatOpenAI(
+                model=os.getenv("OLLAMA_MODEL", "qwen2.5:72b"),
+                base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1"),
+                api_key="ollama",
+                dont_force_structured_output=True,
+                timeout=120,
+            )
+        if os.getenv("GEMINI_API_KEY"):
+            return ChatOpenAI(
+                model="gemini-2.0-flash",
+                base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+                api_key=os.getenv("GEMINI_API_KEY"),
+                dont_force_structured_output=True,
+            )
+        # Fallback: Cerebras
+        return ChatOpenAI(
+            model="qwen-3-235b-a22b-instruct-2507",
+            base_url="https://api.cerebras.ai/v1",
+            api_key=os.getenv("CEREBRAS_API_KEY"),
+            frequency_penalty=None,
+            dont_force_structured_output=True,
+        )
+
+    llm = _make_bu_llm()
+    if event_callback:
+        provider_used = "ollama" if os.getenv("OLLAMA_MODEL") else ("gemini" if os.getenv("GEMINI_API_KEY") else "cerebras")
+        await event_callback("Navigate", "info", f"Browser-use LLM: {provider_used}")
 
     _headless = os.getenv("HEADLESS", "false").lower() == "true"
     _bu_browser = Browser(headless=_headless, keep_alive=True, disable_security=True)
