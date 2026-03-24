@@ -1294,7 +1294,7 @@ async def screenshot_stream():
 
             idle_ticks += 1
             # Send keepalive every ~5s to prevent SSE timeout
-            if idle_ticks > 33:
+            if idle_ticks > 100:
                 idle_ticks = 0
                 yield f"data: {json.dumps({'keepalive': True, 'done': not pipeline_running, 'v': screenshot_version})}\n\n"
 
@@ -1302,7 +1302,7 @@ async def screenshot_stream():
             if not pipeline_running and browser_instance is None and sent_done:
                 yield f"data: {json.dumps({'closed': True})}\n\n"
                 break
-            await asyncio.sleep(0.15)
+            await asyncio.sleep(0.05)  # 20fps check rate for low-latency live view
     return StreamingResponse(stream(), media_type="text/event-stream")
 
 
@@ -1992,6 +1992,7 @@ async def run_pipeline(request: Request):
     pipeline_events.clear()
     pipeline_running = True
     pipeline_stop_requested = False
+    asyncio.create_task(_background_screenshot_loop())  # live view during pipeline
     asyncio.create_task(_run_application(
         data.get("url", ""),
         data.get("company", ""),
@@ -3445,8 +3446,9 @@ async def _run_application(url: str, company: str, role: str):
 
 
 async def _background_screenshot_loop():
-    """Keep taking screenshots while browser is alive after pipeline finishes."""
+    """Continuous live-view: capture browser screenshots at ~4fps during and after pipeline."""
     global latest_screenshot_b64, screenshot_version
+    idle_miss = 0
     while True:
         page = active_page
         if not page:
@@ -3457,18 +3459,25 @@ async def _background_screenshot_loop():
             except Exception:
                 pass
         if not page:
-            await asyncio.sleep(2)
-            if not active_page:
+            idle_miss += 1
+            # Give up after 10s of no page and pipeline also done
+            if idle_miss > 20 and not pipeline_running:
                 break
+            await asyncio.sleep(0.5)
             continue
+        idle_miss = 0
         try:
-            ss = await page.screenshot(type="png")
+            ss = await page.screenshot(type="jpeg", quality=70)
             if ss:
-                latest_screenshot_b64 = base64.b64encode(ss).decode("utf-8")
-                screenshot_version += 1
+                new_b64 = base64.b64encode(ss).decode("utf-8")
+                if new_b64 != latest_screenshot_b64:  # only update if changed
+                    latest_screenshot_b64 = new_b64
+                    screenshot_version += 1
         except Exception:
-            break
-        await asyncio.sleep(1)
+            await asyncio.sleep(0.5)
+            continue
+        # 4fps during pipeline, 2fps during review (reduce CPU when idle)
+        await asyncio.sleep(0.25 if pipeline_running else 0.5)
 
 
 if __name__ == "__main__":

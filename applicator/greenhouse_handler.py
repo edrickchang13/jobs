@@ -451,7 +451,7 @@ async def handle_greenhouse_apply(
         try:
             el = ctx.locator(sel).first
             if await el.is_visible(timeout=800):
-                await el.triple_click()
+                await el.click(click_count=3)
                 await el.fill(val)
                 filled += 1
         except Exception:
@@ -561,7 +561,7 @@ async def handle_greenhouse_apply(
             if val:
                 try:
                     el = ctx.locator(sel).first
-                    await el.triple_click()
+                    await el.click(click_count=3)
                     await el.fill(val)
                     filled += 1
                 except Exception as e:
@@ -632,7 +632,7 @@ async def handle_greenhouse_apply(
             else:
                 try:
                     el = ctx.locator(sel).first
-                    await el.triple_click()
+                    await el.click(click_count=3)
                     await el.fill(answer)
                     filled += 1
                 except Exception as e:
@@ -695,7 +695,7 @@ async def _fill_education_section(ctx, known: dict, ev):
                 if tag == "SELECT":
                     await ctx.select_option(sel, label=val)
                 else:
-                    await el.triple_click()
+                    await el.click(click_count=3)
                     await el.fill(val)
         except Exception:
             pass
