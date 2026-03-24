@@ -296,12 +296,33 @@ def _value_for_label(label: str, known: dict, personal: dict) -> Optional[str]:
 # ──────────────────────────────────────────────────────────────────────────────
 
 async def _fill_react_select(ctx, selector: str, value: str, event_cb=None) -> bool:
-    """Click a React-select dropdown, type to trigger typeahead, pick closest option."""
+    """Click a React-select dropdown, pick the closest option.
+
+    Strategy:
+    1. Click to open the dropdown.
+    2. Check if options are immediately visible (static dropdown, no typeahead).
+       If yes, pick best match without typing — avoids "No options" from long search terms.
+    3. If no options visible yet, type a short keyword to trigger typeahead, then pick.
+    """
     try:
         await ctx.evaluate(JS_GH_REACT_SELECT, {"selector": selector, "value": value})
-        await asyncio.sleep(0.4)
-        # Type a search term to trigger the typeahead — use part before " and " for shorter query
-        search_term = value.split(" and ")[0].split(" & ")[0].strip()
+        await asyncio.sleep(0.5)
+
+        # Step 2: Check if options are already visible WITHOUT typing
+        immediate = await ctx.evaluate(JS_GH_PICK_OPTION, {"value": value})
+        if immediate.get("ok"):
+            if event_cb and immediate.get("fallback"):
+                await event_cb("Fill Form", "warning",
+                    f"React-select (immediate) fallback for '{value[:30]}' → '{immediate.get('picked')}'")
+            return True
+
+        # No options yet — could be a typeahead. Type a short keyword.
+        # Use only the FIRST meaningful word (skip stopwords) to avoid "No options"
+        stopwords = {"i", "a", "an", "the", "is", "am", "are", "not", "have", "has",
+                     "no", "yes", "do", "does", "will", "would", "can", "cannot"}
+        words = [w for w in value.lower().split() if w.isalpha() and w not in stopwords]
+        search_term = words[0][:12] if words else value.split()[0][:8]
+
         try:
             input_sel = f"{selector} input"
             inp = ctx.locator(input_sel).first
@@ -312,16 +333,18 @@ async def _fill_react_select(ctx, selector: str, value: str, event_cb=None) -> b
                 await ctx.keyboard.type(search_term, delay=50)
             except Exception:
                 pass
-        await asyncio.sleep(1.0)  # wait for typeahead to load results
+        await asyncio.sleep(1.0)
+
         result = await ctx.evaluate(JS_GH_PICK_OPTION, {"value": value})
         await asyncio.sleep(0.4)
         if result.get("ok"):
             if event_cb and result.get("fallback"):
                 await event_cb("Fill Form", "warning",
-                    f"React-select fallback for '{value}' → picked '{result.get('picked')}'")
+                    f"React-select fallback for '{value[:30]}' → picked '{result.get('picked')}'")
             return True
         if event_cb:
-            await event_cb("Fill Form", "warning", f"React-select: {result.get('error')} (label: {selector[:60]})")
+            await event_cb("Fill Form", "warning",
+                f"React-select: {result.get('error')} (selector: {selector[:50]})")
         return False
     except Exception as e:
         if event_cb:
@@ -736,29 +759,154 @@ async def _fill_education_section(ctx, known: dict, ev):
 
 
 async def _fill_eeoc_section(ctx, known: dict, ev):
-    """Fill the Greenhouse EEOC / demographic section with known safe defaults."""
-    # Standard Greenhouse EEOC uses select dropdowns with question_ prefix
-    eeoc_selectors = [
-        ('[name*="gender"]',    known["gender"]),
-        ('[name*="race"]',      known["race"]),
-        ('[name*="veteran"]',   known["veteran_status"]),
-        ('[name*="disability"]', known["disability_status"]),
-        ('[id*="gender"]',      known["gender"]),
-        ('[id*="race"]',        known["race"]),
-        ('[id*="veteran"]',     known["veteran_status"]),
-        ('[id*="disability"]',  known["disability_status"]),
+    """Fill EEOC/demographic section using label-based detection.
+
+    Greenhouse dynamically generates element IDs (e.g. h29784) so we cannot
+    rely on [id*="race"] or [name*="race"] selectors.  Instead we scan all
+    <select> and radio-group elements, read their labels, and match by label
+    text keywords.
+    """
+    JS_FIND_EEOC = """
+    () => {
+        const results = [];
+
+        // ── <select> elements ──────────────────────────────────────────────
+        document.querySelectorAll('select').forEach(el => {
+            if (el.offsetParent === null) return;
+            let labelText = '';
+            if (el.id) {
+                const lbl = document.querySelector('label[for="' + CSS.escape(el.id) + '"]');
+                if (lbl) labelText = lbl.innerText.replace('*', '').trim();
+            }
+            if (!labelText) {
+                const wrapper = el.closest('li, .field, .form-group, .question, [class*="question"]');
+                if (wrapper) {
+                    const lbl = wrapper.querySelector('label');
+                    if (lbl) labelText = lbl.innerText.replace('*', '').trim();
+                }
+            }
+            if (!labelText) return;
+            const opts = Array.from(el.options).filter(o => o.value).map(o => o.text.trim());
+            if (!opts.length) return;
+            const sel = el.id
+                ? '#' + CSS.escape(el.id)
+                : (el.name ? '[name="' + el.name + '"]' : null);
+            if (!sel) return;
+            results.push({ type: 'select', label: labelText, selector: sel, options: opts });
+        });
+
+        // ── Radio groups ───────────────────────────────────────────────────
+        const radioGroups = {};
+        document.querySelectorAll('input[type="radio"]').forEach(el => {
+            if (el.offsetParent === null) return;
+            const name = el.name;
+            if (!name) return;
+            if (!radioGroups[name]) radioGroups[name] = { name, options: [], labelText: '' };
+            const lbl = el.id
+                ? document.querySelector('label[for="' + CSS.escape(el.id) + '"]')
+                : null;
+            const optText = lbl ? lbl.innerText.replace('*','').trim() : el.value;
+            radioGroups[name].options.push({ value: el.value, text: optText, id: el.id });
+        });
+        Object.values(radioGroups).forEach(group => {
+            const firstEl = document.querySelector(
+                'input[type="radio"][name="' + group.name + '"]');
+            if (!firstEl) return;
+            const fieldset = firstEl.closest('fieldset');
+            const legend = fieldset ? fieldset.querySelector('legend') : null;
+            if (legend) group.labelText = legend.innerText.replace('*','').trim();
+            if (!group.labelText) {
+                const wrapper = firstEl.closest(
+                    'li, .field, .form-group, .question, [class*="question"]');
+                if (wrapper) {
+                    const lbl = wrapper.querySelector('label:not([for])') ||
+                                wrapper.querySelector('label');
+                    if (lbl) group.labelText = lbl.innerText.replace('*','').trim();
+                }
+            }
+            if (group.labelText) {
+                results.push({
+                    type: 'radio',
+                    label: group.labelText,
+                    name: group.name,
+                    options: group.options,
+                });
+            }
+        });
+
+        return results;
+    }
+    """
+
+    # keyword groups → desired value
+    eeoc_patterns = [
+        (["gender", " sex"],                        known["gender"]),
+        (["race", "ethnic", "national origin"],     known["race"]),
+        (["veteran", "military", "protected vet"],  known["veteran_status"]),
+        (["disability", "disabled", "accommodat"],  known["disability_status"]),
     ]
-    for sel, val in eeoc_selectors:
-        try:
-            el = ctx.locator(sel).first
-            if await el.is_visible(timeout=500):
-                tag = await el.evaluate("e => e.tagName")
-                if tag == "SELECT":
-                    opts = await el.evaluate("e => Array.from(e.options).map(o => o.text)")
-                    # Find best match
-                    val_lower = val.lower()
-                    best = next((o for o in opts if val_lower[:6] in o.lower()), None)
-                    if best:
-                        await ctx.select_option(sel, label=best)
-        except Exception:
+
+    try:
+        fields = await ctx.evaluate(JS_FIND_EEOC)
+    except Exception as e:
+        await ev("EEOC", "warning", f"EEOC field scan failed: {e}")
+        return
+
+    for field in fields:
+        label_lower = field.get("label", "").lower()
+        matched_val = None
+        for keywords, val in eeoc_patterns:
+            if any(kw in label_lower for kw in keywords):
+                matched_val = val
+                break
+        if not matched_val:
             continue
+
+        ftype = field.get("type")
+
+        if ftype == "select":
+            sel  = field["selector"]
+            opts = field["options"]
+            val_lower = matched_val.lower()
+            # Try progressively looser matches
+            best = next((o for o in opts if val_lower in o.lower()), None)
+            if not best:
+                best = next((o for o in opts if val_lower[:6] in o.lower()), None)
+            if not best:
+                best = next((o for o in opts
+                             if any(w in o.lower()
+                                    for w in val_lower.split()[:3]
+                                    if len(w) > 2)), None)
+            if best:
+                try:
+                    await ctx.select_option(sel, label=best)
+                    await ev("EEOC", "success",
+                             f"Set '{field['label']}' → '{best}'")
+                except Exception as e:
+                    await ev("EEOC", "warning",
+                             f"EEOC select failed for '{field['label']}': {e}")
+            else:
+                await ev("EEOC", "warning",
+                         f"No option match for '{field['label']}' (want: {matched_val})")
+
+        elif ftype == "radio":
+            opts = field["options"]
+            val_lower = matched_val.lower()
+            best_opt = next((o for o in opts if val_lower in o["text"].lower()), None)
+            if not best_opt:
+                best_opt = next((o for o in opts if val_lower[:6] in o["text"].lower()), None)
+            if not best_opt:
+                best_opt = next((o for o in opts
+                                 if any(w in o["text"].lower()
+                                        for w in val_lower.split()[:3]
+                                        if len(w) > 2)), None)
+            if best_opt and best_opt.get("id"):
+                try:
+                    radio = ctx.locator(f'#{best_opt["id"]}').first
+                    if await radio.is_visible(timeout=500):
+                        await radio.check()
+                        await ev("EEOC", "success",
+                                 f"Set radio '{field['label']}' → '{best_opt['text']}'")
+                except Exception as e:
+                    await ev("EEOC", "warning",
+                             f"EEOC radio failed for '{field['label']}': {e}")

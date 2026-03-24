@@ -839,6 +839,114 @@ Report what page you're on when you stop."""
                   await event_callback("Form Fill", "info", _gh_tb.format_exc()[:600])
           # ─────────────────────────────────────────────────────────────────
 
+          # ── Lever dedicated handler ──────────────────────────────────────
+          if not _gh_handled:
+              try:
+                  _lv_cur = ""
+                  try: _lv_cur = page.url.lower()
+                  except Exception: pass
+                  if ats_key == "lever" or "jobs.lever.co" in _lv_cur:
+                      if event_callback:
+                          await event_callback("Form Fill", "info",
+                              "Lever form detected — using dedicated handler...")
+                      from applicator.lever_handler import handle_lever_apply
+                      from applicator.field_generator_cerebras import generate_field_answer as _lv_gen
+                      _lv_summary = await handle_lever_apply(
+                          page=page,
+                          resume_path=resume_path,
+                          job_description=job_description,
+                          company=company,
+                          role=role,
+                          event_callback=event_callback,
+                          screenshot_callback=screenshot_callback,
+                          generate_answer_fn=_lv_gen,
+                      )
+                      _gh_handled = True  # mark as handled to skip generic fill
+                      completed = _lv_summary.get("filled", 0) > 0
+                      if event_callback:
+                          await event_callback("Form Fill",
+                              "success" if completed else "warning",
+                              f"Lever: {_lv_summary.get('filled',0)} filled, "
+                              f"{_lv_summary.get('failed',0)} failed — review before submitting.")
+              except Exception as _lv_e:
+                  import traceback as _lv_tb
+                  if event_callback:
+                      await event_callback("Form Fill", "error", f"Lever handler error: {_lv_e}")
+                      await event_callback("Form Fill", "info", _lv_tb.format_exc()[:400])
+          # ─────────────────────────────────────────────────────────────────
+
+          # ── Ashby dedicated handler ──────────────────────────────────────
+          if not _gh_handled:
+              try:
+                  _ab_cur = ""
+                  try: _ab_cur = page.url.lower()
+                  except Exception: pass
+                  if ats_key == "ashby" or "ashbyhq.com" in _ab_cur:
+                      if event_callback:
+                          await event_callback("Form Fill", "info",
+                              "Ashby form detected — using dedicated handler...")
+                      from applicator.ashby_handler import handle_ashby_apply
+                      from applicator.field_generator_cerebras import generate_field_answer as _ab_gen
+                      _ab_summary = await handle_ashby_apply(
+                          page=page,
+                          resume_path=resume_path,
+                          job_description=job_description,
+                          company=company,
+                          role=role,
+                          event_callback=event_callback,
+                          screenshot_callback=screenshot_callback,
+                          generate_answer_fn=_ab_gen,
+                      )
+                      _gh_handled = True
+                      completed = _ab_summary.get("filled", 0) > 0
+                      if event_callback:
+                          await event_callback("Form Fill",
+                              "success" if completed else "warning",
+                              f"Ashby: {_ab_summary.get('filled',0)} filled, "
+                              f"{_ab_summary.get('failed',0)} failed — review before submitting.")
+              except Exception as _ab_e:
+                  import traceback as _ab_tb
+                  if event_callback:
+                      await event_callback("Form Fill", "error", f"Ashby handler error: {_ab_e}")
+                      await event_callback("Form Fill", "info", _ab_tb.format_exc()[:400])
+          # ─────────────────────────────────────────────────────────────────
+
+          # ── SmartRecruiters dedicated handler ────────────────────────────
+          if not _gh_handled:
+              try:
+                  _sr_cur = ""
+                  try: _sr_cur = page.url.lower()
+                  except Exception: pass
+                  if ats_key == "smartrecruiters" or "smartrecruiters.com" in _sr_cur:
+                      if event_callback:
+                          await event_callback("Form Fill", "info",
+                              "SmartRecruiters form detected — using dedicated handler...")
+                      from applicator.smartrecruiters_handler import handle_smartrecruiters_apply
+                      from applicator.field_generator_cerebras import generate_field_answer as _sr_gen
+                      _sr_summary = await handle_smartrecruiters_apply(
+                          page=page,
+                          resume_path=resume_path,
+                          job_description=job_description,
+                          company=company,
+                          role=role,
+                          event_callback=event_callback,
+                          screenshot_callback=screenshot_callback,
+                          generate_answer_fn=_sr_gen,
+                      )
+                      _gh_handled = True
+                      completed = _sr_summary.get("filled", 0) > 0
+                      if event_callback:
+                          await event_callback("Form Fill",
+                              "success" if completed else "warning",
+                              f"SmartRecruiters: {_sr_summary.get('filled',0)} filled, "
+                              f"{_sr_summary.get('failed',0)} failed — review before submitting.")
+              except Exception as _sr_e:
+                  import traceback as _sr_tb
+                  if event_callback:
+                      await event_callback("Form Fill", "error", f"SmartRecruiters handler error: {_sr_e}")
+                      await event_callback("Form Fill", "info", _sr_tb.format_exc()[:400])
+          # ─────────────────────────────────────────────────────────────────
+
           if not _gh_handled:
             # === DIRECT PRE-FILL: fill standard personal info fields without LLM ===
             # These never change so we fill them immediately via Playwright keyboard input.
@@ -4787,6 +4895,31 @@ async def fill_application(
             event_callback=event_callback,
             screenshot_callback=screenshot_callback,
             generate_answer_fn=generate_answer,
+        )
+        return {"browser": _browser, "page": page, "summary": summary, "completed": True}
+
+    # ── Early Workday dispatch ──
+    if ats_key in ("workday", "myworkdayjobs"):
+        if event_callback:
+            await event_callback("Navigate", "info", "Workday — using dedicated handler")
+        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        await asyncio.sleep(3.0)
+        await _dismiss_cookie_banners(page)
+        # Phase 1: Handle Apply button → Apply Manually → auth (create/sign-in)
+        auth_ok = await _handle_workday_auth(page, event_callback)
+        if not auth_ok and event_callback:
+            await event_callback("Navigate", "warning",
+                "Workday auth failed or no credentials — attempting form fill anyway")
+        # Phase 2: Fill multi-step form with comprehensive workday_handler
+        from applicator.workday_handler import handle_workday_application
+        summary = await handle_workday_application(
+            page=page,
+            resume_path=resume_path,
+            company=company,
+            role=role,
+            job_description=job_description,
+            event_callback=event_callback,
+            screenshot_callback=screenshot_callback,
         )
         return {"browser": _browser, "page": page, "summary": summary, "completed": True}
 
