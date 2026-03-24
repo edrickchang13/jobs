@@ -147,16 +147,27 @@ JS_GH_PICK_OPTION = """
 (args) => {
     const { value } = args;
     const options = document.querySelectorAll('[class*="select__option"], [class*="selectOption"]');
+    if (!options.length) return { ok: false, error: 'no options visible (typeahead not loaded yet?)' };
     const lower = value.toLowerCase();
+    const words = lower.split(/\\s+and\\s+|\\s*&\\s*/);
+    const firstPart = words[0].trim();
+    // 1. Exact substring match on full value
     for (const opt of options) {
         if (opt.innerText.toLowerCase().includes(lower)) {
             opt.click();
             return { ok: true, picked: opt.innerText.trim() };
         }
     }
-    // Try first option if nothing matches
-    if (options.length) { options[0].click(); return { ok: true, picked: options[0].innerText.trim(), fallback: true }; }
-    return { ok: false, error: 'option not found: ' + value };
+    // 2. Match on first part before "and"
+    for (const opt of options) {
+        if (opt.innerText.toLowerCase().includes(firstPart)) {
+            opt.click();
+            return { ok: true, picked: opt.innerText.trim(), fallback: true };
+        }
+    }
+    // 3. Pick first option as last resort
+    options[0].click();
+    return { ok: true, picked: options[0].innerText.trim(), fallback: true };
 }
 """
 
@@ -285,10 +296,23 @@ def _value_for_label(label: str, known: dict, personal: dict) -> Optional[str]:
 # ──────────────────────────────────────────────────────────────────────────────
 
 async def _fill_react_select(ctx, selector: str, value: str, event_cb=None) -> bool:
-    """Click a React-select dropdown and pick the option closest to `value`."""
+    """Click a React-select dropdown, type to trigger typeahead, pick closest option."""
     try:
         await ctx.evaluate(JS_GH_REACT_SELECT, {"selector": selector, "value": value})
-        await asyncio.sleep(0.6)
+        await asyncio.sleep(0.4)
+        # Type a search term to trigger the typeahead — use part before " and " for shorter query
+        search_term = value.split(" and ")[0].split(" & ")[0].strip()
+        try:
+            input_sel = f"{selector} input"
+            inp = ctx.locator(input_sel).first
+            if await inp.is_visible(timeout=600):
+                await inp.fill(search_term)
+        except Exception:
+            try:
+                await ctx.keyboard.type(search_term, delay=50)
+            except Exception:
+                pass
+        await asyncio.sleep(1.0)  # wait for typeahead to load results
         result = await ctx.evaluate(JS_GH_PICK_OPTION, {"value": value})
         await asyncio.sleep(0.4)
         if result.get("ok"):

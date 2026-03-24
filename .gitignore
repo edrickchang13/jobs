@@ -9,3 +9,11 @@ screenshots/
 uploads/
 personal_info.yaml
 credentials.yaml
+*.db
+*.log
+watchdog.pid
+watchdog_restarts.log
+.cdp_url
+.claude/
+*.plist
+launchd.log

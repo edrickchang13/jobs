@@ -4727,6 +4727,69 @@ async def fill_application(
         )
         return {"browser": _browser, "page": page, "summary": summary, "completed": True}
 
+    # ── Early Lever dispatch ──
+    if ats_key == "lever":
+        if event_callback:
+            await event_callback("Navigate", "info", "Lever — using dedicated handler")
+        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        await asyncio.sleep(3.0)
+        await _dismiss_cookie_banners(page)
+        from applicator.lever_handler import handle_lever_apply
+        from applicator.field_generator_cerebras import generate_field_answer as generate_answer
+        summary = await handle_lever_apply(
+            page=page,
+            resume_path=resume_path,
+            job_description=job_description,
+            company=company,
+            role=role,
+            event_callback=event_callback,
+            screenshot_callback=screenshot_callback,
+            generate_answer_fn=generate_answer,
+        )
+        return {"browser": _browser, "page": page, "summary": summary, "completed": True}
+
+    # ── Early Ashby dispatch ──
+    if ats_key == "ashby":
+        if event_callback:
+            await event_callback("Navigate", "info", "Ashby — using dedicated handler")
+        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        await asyncio.sleep(3.0)
+        await _dismiss_cookie_banners(page)
+        from applicator.ashby_handler import handle_ashby_apply
+        from applicator.field_generator_cerebras import generate_field_answer as generate_answer
+        summary = await handle_ashby_apply(
+            page=page,
+            resume_path=resume_path,
+            job_description=job_description,
+            company=company,
+            role=role,
+            event_callback=event_callback,
+            screenshot_callback=screenshot_callback,
+            generate_answer_fn=generate_answer,
+        )
+        return {"browser": _browser, "page": page, "summary": summary, "completed": True}
+
+    # ── Early SmartRecruiters dispatch ──
+    if ats_key == "smartrecruiters":
+        if event_callback:
+            await event_callback("Navigate", "info", "SmartRecruiters — using dedicated handler")
+        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        await asyncio.sleep(3.0)
+        await _dismiss_cookie_banners(page)
+        from applicator.smartrecruiters_handler import handle_smartrecruiters_apply
+        from applicator.field_generator_cerebras import generate_field_answer as generate_answer
+        summary = await handle_smartrecruiters_apply(
+            page=page,
+            resume_path=resume_path,
+            job_description=job_description,
+            company=company,
+            role=role,
+            event_callback=event_callback,
+            screenshot_callback=screenshot_callback,
+            generate_answer_fn=generate_answer,
+        )
+        return {"browser": _browser, "page": page, "summary": summary, "completed": True}
+
     # Navigate
     await page.goto(url, wait_until="domcontentloaded", timeout=30000)
     # Wait a bit for JS rendering
