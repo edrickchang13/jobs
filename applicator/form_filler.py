@@ -4662,6 +4662,27 @@ async def fill_application(
         ats_name = ats_profile.get("name", ats_key) if ats_profile else ats_key
         await event_callback("Navigate", "info", f"Detected ATS: {ats_name}")
 
+    # ── Early Greenhouse dispatch (before generic page parsing) ──
+    if ats_key == "greenhouse":
+        if event_callback:
+            await event_callback("Navigate", "info", "Greenhouse — using dedicated handler")
+        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        await asyncio.sleep(3.0)
+        await _dismiss_cookie_banners(page)
+        from applicator.greenhouse_handler import handle_greenhouse_apply
+        from applicator.field_generator_cerebras import generate_field_answer as generate_answer
+        summary = await handle_greenhouse_apply(
+            page=page,
+            resume_path=resume_path,
+            job_description=job_description,
+            company=company,
+            role=role,
+            event_callback=event_callback,
+            screenshot_callback=screenshot_callback,
+            generate_answer_fn=generate_answer,
+        )
+        return {"browser": _browser, "page": page, "summary": summary, "completed": True}
+
     # Navigate
     await page.goto(url, wait_until="domcontentloaded", timeout=30000)
     # Wait a bit for JS rendering
@@ -4869,14 +4890,35 @@ async def fill_application(
         ss = await _take_screenshot(page)
         await screenshot_callback(ss)
 
-    # If no fields found, check if it's a Workday page
+    # If no fields found, dispatch to ATS-specific handlers
     if len(fields) == 0:
         current_url = page.url.lower()
-        if "workday" in current_url or "myworkdayjobs" in current_url:
-            if event_callback:
-                await event_callback("Extract Fields", "info", "Workday detected - using Workday-specific handler...")
 
+        # ── Workday ──
+        if ats_key in ("workday", "myworkdayjobs") or "workday" in current_url or "myworkdayjobs" in current_url:
+            if event_callback:
+                await event_callback("Extract Fields", "info", "Workday detected — using Workday handler...")
             summary = await _handle_workday_apply(page, resume_path, event_callback, screenshot_callback, job_url=url)
+            return {"browser": _browser, "page": page, "summary": summary}
+
+        # ── Greenhouse ──
+        if ats_key == "greenhouse" or "greenhouse" in current_url or any(
+            m in current_url for m in ("boards.greenhouse", "gh_jid=")
+        ):
+            if event_callback:
+                await event_callback("Extract Fields", "info", "Greenhouse detected — using Greenhouse handler...")
+            from applicator.greenhouse_handler import handle_greenhouse_apply
+            from applicator.field_generator_cerebras import generate_field_answer as generate_answer
+            summary = await handle_greenhouse_apply(
+                page=page,
+                resume_path=resume_path,
+                job_description=job_description,
+                company=company,
+                role=role,
+                event_callback=event_callback,
+                screenshot_callback=screenshot_callback,
+                generate_answer_fn=generate_answer,
+            )
             return {"browser": _browser, "page": page, "summary": summary}
 
         if len(fields) == 0:

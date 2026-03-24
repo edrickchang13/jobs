@@ -411,6 +411,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="tab-nav">
         <button class="tab-btn active" onclick="switchTab('jobs')">Jobs List</button>
         <button class="tab-btn" onclick="switchTab('apply')">Apply</button>
+        <button class="tab-btn" onclick="switchTab('autoqueue')">⚡ Auto-Queue</button>
     </div>
 
     <!-- ===== JOBS TAB ===== -->
@@ -490,6 +491,57 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                     </tbody>
                 </table>
             </div>
+        </div>
+    </div>
+
+    <!-- ===== AUTO-QUEUE TAB ===== -->
+    <div class="tab-content" id="tab-autoqueue" style="padding:24px;flex-direction:column;gap:16px;overflow-y:auto;">
+        <h3 style="margin:0;color:#f1f5f9;">⚡ Auto-Queue — Batch Apply</h3>
+        <p style="color:#94a3b8;margin:0;font-size:13px;">Scrapes GitHub for new unprocessed jobs, filters by ATS, and applies sequentially with a pause between each. Browser stays open after each job for your review.</p>
+
+        <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end;">
+            <div style="display:flex;flex-direction:column;gap:4px;">
+                <label style="font-size:12px;color:#94a3b8;">Max jobs</label>
+                <input id="aq-limit" type="number" value="10" min="1" max="100"
+                    style="width:80px;background:#1e293b;border:1px solid #334155;color:#f1f5f9;padding:6px 10px;border-radius:6px;font-size:14px;">
+            </div>
+            <div style="display:flex;flex-direction:column;gap:4px;">
+                <label style="font-size:12px;color:#94a3b8;">Pause between jobs (sec)</label>
+                <input id="aq-delay" type="number" value="30" min="5" max="300"
+                    style="width:90px;background:#1e293b;border:1px solid #334155;color:#f1f5f9;padding:6px 10px;border-radius:6px;font-size:14px;">
+            </div>
+            <div style="display:flex;flex-direction:column;gap:4px;">
+                <label style="font-size:12px;color:#94a3b8;">ATS types</label>
+                <div style="display:flex;gap:8px;align-items:center;">
+                    <label style="font-size:13px;color:#cbd5e1;display:flex;align-items:center;gap:4px;">
+                        <input type="checkbox" id="aq-greenhouse" checked> Greenhouse</label>
+                    <label style="font-size:13px;color:#cbd5e1;display:flex;align-items:center;gap:4px;">
+                        <input type="checkbox" id="aq-lever" checked> Lever</label>
+                    <label style="font-size:13px;color:#cbd5e1;display:flex;align-items:center;gap:4px;">
+                        <input type="checkbox" id="aq-workday" checked> Workday</label>
+                </div>
+            </div>
+            <button onclick="startAutoQueue()" id="aqStartBtn"
+                style="padding:8px 20px;background:#2563eb;color:#fff;border:none;border-radius:6px;font-size:14px;cursor:pointer;font-weight:600;">
+                ▶ Start Batch
+            </button>
+            <button onclick="stopAutoQueue()" id="aqStopBtn"
+                style="padding:8px 16px;background:#dc2626;color:#fff;border:none;border-radius:6px;font-size:14px;cursor:pointer;display:none;">
+                ■ Stop
+            </button>
+            <button onclick="loadQueueStatus()"
+                style="padding:8px 14px;background:#1e293b;color:#94a3b8;border:1px solid #334155;border-radius:6px;font-size:13px;cursor:pointer;">
+                ↻ Refresh
+            </button>
+        </div>
+
+        <div id="aq-status" style="background:#0f172a;border:1px solid #1e293b;border-radius:8px;padding:14px;font-size:13px;color:#94a3b8;">
+            Idle — click "Start Batch" to begin.
+        </div>
+
+        <div id="aq-queue-list" style="display:none;">
+            <h4 style="color:#cbd5e1;margin:0 0 8px 0;font-size:13px;">Queue</h4>
+            <div id="aq-queue-items" style="display:flex;flex-direction:column;gap:4px;max-height:300px;overflow-y:auto;"></div>
         </div>
     </div>
 
@@ -995,6 +1047,91 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             } else if (Notification.permission !== 'denied') {
                 Notification.requestPermission();
             }
+        }
+
+        // ===== AUTO-QUEUE =====
+        let _aqPollInterval = null;
+
+        function startAutoQueue() {
+            const limit = parseInt(document.getElementById('aq-limit').value) || 10;
+            const delay = parseInt(document.getElementById('aq-delay').value) || 30;
+            const atsList = [];
+            if (document.getElementById('aq-greenhouse').checked) atsList.push('greenhouse');
+            if (document.getElementById('aq-lever').checked) atsList.push('lever');
+            if (document.getElementById('aq-workday').checked) atsList.push('workday');
+
+            document.getElementById('aqStartBtn').disabled = true;
+            document.getElementById('aq-status').textContent = 'Building queue from GitHub...';
+
+            fetch('/api/queue/start', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ limit, delay_seconds: delay, ats_filter: atsList })
+            }).then(r => r.json()).then(data => {
+                if (data.status === 'error') {
+                    document.getElementById('aq-status').textContent = '❌ ' + data.message;
+                    document.getElementById('aqStartBtn').disabled = false;
+                    return;
+                }
+                if (data.status === 'empty') {
+                    document.getElementById('aq-status').textContent = '✅ No new matching jobs found.';
+                    document.getElementById('aqStartBtn').disabled = false;
+                    return;
+                }
+                document.getElementById('aqStopBtn').style.display = 'inline-block';
+                document.getElementById('aq-status').textContent =
+                    `⚡ Running — ${data.queued} jobs queued. First 5: ${(data.preview||[]).map(j=>j.company+' ('+j.ats+')').join(', ')}`;
+                _aqPollInterval = setInterval(loadQueueStatus, 3000);
+            }).catch(e => {
+                document.getElementById('aq-status').textContent = '❌ ' + e;
+                document.getElementById('aqStartBtn').disabled = false;
+            });
+        }
+
+        function stopAutoQueue() {
+            fetch('/api/queue/stop', {method: 'POST'});
+            document.getElementById('aq-status').textContent = 'Stopping after current job...';
+        }
+
+        function loadQueueStatus() {
+            fetch('/api/queue').then(r => r.json()).then(data => {
+                const total = data.queue ? data.queue.length : 0;
+                const remaining = data.remaining || 0;
+                const idx = data.index || 0;
+                const running = data.running;
+
+                if (!running && _aqPollInterval) {
+                    clearInterval(_aqPollInterval);
+                    _aqPollInterval = null;
+                    document.getElementById('aqStartBtn').disabled = false;
+                    document.getElementById('aqStopBtn').style.display = 'none';
+                }
+
+                const statusEl = document.getElementById('aq-status');
+                if (running) {
+                    const cur = data.queue && data.queue[idx];
+                    const curStr = cur ? `${cur.company} — ${cur.role} (${cur.ats})` : '...';
+                    statusEl.textContent = `⚡ Running [${idx+1}/${total}]: ${curStr}  |  ${remaining} remaining`;
+                } else if (total > 0) {
+                    statusEl.textContent = `✅ Batch complete. Processed ${Math.min(idx, total)}/${total} jobs.`;
+                }
+
+                // Render queue list
+                if (data.queue && data.queue.length > 0) {
+                    const listEl = document.getElementById('aq-queue-list');
+                    const itemsEl = document.getElementById('aq-queue-items');
+                    listEl.style.display = 'block';
+                    itemsEl.innerHTML = data.queue.map((j, i) => {
+                        const done = i < idx;
+                        const active = i === idx && running;
+                        const color = done ? '#22c55e' : active ? '#60a5fa' : '#475569';
+                        const icon = done ? '✓' : active ? '▶' : '○';
+                        return `<div style="font-size:12px;color:${color};padding:2px 6px;">
+                            ${icon} [${i+1}] ${j.company} — ${j.role} <span style="color:#64748b;">(${j.ats})</span>
+                        </div>`;
+                    }).join('');
+                }
+            });
         }
 
         // Load jobs and check uploads on page load
@@ -1861,6 +1998,158 @@ async def run_pipeline(request: Request):
         data.get("role", ""),
     ))
     return JSONResponse({"status": "started"})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Auto-queue: scraper → apply batch loop
+# ─────────────────────────────────────────────────────────────────────────────
+
+_auto_queue: list[dict] = []          # jobs waiting to be processed
+_auto_queue_running: bool = False     # True while the batch loop is active
+_auto_queue_stop: bool = False        # signal to abort the loop
+_auto_queue_index: int = 0            # current position in queue
+
+
+@app.get("/api/queue")
+async def get_queue():
+    return JSONResponse({
+        "queue": _auto_queue,
+        "running": _auto_queue_running,
+        "index": _auto_queue_index,
+        "remaining": max(0, len(_auto_queue) - _auto_queue_index),
+    })
+
+
+@app.post("/api/queue/stop")
+async def stop_queue():
+    global _auto_queue_stop
+    _auto_queue_stop = True
+    return JSONResponse({"status": "stopping"})
+
+
+@app.post("/api/queue/start")
+async def start_queue(request: Request):
+    """
+    Start the auto-apply batch loop.
+
+    Body (all optional):
+      {
+        "ats_filter": ["greenhouse", "lever", "workday"],  // only run these ATS types
+        "limit": 10,                                        // max jobs to attempt
+        "delay_seconds": 30,                               // pause between applications
+        "refresh": false                                    // re-fetch jobs from GitHub
+      }
+    """
+    global _auto_queue, _auto_queue_running, _auto_queue_stop, _auto_queue_index
+
+    if _auto_queue_running:
+        return JSONResponse({"status": "error", "message": "Queue already running"})
+    if pipeline_running:
+        return JSONResponse({"status": "error", "message": "Single-job pipeline is active; stop it first"})
+
+    data = await request.json()
+    ats_filter: list = data.get("ats_filter", ["greenhouse", "lever", "workday"])
+    limit: int = data.get("limit", 20)
+    delay_seconds: int = data.get("delay_seconds", 30)
+    refresh: bool = data.get("refresh", False)
+
+    # Build queue from scraper
+    try:
+        from scraper.github_scraper import fetch_readme, parse_internship_table
+        from database.tracker import is_posting_seen
+        from applicator.ats_profiles import detect_ats
+
+        readme = await asyncio.to_thread(fetch_readme)
+        postings = parse_internship_table(readme)
+
+        queued = []
+        for p in postings:
+            if len(queued) >= limit:
+                break
+            if is_posting_seen(p["url"]):
+                continue
+            ats = detect_ats(p["url"])
+            if ats_filter and ats not in ats_filter:
+                continue
+            queued.append({**p, "ats": ats or "unknown"})
+
+        _auto_queue = queued
+        _auto_queue_index = 0
+        _auto_queue_stop = False
+    except Exception as e:
+        return JSONResponse({"status": "error", "message": f"Failed to build queue: {e}"}, status_code=500)
+
+    if not _auto_queue:
+        return JSONResponse({"status": "empty", "message": "No new matching jobs found"})
+
+    asyncio.create_task(_run_auto_queue(delay_seconds))
+    return JSONResponse({
+        "status": "started",
+        "queued": len(_auto_queue),
+        "preview": [{"company": j["company"], "role": j["role"], "ats": j["ats"]} for j in _auto_queue[:5]],
+    })
+
+
+async def _run_auto_queue(delay_seconds: int = 30):
+    """Background task: apply to each job in _auto_queue sequentially."""
+    global _auto_queue_running, _auto_queue_stop, _auto_queue_index, pipeline_events, pipeline_running
+
+    _auto_queue_running = True
+    add_event("Auto-Queue", "start", f"Starting batch run: {len(_auto_queue)} jobs")
+
+    for idx, job in enumerate(_auto_queue):
+        _auto_queue_index = idx
+
+        if _auto_queue_stop:
+            add_event("Auto-Queue", "warning", "Batch stopped by user")
+            break
+
+        company = job.get("company", "")
+        role = job.get("role", "")
+        url = job.get("url", "")
+        ats = job.get("ats", "unknown")
+
+        add_event("Auto-Queue", "info",
+            f"[{idx+1}/{len(_auto_queue)}] {company} — {role} ({ats})")
+
+        # Wait for any running single pipeline to finish
+        waited = 0
+        while pipeline_running and waited < 600:
+            await asyncio.sleep(5)
+            waited += 5
+        if pipeline_running:
+            add_event("Auto-Queue", "error", f"Timed out waiting for previous job to finish")
+            continue
+
+        # Trigger the single-job pipeline for this URL
+        pipeline_events.clear()
+        pipeline_running = True
+        asyncio.create_task(_run_application(url, company, role))
+
+        # Wait for it to complete (max 10 min per job)
+        wait_ticks = 0
+        while pipeline_running and wait_ticks < 120:
+            await asyncio.sleep(5)
+            wait_ticks += 1
+
+        if pipeline_running:
+            add_event("Auto-Queue", "warning", f"Job timed out after 10 min: {company}")
+            # Force-stop and carry on
+            pipeline_running = False
+
+        add_event("Auto-Queue", "success",
+            f"Finished [{idx+1}/{len(_auto_queue)}]: {company} — {role}")
+
+        # Pause between jobs (skip delay on last job)
+        if idx < len(_auto_queue) - 1 and not _auto_queue_stop:
+            add_event("Auto-Queue", "info", f"Waiting {delay_seconds}s before next job...")
+            await asyncio.sleep(delay_seconds)
+
+    _auto_queue_running = False
+    _auto_queue_index = len(_auto_queue)
+    total = len(_auto_queue)
+    add_event("Auto-Queue", "success",
+        f"Batch complete. Processed {min(_auto_queue_index, total)}/{total} jobs.")
 
 
 async def _handle_custom_fields(page, add_event_func):
