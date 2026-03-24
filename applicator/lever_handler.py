@@ -441,6 +441,8 @@ async def handle_lever_apply(
 
         # Text / textarea
         if value:
+            _fill_ok = False
+            lbl_lower = label.lower()
             try:
                 el = page.locator(sel).first
                 await el.click(click_count=3, timeout=3000)
@@ -450,7 +452,6 @@ async def handle_lever_apply(
                 # Then check if a dropdown appeared; if so pick the first suggestion
                 # with ArrowDown+Enter. Otherwise just Tab away so the typed value
                 # is committed without accidentally submitting the form.
-                lbl_lower = label.lower()
                 if any(kw in lbl_lower for kw in ("location", "city", "address", "where")):
                     await el.press_sequentially(value, delay=60)
                     await asyncio.sleep(1.8)
@@ -473,10 +474,44 @@ async def handle_lever_apply(
                     await asyncio.sleep(0.5)
                 else:
                     await el.fill(value, timeout=3000)
+                _fill_ok = True
+            except Exception:
+                pass  # fall through to JS injection
+
+            if not _fill_ok:
+                # Fallback: JS value injection — bypasses CAPTCHA/overlay pointer interception.
+                # Works for Lever URL fields (LinkedIn/GitHub/Portfolio) that sit below
+                # the hCaptcha iframe which intercepts mouse events.
+                try:
+                    injected = await page.evaluate("""(args) => {
+                        const el = document.querySelector(args.sel);
+                        if (!el) return false;
+                        // Use native setter so React's onChange fires correctly
+                        const proto = Object.getOwnPropertyDescriptor(
+                            window.HTMLInputElement.prototype, 'value'
+                        ) || Object.getOwnPropertyDescriptor(
+                            window.HTMLTextAreaElement.prototype, 'value'
+                        );
+                        if (proto && proto.set) proto.set.call(el, args.val);
+                        else el.value = args.val;
+                        el.dispatchEvent(new Event('input',  { bubbles: true }));
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                        el.dispatchEvent(new Event('blur',   { bubbles: true }));
+                        return true;
+                    }""", {"sel": sel, "val": value})
+                    if injected:
+                        _fill_ok = True
+                        if event_callback:
+                            await event_callback("Lever", "info",
+                                f"JS-injected '{label}' (captcha overlay workaround)")
+                except Exception:
+                    pass
+
+            if _fill_ok:
                 filled += 1
-            except Exception as e:
+            else:
                 failed += 1
-                errors.append(f"Fill {label}: {e}")
+                errors.append(f"Fill {label}: click and JS injection both failed")
         else:
             # Custom question needing LLM
             if label and (field.get("required") or ftype == "textarea"):

@@ -186,6 +186,56 @@ async def run_test(ats: str, url: str, resume_path: str, headless: bool):
             elif ats in ("workday", "myworkdayjobs"):
                 await page.goto(url, wait_until="domcontentloaded", timeout=30000)
                 await asyncio.sleep(3.0)
+
+                # Step 1: Accept cookies / legal notice
+                try:
+                    btn = page.locator('[data-automation-id="legalNoticeAcceptButton"]')
+                    if await btn.is_visible(timeout=2000):
+                        await btn.click()
+                        await asyncio.sleep(1.0)
+                except Exception:
+                    pass
+
+                # Step 2: Click Apply button on the job listing page
+                apply_selectors = [
+                    'a[data-uxi-element-id="Apply_adventureButton"]',
+                    '[data-automation-id="adventureButton"]',
+                    '[data-automation-id="jobPostingApplyButton"]',
+                    'a[role="button"]:has-text("Apply")',
+                    'button:has-text("Apply")',
+                ]
+                for asel in apply_selectors:
+                    try:
+                        abtn = page.locator(asel).first
+                        if await abtn.is_visible(timeout=2000):
+                            await abtn.click()
+                            await asyncio.sleep(5.0)
+                            await event_callback("Workday", "info", "Clicked Apply button")
+                            break
+                    except Exception:
+                        continue
+
+                # Step 3: Click "Apply Manually" if the option modal appears
+                try:
+                    manual = page.locator('[data-automation-id="applyManually"]')
+                    if await manual.is_visible(timeout=4000):
+                        await manual.click()
+                        await asyncio.sleep(5.0)
+                        await event_callback("Workday", "info", "Clicked Apply Manually")
+                except Exception:
+                    pass
+
+                # Step 4: Handle auth (create account / sign in) via form_filler helper
+                try:
+                    from applicator.form_filler import _handle_workday_auth
+                    auth_ok = await _handle_workday_auth(page, event_callback)
+                    if not auth_ok:
+                        await event_callback("Workday", "warning",
+                            "Auth failed or no credentials — trying form fill anyway")
+                except Exception as auth_e:
+                    await event_callback("Workday", "warning", f"Auth step error: {auth_e}")
+
+                # Step 5: Fill the multi-step form
                 from applicator.workday_handler import handle_workday_application
                 result = await handle_workday_application(
                     page=page,
