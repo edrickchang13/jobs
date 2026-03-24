@@ -15,6 +15,15 @@ fi
 
 while true; do
     echo "===== Starting server at $(date) ====="
+    # Kill ALL processes holding port 8080 (uvicorn --reload spawns parent + child)
+    _old_pids=$(lsof -ti:8080 2>/dev/null)
+    if [ -n "$_old_pids" ]; then
+        echo "Port 8080 in use by PID(s) $(echo $_old_pids | tr '\n' ' ')— killing..."
+        echo "$_old_pids" | xargs kill 2>/dev/null || true
+        sleep 2
+        echo "$_old_pids" | xargs kill -9 2>/dev/null || true
+        sleep 1
+    fi
     # Auto-pull latest code from GitHub before each start
     git pull --rebase origin main 2>&1 | tail -3 || true
     python -m uvicorn dashboard.app:app \

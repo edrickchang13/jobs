@@ -31,21 +31,27 @@ def _build_lever_map(personal: dict) -> dict:
         "last name":       personal.get("last_name", "Chang"),
         "email":           personal.get("email", "eachang@scu.edu"),
         "phone":           personal.get("phone", "4088066495"),
-        "location":        personal.get("city", "Santa Clara, CA"),
+        # Location — use full "City, State, Country" so Lever autocomplete matches
+        "location":        personal.get("location", "Santa Clara, CA, USA"),
         "city":            personal.get("city", "Santa Clara"),
+        "current location": personal.get("location", "Santa Clara, CA, USA"),
         # Links
         "linkedin":        personal.get("linkedin", "https://linkedin.com/in/edrickchang"),
         "github":          personal.get("github", "https://github.com/edrickchang"),
         "portfolio":       personal.get("github", "https://github.com/edrickchang"),
         "website":         personal.get("github", "https://github.com/edrickchang"),
         "twitter":         "",
-        # Education
+        # Education / org
         "school":          personal.get("school", "Santa Clara University"),
         "university":      personal.get("school", "Santa Clara University"),
         "degree":          personal.get("degree", "Bachelor of Science"),
         "major":           personal.get("major", "Computer Science and Engineering"),
         "gpa":             str(personal.get("gpa", "3.78")),
         "graduation year": personal.get("graduation_year", "2028"),
+        # Company / org field (student — no current employer)
+        "company":         personal.get("current_company", ""),
+        "employer":        personal.get("current_company", ""),
+        "organization":    personal.get("current_company", ""),
         # Work auth
         "authorized":      "Yes",
         "sponsorship":     "No",
@@ -115,82 +121,241 @@ def _value_for_label(label: str, lever_map: dict) -> Optional[str]:
 
 EEO_LEVER_MAP = {
     "gender":      "Male",
+    "sex":         "Male",
     "race":        "Asian",
     "ethnicity":   "Asian",
     "hispanic":    "No",
     "veteran":     "I am not a protected veteran",
     "disability":  "No, I don't have a disability",
+    "age":         "20-29",   # Edrick is ~20-21 in 2026 (HS grad 2024)
 }
+
+# For checkbox-based ethnicity — ONLY check boxes whose text matches one of these
+EEO_ETHNICITY_MATCH = ["asian"]
+
+# For "prefer not to say" / decline fallback option keywords
+_DECLINE_KEYWORDS = ["prefer not", "decline", "not wish", "no answer", "do not wish"]
+
+
+def _best_eeo_option(target: str, opts: list) -> dict | None:
+    """Find the best matching option dict from a list of {t, v, i} dicts."""
+    t = target.lower()
+    # Exact match
+    for o in opts:
+        if o["t"].lower() == t:
+            return o
+    # Prefix / substring match
+    for o in opts:
+        ot = o["t"].lower()
+        if t[:6] in ot or ot[:6] in t:
+            return o
+    # Word overlap (≥1 meaningful word)
+    t_words = set(w for w in t.split() if len(w) > 3)
+    for o in opts:
+        ot_words = set(w for w in o["t"].lower().split() if len(w) > 3)
+        if t_words & ot_words:
+            return o
+    return None
 
 
 async def _fill_lever_eeo(page, ev):
-    """Fill Lever EEO section at bottom of form (native <select> elements)."""
+    """Fill Lever EEO section — handles <select>, radio, and checkbox variants."""
+
+    # ── 1. <select> dropdowns ─────────────────────────────────────────────────
     eeo_selects = await page.evaluate("""() => {
         const results = [];
-        const selects = document.querySelectorAll('select');
-        for (const s of selects) {
+        for (const s of document.querySelectorAll('select')) {
             if (s.offsetParent === null) continue;
-            const currentText = s.options[s.selectedIndex]?.text?.trim().toLowerCase() || '';
-            const isPlaceholder = ['select...', 'select', 'choose', '--', '', 'prefer not to answer'].includes(currentText);
-            const label = s.closest('.application-field, .lever-field, .field, .eeo-field, li, div')
-                ?.querySelector('label, .field-label, legend')?.innerText?.replace('*','').trim() || '';
-            const opts = Array.from(s.options).map(o => ({v: o.value, t: o.text.trim(), i: o.index}));
-            results.push({
-                selector: s.id ? '#' + CSS.escape(s.id) : (s.name ? 'select[name="' + s.name + '"]' : ''),
-                label: label,
-                isPlaceholder: isPlaceholder,
-                currentText: currentText,
-                options: opts,
-            });
+            const cur = s.options[s.selectedIndex]?.text?.trim().toLowerCase() || '';
+            const isPlaceholder = ['select...','select','choose','--','','prefer not to answer'].includes(cur);
+            if (!isPlaceholder) continue;   // already filled — skip
+            // Get label — try parent label text nodes first (Lever wraps select in <label>)
+            let lbl = '';
+            const parentLbl = s.closest('label');
+            if (parentLbl) {
+                lbl = Array.from(parentLbl.childNodes)
+                    .filter(n => n.nodeType === 3)
+                    .map(n => n.textContent.trim())
+                    .filter(t => t && t !== '✱' && t !== '*')
+                    .join(' ').trim();
+            }
+            if (!lbl) {
+                const wrapper = s.closest('.application-question,.application-field,.lever-field,.field,li');
+                lbl = wrapper?.querySelector('label:not(:has(select)),.field-label,legend')?.innerText?.replace('*','').replace('✱','').trim() || s.name || '';
+            }
+            const opts = Array.from(s.options).map(o => ({v:o.value, t:o.text.trim(), i:o.index}));
+            const sel = s.id ? '#'+CSS.escape(s.id) : (s.name ? 'select[name="'+s.name+'"]' : '');
+            if (sel) results.push({selector:sel, label:lbl, options:opts});
         }
         return results;
     }""")
 
-    for sel_info in eeo_selects:
-        selector = sel_info.get("selector", "")
-        label = sel_info.get("label", "").lower()
+    for si in eeo_selects:
+        selector = si.get("selector", "")
+        label = si.get("label", "").lower()
         if not selector:
             continue
-
         target = None
         for kw, val in EEO_LEVER_MAP.items():
             if kw in label:
+                target = val
+                break
+        if not target:
+            continue
+        best = _best_eeo_option(target, si.get("options", []))
+        if not best:
+            continue
+        try:
+            loc = page.locator(selector).first
+            await loc.scroll_into_view_if_needed(timeout=3000)
+            await loc.select_option(index=best["i"], timeout=3000)
+            await page.evaluate(f"document.querySelector('{selector}')?.dispatchEvent(new Event('change',{{bubbles:true}}))")
+            await ev("Lever EEO", "success", f"Select: '{target}' → '{si['label'][:40]}'")
+        except Exception as e:
+            await ev("Lever EEO", "warning", f"EEO select failed '{si['label'][:30]}': {e}")
+
+    # ── 2. Radio button EEO groups (gender, age, veteran, disability) ─────────
+    radio_eeo_groups = await page.evaluate("""() => {
+        const groups = {};
+        for (const r of document.querySelectorAll('input[type="radio"]')) {
+            if (r.offsetParent === null) continue;
+            if (r.checked) continue;  // already selected
+            const name = r.name || r.id;
+            if (!groups[name]) groups[name] = {name, radios: []};
+            const wrapper = r.closest('label,li,.radio-option,div');
+            const text = wrapper ? wrapper.innerText.trim() : r.value;
+            const sel = r.id ? '#'+CSS.escape(r.id) : '[name="'+name+'"][value="'+r.value+'"]';
+            groups[name].radios.push({selector: sel, text: text, value: r.value});
+        }
+        // Only keep groups where question text signals EEO
+        const result = [];
+        for (const g of Object.values(groups)) {
+            const first = document.querySelector('input[name="'+g.name+'"]');
+            if (!first) continue;
+            let qText = '';
+            let el = first;
+            for (let i = 0; i < 10 && el; i++) {
+                el = el.parentElement;
+                if (!el || el === document.body) break;
+                const lbl = el.querySelector('label,legend,h3,h4,p,.field-label');
+                if (lbl) { const t = lbl.innerText.trim(); if (t.length > 4) { qText = t.toLowerCase(); break; } }
+            }
+            g.questionText = qText;
+            const eeoKw = ['gender','sex','age','veteran','disab','ethnic','race','identify'];
+            if (eeoKw.some(k => qText.includes(k))) result.push(g);
+        }
+        return result;
+    }""")
+
+    eeo_radio_map = {
+        ("gender", "sex"):                     "Male",
+        ("age",):                               "20-29",
+        ("veteran",):                           "I am not a protected veteran",
+        ("disab",):                             "No, I don't have a disability",
+        ("ethnic", "race", "identify"):         "Asian",
+    }
+
+    for group in radio_eeo_groups:
+        q = group.get("questionText", "")
+        radios = group.get("radios", [])
+        if not radios:
+            continue
+
+        target = None
+        for kw_tuple, val in eeo_radio_map.items():
+            if any(kw in q for kw in kw_tuple):
                 target = val
                 break
 
         if not target:
             continue
 
-        opts = sel_info.get("options", [])
-        # Find best matching option
-        target_lower = target.lower()
-        best_opt = None
-        for opt in opts:
-            ot = opt["t"].lower()
-            if ot == target_lower:
-                best_opt = opt
+        # Find matching radio
+        best_sel = None
+        t_lower = target.lower()
+        for r in radios:
+            if r["text"].strip().lower() == t_lower:
+                best_sel = r["selector"]
                 break
-        if not best_opt:
-            for opt in opts:
-                ot = opt["t"].lower()
-                if target_lower[:5] in ot:
-                    best_opt = opt
+        if not best_sel:
+            for r in radios:
+                rt = r["text"].strip().lower()
+                if t_lower[:6] in rt or any(w in rt for w in t_lower.split() if len(w) > 3):
+                    best_sel = r["selector"]
                     break
 
-        if not best_opt:
-            continue
+        if best_sel:
+            try:
+                loc = page.locator(best_sel).first
+                await loc.scroll_into_view_if_needed(timeout=3000)
+                await loc.click(timeout=3000)
+                await ev("Lever EEO", "success", f"Radio: '{target}' for '{q[:50]}'")
+            except Exception as e:
+                await ev("Lever EEO", "warning", f"EEO radio failed '{q[:30]}': {e}")
 
-        try:
-            loc = page.locator(selector).first
-            await loc.scroll_into_view_if_needed(timeout=3000)
-            await loc.select_option(index=best_opt["i"], timeout=3000)
-            await page.evaluate(f"""() => {{
-                const el = document.querySelector('{selector}');
-                if (el) el.dispatchEvent(new Event('change', {{bubbles: true}}));
-            }}""")
-            await ev("Lever EEO", "success", f"Set '{target}' for '{sel_info['label'][:40]}'")
-        except Exception as e:
-            await ev("Lever EEO", "warning", f"EEO select failed '{sel_info['label'][:30]}': {e}")
+    # ── 3. Checkbox-based ethnicity ("Select all that apply") ─────────────────
+    # Detect by label text (not by container structure — more reliable for all Lever configs).
+    # Use index-based JS clicking via label.click() for React compatibility.
+    _race_words = [
+        'asian', 'white', 'caucasian', 'hispanic', 'latino', 'black', 'african',
+        'native', 'pacific', 'indigenous', 'middle eastern', 'north african',
+        'other race', 'other origin', 'other ethnicity', 'prefer not to answer',
+        'prefer not to disclose',
+    ]
+    ethnicity_cbs = await page.evaluate("""(matchKw, raceWords) => {
+        const allCbs = Array.from(document.querySelectorAll('input[type="checkbox"]'));
+        const result = [];
+        for (let i = 0; i < allCbs.length; i++) {
+            const cb = allCbs[i];
+            if (cb.offsetParent === null) continue;
+            // Get label text using direct text nodes (avoids nested element noise)
+            const lbl = cb.closest('label');
+            const rawText = lbl
+                ? Array.from(lbl.childNodes).filter(n => n.nodeType === 3)
+                    .map(n => n.textContent.trim()).filter(t => t).join(' ')
+                : (cb.value || '');
+            const text = rawText.toLowerCase();
+            if (!raceWords.some(w => text.includes(w))) continue;
+            result.push({
+                index: i,
+                text: lbl ? lbl.innerText.trim() : cb.value,
+                isChecked: cb.checked,
+                shouldCheck: matchKw.some(kw => text.includes(kw)),
+            });
+        }
+        return result;
+    }""", EEO_ETHNICITY_MATCH, _race_words)
+
+    if ethnicity_cbs:
+        await ev("Lever EEO", "info", f"Found {len(ethnicity_cbs)} ethnicity checkboxes (checkbox-style EEO)")
+        for item in ethnicity_cbs:
+            idx   = item["index"]
+            txt   = item["text"][:50]
+            should = item["shouldCheck"]
+            checked = item["isChecked"]
+
+            await ev("Lever EEO", "info",
+                     f"  '{txt}' | checked={checked} | shouldCheck={should}")
+
+            if should == checked:
+                continue  # Already in correct state
+
+            try:
+                via = await page.evaluate(f"""() => {{
+                    const cbs = document.querySelectorAll('input[type="checkbox"]');
+                    const cb = cbs[{idx}];
+                    if (!cb) return 'not-found';
+                    const lbl = cb.closest('label');
+                    if (lbl) {{ lbl.click(); return 'label'; }}
+                    cb.click(); return 'input';
+                }}""")
+                await asyncio.sleep(0.2)
+                action = "Checked" if should else "Unchecked"
+                await ev("Lever EEO", "success", f"{action} ethnicity '{txt}' (via {via})")
+            except Exception as e:
+                await ev("Lever EEO", "warning", f"Checkbox click failed '{txt}': {e}")
+    else:
+        await ev("Lever EEO", "info", "No checkbox-style ethnicity group found (likely uses <select>)")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -262,73 +427,85 @@ async def handle_lever_apply(
     # ── Step 2: Upload resume ───────────────────────────────────────────────
     if resume_path and os.path.exists(resume_path):
         resume_uploaded = False
-        # Lever uses a file input inside a drop zone
-        resume_selectors = [
+        resume_basename = os.path.basename(resume_path)
+
+        # ── Strategy A: set_input_files directly on the hidden file input ──
+        # Playwright can set files on hidden inputs without making them visible.
+        # After setting, verify the file actually registered (React may not fire
+        # its onChange for a manually-unhidden input).
+        for sel in [
             'input[type="file"][name*="resume"]',
             'input[type="file"][id*="resume"]',
             'input[type="file"][accept*="pdf"]',
             'input[type="file"]',
-        ]
-        for sel in resume_selectors:
+        ]:
             try:
                 fi = page.locator(sel).first
-                count = await fi.count()
-                if count > 0:
-                    # Force set even if element is hidden (Lever hides file input behind styled button)
-                    try:
-                        await fi.set_input_files(resume_path)
-                    except Exception:
-                        # Try with evaluate to bypass visibility restrictions
-                        try:
-                            await page.evaluate(f"""() => {{
-                                const input = document.querySelector('{sel}');
-                                if (input) input.style.display = 'block';
-                            }}""")
-                            await fi.set_input_files(resume_path)
-                        except Exception:
-                            continue
-                    await asyncio.sleep(2.0)
-                    # Verify something appeared in the resume field area
+                if await fi.count() == 0:
+                    continue
+                # Unhide if needed, then set files
+                await page.evaluate(f"""() => {{
+                    const el = document.querySelector('{sel}');
+                    if (el) {{ el.style.display = 'block'; el.style.opacity = '1'; }}
+                }}""")
+                await fi.set_input_files(resume_path)
+                await asyncio.sleep(1.5)
+                # Verify: check that the file input's .files list is populated
+                # AND that Lever's UI shows the filename (indicates React processed it)
+                verified = await page.evaluate(f"""() => {{
+                    const fi = document.querySelector('{sel}');
+                    if (!fi) return false;
+                    if (fi.files && fi.files.length > 0) return true;
+                    // Also check if Lever rendered the filename anywhere on the page
+                    const pageText = document.body.innerText;
+                    return pageText.includes('{resume_basename}');
+                }}""")
+                if verified:
                     resume_uploaded = True
-                    await ev("Lever", "success", f"Resume uploaded: {os.path.basename(resume_path)}")
+                    await ev("Lever", "success", f"Resume uploaded (direct): {resume_basename}")
                     break
+                else:
+                    await ev("Lever", "info",
+                             f"Strategy A: set_input_files ran but file not registered by React — trying Strategy B")
             except Exception:
                 continue
+
+        # ── Strategy B: intercept the file-chooser dialog (most robust) ──
+        # Lever's "ATTACH RESUME/CV" link opens a native file dialog.
+        # expect_file_chooser intercepts it so we never see the OS dialog.
         if not resume_uploaded:
-            # Try clicking ATTACH RESUME/CV button to open the upload modal, then set files
-            attach_btns = [
+            attach_selectors = [
                 'a:has-text("ATTACH")', 'button:has-text("ATTACH")',
                 'a:has-text("Attach")', 'button:has-text("Attach")',
-                '.resume-upload-btn', '.attach-resume',
-                'a[class*="resume"]', 'button[class*="resume"]',
+                'a:has-text("attach")', 'button:has-text("attach")',
+                '[class*="resume"]', '[class*="upload"]',
             ]
-            for btn_sel in attach_btns:
+            for btn_sel in attach_selectors:
                 try:
                     btn = page.locator(btn_sel).first
-                    if await btn.count() > 0 and await btn.is_visible(timeout=1500):
-                        await btn.click()
-                        await asyncio.sleep(1.0)
-                        # Now look for file input that appeared
-                        for fi_sel in ['input[type="file"]', 'input[type="file"][accept*="pdf"]']:
-                            try:
-                                fi2 = page.locator(fi_sel).first
-                                if await fi2.count() > 0:
-                                    await fi2.set_input_files(resume_path)
-                                    await asyncio.sleep(2.0)
-                                    resume_uploaded = True
-                                    await ev("Lever", "success", f"Resume uploaded via modal: {os.path.basename(resume_path)}")
-                                    break
-                            except Exception:
-                                continue
-                        if resume_uploaded:
-                            break
+                    if await btn.count() == 0:
+                        continue
+                    async with page.expect_file_chooser(timeout=4000) as fc_info:
+                        await btn.click(timeout=3000)
+                    fc = await fc_info.value
+                    await fc.set_files(resume_path)
+                    await asyncio.sleep(1.5)
+                    resume_uploaded = True
+                    await ev("Lever", "success",
+                             f"Resume uploaded (file-chooser): {resume_basename}")
+                    break
                 except Exception:
                     continue
+
         if not resume_uploaded:
-            await ev("Lever", "warning", "Resume upload failed — file input not found")
+            await ev("Lever", "warning",
+                     "Resume upload: could not find file input or ATTACH button")
             errors.append("Resume upload failed")
     else:
-        await ev("Lever", "warning", f"Resume not found: {resume_path}")
+        if resume_path:
+            await ev("Lever", "warning", f"Resume file not found on disk: {resume_path}")
+        else:
+            await ev("Lever", "warning", "No resume path configured")
 
     await ss()
 
@@ -348,12 +525,24 @@ async def handle_lever_apply(
             const sel = id ? '#' + CSS.escape(id) : (name ? '[name="' + name + '"]' : null);
             if (!sel || seen.has(sel)) return;
             seen.add(sel);
-            // Label lookup
+            // Label lookup — Lever wraps inputs in <label>; get text nodes from that label
             let lbl = '';
-            if (id) { const l = document.querySelector('label[for="' + id + '"]'); if (l) lbl = l.innerText.replace('*','').trim(); }
+            if (id) { const l = document.querySelector('label[for="' + id + '"]'); if (l) lbl = l.innerText.replace('*','').replace('✱','').trim(); }
             if (!lbl) {
-                const wrapper = el.closest('.application-field, .lever-field, .field, .form-group, .question, li');
-                if (wrapper) { const l = wrapper.querySelector('label, .field-label, legend'); if (l) lbl = l.innerText.replace('*','').trim(); }
+                // Lever structure: input > div.application-field > label (text "Field Name") > li
+                const parentLbl = el.closest('label');
+                if (parentLbl) {
+                    // Use direct text nodes only to avoid picking up dropdown result text
+                    lbl = Array.from(parentLbl.childNodes)
+                        .filter(n => n.nodeType === 3)
+                        .map(n => n.textContent.trim())
+                        .filter(t => t.length > 0 && t !== '✱' && t !== '*')
+                        .join(' ').trim();
+                }
+            }
+            if (!lbl) {
+                const wrapper = el.closest('.application-question, .application-field, .field, .form-group, li');
+                if (wrapper) { const l = wrapper.querySelector('label:not(:has(input)), .field-label, legend'); if (l) lbl = l.innerText.replace('*','').replace('✱','').trim(); }
             }
             if (!lbl) lbl = el.placeholder || el.name || '';
             fields.push({
@@ -374,8 +563,18 @@ async def handle_lever_apply(
             let lbl = '';
             if (id) { const l = document.querySelector('label[for="' + id + '"]'); if (l) lbl = l.innerText.replace('*','').trim(); }
             if (!lbl) {
-                const wrapper = el.closest('.application-field, .lever-field, .field, li');
-                if (wrapper) { const l = wrapper.querySelector('label, .field-label, legend'); if (l) lbl = l.innerText.replace('*','').trim(); }
+                const parentLbl = el.closest('label');
+                if (parentLbl) {
+                    lbl = Array.from(parentLbl.childNodes)
+                        .filter(n => n.nodeType === 3)
+                        .map(n => n.textContent.trim())
+                        .filter(t => t.length > 0 && t !== '✱' && t !== '*')
+                        .join(' ').trim();
+                }
+            }
+            if (!lbl) {
+                const wrapper = el.closest('.application-question, .application-field, .field, li');
+                if (wrapper) { const l = wrapper.querySelector('label:not(:has(select)), .field-label, legend'); if (l) lbl = l.innerText.replace('*','').replace('✱','').trim(); }
             }
             const opts = Array.from(el.options).filter(o => o.value).map(o => o.text.trim());
             fields.push({
@@ -454,23 +653,40 @@ async def handle_lever_apply(
                 # is committed without accidentally submitting the form.
                 if any(kw in lbl_lower for kw in ("location", "city", "address", "where")):
                     await el.press_sequentially(value, delay=60)
-                    await asyncio.sleep(1.8)
-                    # Check whether an autocomplete suggestion list is visible
-                    _dropdown_visible = False
+                    await asyncio.sleep(3.5)  # Lever autocomplete API can take 2-3s
+                    # Try Lever-specific dropdown first (.dropdown-location items)
+                    _clicked_dropdown = False
                     try:
-                        _dd = page.locator(
-                            "ul[role='listbox'], [class*='autocomplete'], "
-                            "[class*='suggestions'], [class*='dropdown-menu']"
-                        )
-                        _dropdown_visible = await _dd.first.is_visible(timeout=800)
+                        _lever_item = page.locator(".dropdown-location").first
+                        if await _lever_item.is_visible(timeout=1500):
+                            await _lever_item.click(timeout=2000)
+                            _clicked_dropdown = True
                     except Exception:
                         pass
-                    if _dropdown_visible:
-                        await el.press("ArrowDown")
-                        await asyncio.sleep(0.4)
-                        await el.press("Enter")
-                    else:
-                        await el.press("Tab")  # commit value without form submission
+                    if not _clicked_dropdown:
+                        # Try Lever's #location-0 id (first autocomplete result)
+                        try:
+                            _clicked_dropdown = await page.evaluate("""() => {
+                                const el = document.querySelector('#location-0');
+                                if (el && el.offsetParent !== null) { el.click(); return true; }
+                                return false;
+                            }""")
+                        except Exception:
+                            pass
+                    if not _clicked_dropdown:
+                        # Fallback: generic autocomplete dropdowns
+                        try:
+                            _dd = page.locator(
+                                "ul[role='listbox'] li, [class*='autocomplete'] li, "
+                                "[class*='suggestion'], [class*='dropdown-item']"
+                            )
+                            if await _dd.first.is_visible(timeout=800):
+                                await _dd.first.click(timeout=2000)
+                                _clicked_dropdown = True
+                        except Exception:
+                            pass
+                    if not _clicked_dropdown:
+                        await el.press("Tab")  # commit typed value
                     await asyncio.sleep(0.5)
                 else:
                     await el.fill(value, timeout=3000)
@@ -516,6 +732,104 @@ async def handle_lever_apply(
             # Custom question needing LLM
             if label and (field.get("required") or ftype == "textarea"):
                 custom_questions.append(field)
+
+    await ss()
+
+    # ── Step 3b: Pronouns checkboxes (label-text proximity search) ─────────
+    # Lever forms often use name="cards[uuid]" instead of name="pronouns",
+    # so we find the pronoun group by locating the "Pronouns" heading/label
+    # and collecting all checkboxes inside its container.
+    pronouns_val = (personal_info.get("pronouns") or "").lower().strip()  # e.g. "he/him"
+    _PRONOUN_JS = """(target) => {
+        // Normalise: lowercase, strip spaces/slashes so "He/him" == "he/him" == "hehim"
+        function norm(s) { return s.toLowerCase().replace(/[\\s\\/]+/g, ''); }
+        const normTarget = norm(target);
+
+        // 1. Find the element whose direct text is "Pronouns" (label/legend/span/etc.)
+        let pronounsLabel = null;
+        const candidates = document.querySelectorAll(
+            'label, legend, span, p, div, h3, h4, h5, li');
+        for (const el of candidates) {
+            // Use only direct text nodes to avoid matching child text
+            const direct = Array.from(el.childNodes)
+                .filter(n => n.nodeType === 3)
+                .map(n => n.textContent.trim())
+                .join(' ')
+                .trim();
+            if (/^pronouns[*:\\s]*$/i.test(direct) ||
+                /^pronouns[*:\\s]*$/i.test(el.textContent.trim())) {
+                pronounsLabel = el;
+                break;
+            }
+        }
+        if (!pronounsLabel) return [];
+
+        // 2. Walk up from that label until we find the smallest ancestor
+        //    that directly contains at least one checkbox (but fewer than 20,
+        //    to avoid grabbing the whole form).
+        let container = pronounsLabel.parentElement;
+        for (let i = 0; i < 10 && container; i++) {
+            const count = container.querySelectorAll('input[type="checkbox"]').length;
+            if (count > 0 && count < 20) break;
+            container = container.parentElement;
+        }
+        if (!container) return [];
+
+        // 3. Map each checkbox in the container to {index, text, checked, shouldCheck}
+        const allCbs = Array.from(document.querySelectorAll('input[type="checkbox"]'));
+        const localCbs = Array.from(container.querySelectorAll('input[type="checkbox"]'));
+
+        return localCbs.map(cb => {
+            // Prefer direct text-node content of the wrapping <label>
+            let text = cb.value || '';
+            const lbl = cb.closest('label') ||
+                        document.querySelector('label[for="' + cb.id + '"]');
+            if (lbl) {
+                const textNodes = Array.from(lbl.childNodes)
+                    .filter(n => n.nodeType === 3)
+                    .map(n => n.textContent.trim())
+                    .filter(Boolean);
+                text = textNodes.length > 0
+                    ? textNodes.join(' ')
+                    : lbl.textContent.trim();
+            }
+            return {
+                index: allCbs.indexOf(cb),
+                text: text,
+                isChecked: cb.checked,
+                shouldCheck: norm(text) === normTarget,
+            };
+        });
+    }"""
+    if pronouns_val:
+        pronoun_data = await page.evaluate(_PRONOUN_JS, pronouns_val)
+
+        if pronoun_data:
+            await ev("Lever", "info",
+                     f"Pronouns: found {len(pronoun_data)} option(s) in section")
+        else:
+            await ev("Lever", "warning",
+                     "Pronouns: could not locate pronoun checkbox section")
+
+        for item in pronoun_data:
+            should = item["shouldCheck"]
+            checked = item["isChecked"]
+            if should == checked:
+                continue  # already correct state
+            idx = item["index"]
+            try:
+                await page.evaluate(f"""() => {{
+                    const cbs = document.querySelectorAll('input[type="checkbox"]');
+                    const cb = cbs[{idx}];
+                    if (!cb) return;
+                    const lbl = cb.closest('label');
+                    if (lbl) lbl.click(); else cb.click();
+                }}""")
+                action = "Checked" if should else "Unchecked"
+                await ev("Lever", "success", f"{action} pronoun: {item['text']}")
+            except Exception as e:
+                await ev("Lever", "warning",
+                         f"Pronoun checkbox failed '{item['text']}': {e}")
 
     await ss()
 
@@ -643,6 +957,11 @@ async def handle_lever_apply(
         except Exception:
             pass
 
+        # Skip EEO/demographic questions — handled by _fill_lever_eeo below
+        _eeo_kw = ["gender", "sex", "age", "ethnic", "race", "veteran", "disab", "identify"]
+        if any(kw in q_text for kw in _eeo_kw):
+            continue
+
         target = None
         for kw, val in radio_answer_map.items():
             if kw in q_text:
@@ -705,6 +1024,40 @@ async def handle_lever_apply(
             pass
 
     await ss()
+
+    # ── Step 8: Final pronouns re-check (runs LAST so nothing can undo it) ─
+    # Re-uses the same label-proximity JS from Step 3b (_PRONOUN_JS).
+    # Runs after EEO + agree steps in case any prior step accidentally toggled them.
+    pronouns_val_final = (personal_info.get("pronouns") or "").lower().strip()
+    if pronouns_val_final:
+        pronoun_data_final = await page.evaluate(_PRONOUN_JS, pronouns_val_final)
+
+        changed_final = 0
+        for item in pronoun_data_final:
+            should = item["shouldCheck"]
+            checked = item["isChecked"]
+            if should == checked:
+                continue
+            idx = item["index"]
+            try:
+                await page.evaluate(f"""() => {{
+                    const cbs = document.querySelectorAll('input[type="checkbox"]');
+                    const cb = cbs[{idx}];
+                    if (!cb) return;
+                    const lbl = cb.closest('label');
+                    if (lbl) lbl.click(); else cb.click();
+                }}""")
+                action = "Checked" if should else "Unchecked"
+                await ev("Lever", "success",
+                         f"Final re-check pronoun: {item['text']} ({action})")
+                changed_final += 1
+            except Exception as e:
+                await ev("Lever", "warning",
+                         f"Final pronoun re-check failed '{item['text']}': {e}")
+
+        if not changed_final and pronoun_data_final:
+            await ev("Lever", "success",
+                     f"Pronouns already correct — '{pronouns_val_final}' only")
 
     await ev("Lever", "success",
         f"Lever form filled ({filled} fields, {failed} failed). Review in browser before submitting.")

@@ -270,52 +270,85 @@ async def handle_ashby_apply(
     # ── Step 2: Upload resume ───────────────────────────────────────────────
     if resume_path and os.path.exists(resume_path):
         resume_uploaded = False
+        resume_basename = os.path.basename(resume_path)
 
-        # Ashby usually has a file drop zone + hidden file input
-        # The file input is often inside .ashby-file-upload or similar
-        file_selectors = [
+        # Strategy A: set_input_files directly, preferring non-cover-letter inputs
+        for sel in [
             'input[type="file"][name*="resume"]',
             'input[type="file"][name*="Resume"]',
             'input[type="file"][accept*="pdf"]',
             'input[type="file"]',
-        ]
-        for sel in file_selectors:
+        ]:
             try:
                 fis = page.locator(sel)
                 count = await fis.count()
-                if count > 0:
-                    # Check labels to find resume input (not cover letter)
-                    for i in range(count):
-                        fi = fis.nth(i)
-                        # Get parent container text to check label
-                        parent_text = await page.evaluate(f"""() => {{
+                if count == 0:
+                    continue
+                for i in range(count):
+                    fi = fis.nth(i)
+                    # Check container text to skip cover letter inputs
+                    parent_text = await page.evaluate(f"""() => {{
+                        const fis = document.querySelectorAll('{sel}');
+                        const fi = fis[{i}];
+                        if (!fi) return '';
+                        let el = fi;
+                        for (let j = 0; j < 5; j++) {{
+                            el = el.parentElement;
+                            if (!el) break;
+                            const t = el.innerText || '';
+                            if (t.length > 3 && t.length < 200) return t.toLowerCase();
+                        }}
+                        return '';
+                    }}""")
+                    if "cover" in parent_text and "resume" not in parent_text:
+                        continue
+                    await fi.set_input_files(resume_path)
+                    await asyncio.sleep(2.0)
+                    # Verify file actually registered (React may not fire onChange for unhidden inputs)
+                    try:
+                        verified = await page.evaluate(f"""() => {{
                             const fis = document.querySelectorAll('{sel}');
-                            const fi = fis[{i}];
-                            if (!fi) return '';
-                            let el = fi;
-                            for (let j = 0; j < 5; j++) {{
-                                el = el.parentElement;
-                                if (!el) break;
-                                const t = el.innerText || '';
-                                if (t.length > 3 && t.length < 200) return t.toLowerCase();
-                            }}
-                            return '';
+                            const f = fis[{i}];
+                            if (f && f.files && f.files.length > 0) return true;
+                            return document.body.innerText.includes('{resume_basename}');
                         }}""")
-
-                        # Skip cover letter inputs
-                        if "cover" in parent_text and "resume" not in parent_text:
-                            continue
-
-                        await fi.set_input_files(resume_path)
-                        await asyncio.sleep(2.0)
+                    except Exception:
+                        verified = True
+                    if verified:
                         resume_uploaded = True
-                        await ev("Ashby", "success", f"Resume uploaded: {os.path.basename(resume_path)}")
+                        await ev("Ashby", "success", f"Resume uploaded (direct): {resume_basename}")
                         break
-
-                    if resume_uploaded:
-                        break
+                    else:
+                        await ev("Ashby", "info",
+                                 "Strategy A: file set but not registered — trying Strategy B")
+                if resume_uploaded:
+                    break
             except Exception:
                 continue
+
+        # Strategy B: intercept the file-chooser dialog via upload button
+        if not resume_uploaded:
+            for btn_sel in [
+                'button:has-text("Upload")', 'a:has-text("Upload")',
+                'button:has-text("Choose")', 'a:has-text("Choose")',
+                'button:has-text("Attach")', 'a:has-text("Attach")',
+                '[class*="upload"]', '[class*="resume"]',
+            ]:
+                try:
+                    btn = page.locator(btn_sel).first
+                    if await btn.count() == 0:
+                        continue
+                    async with page.expect_file_chooser(timeout=4000) as fc_info:
+                        await btn.click(timeout=3000)
+                    fc = await fc_info.value
+                    await fc.set_files(resume_path)
+                    await asyncio.sleep(2.0)
+                    resume_uploaded = True
+                    await ev("Ashby", "success",
+                             f"Resume uploaded (file-chooser): {resume_basename}")
+                    break
+                except Exception:
+                    continue
 
         if not resume_uploaded:
             await ev("Ashby", "warning", "Resume upload failed — file input not found")
@@ -441,6 +474,39 @@ async def handle_ashby_apply(
                     await asyncio.sleep(0.5)
                 else:
                     await el.fill(value, timeout=3000)
+                    # If a date picker calendar opened (graduation date, etc.),
+                    # dismiss it by pressing Escape then Tab so the value is committed.
+                    if any(kw in label.lower() for kw in
+                           ("graduation", "date", "start date", "end date")):
+                        await asyncio.sleep(0.4)
+                        try:
+                            # First try clicking a visible day button (any enabled day cell)
+                            day_js = await page.evaluate("""() => {
+                                // Look for any table cell button that looks like a calendar day
+                                const btns = Array.from(document.querySelectorAll('table button, [role="gridcell"] button'));
+                                const vis = btns.filter(b => {
+                                    const r = b.getBoundingClientRect();
+                                    return r.width > 5 && r.height > 5 && !b.disabled;
+                                });
+                                if (vis.length > 0) {
+                                    const r = vis[0].getBoundingClientRect();
+                                    return {x: r.left + r.width/2, y: r.top + r.height/2};
+                                }
+                                return null;
+                            }""")
+                            if day_js:
+                                await page.mouse.click(day_js["x"], day_js["y"])
+                                await asyncio.sleep(0.3)
+                            else:
+                                await el.press("Escape")
+                                await asyncio.sleep(0.2)
+                                await el.press("Tab")
+                        except Exception:
+                            try:
+                                await el.press("Escape")
+                                await el.press("Tab")
+                            except Exception:
+                                pass
                 filled += 1
             except Exception as e:
                 failed += 1
@@ -639,30 +705,60 @@ async def handle_ashby_apply(
                 await ev("Ashby", "warning", f"Radio click failed: {e}")
 
     # ── Step 7: Checkboxes ─────────────────────────────────────────────────
+    # Collect ALL visible unchecked checkboxes with their parent group context
     checkboxes = await page.evaluate("""() => {
         const results = [];
         document.querySelectorAll('input[type="checkbox"]').forEach(cb => {
             if (cb.checked || cb.offsetParent === null) return;
             const wrapper = cb.closest('label, li, .checkbox-field, div');
             const text = wrapper ? wrapper.innerText.trim().toLowerCase() : '';
-            if (text.includes('agree') || text.includes('acknowledge') || text.includes('certif')
-                || text.includes('understand') || text.includes('confirm')) {
-                results.push({
-                    selector: cb.id ? '#' + CSS.escape(cb.id) : '[name="' + cb.name + '"]',
-                    text: text.substring(0, 100),
-                });
-            }
+            // Find the group label (fieldset legend or nearest preceding heading/label)
+            const fieldset = cb.closest('fieldset, [class*="field"], [class*="group"]');
+            const groupLabel = fieldset
+                ? (fieldset.querySelector('legend, label, [class*="label"]')?.innerText?.toLowerCase() || '')
+                : '';
+            results.push({
+                selector: cb.id ? '#' + CSS.escape(cb.id) : '[name="' + CSS.escape(cb.name) + '"]',
+                text: text.substring(0, 120),
+                groupLabel: groupLabel.substring(0, 80),
+            });
         });
         return results;
     }""")
 
+    # Keywords that should always be checked (legal/agreement boxes)
+    _AGREE_KW = ("agree", "acknowledge", "certif", "understand", "confirm", "consent")
+    # Keywords for "area of interest" checkboxes relevant to a SWE role
+    _SWE_AREA_KW = ("infra", "engineer", "backend", "frontend", "platform",
+                    "security", "data", "ml", "ai", "mobile", "software", "tech")
+    # Candidate's degree level keywords (BS = undergraduate/bachelor)
+    _DEGREE_KW = ("undergraduate", "bachelor", "b.s", "bs ")
+
     for cb in checkboxes:
         if not cb.get("selector"):
             continue
+        text = cb.get("text", "")
+        group = cb.get("groupLabel", "")
+        combined = (text + " " + group).lower()
+
+        is_agree = any(kw in combined for kw in _AGREE_KW)
+        # Interest-area group: group label contains "interest" or "area" or "team"
+        is_interest_group = any(kw in group for kw in ("interest", "area", "team", "role", "which"))
+        is_swe_relevant = any(kw in text for kw in _SWE_AREA_KW)
+        # Degree type group: check the undergraduate/bachelor option
+        is_degree_group = any(kw in group for kw in ("degree", "education level", "degree type"))
+        is_undergrad = any(kw in text for kw in _DEGREE_KW)
+
+        should_check = (is_agree
+                        or (is_interest_group and is_swe_relevant)
+                        or (is_degree_group and is_undergrad))
+        if not should_check:
+            continue
+
         try:
             loc = page.locator(cb["selector"]).first
             await loc.click(timeout=3000)
-            await ev("Ashby", "success", f"Checked: '{cb['text'][:50]}'")
+            await ev("Ashby", "success", f"Checked: '{text[:50]}'")
         except Exception:
             pass
 

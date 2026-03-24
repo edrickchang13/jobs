@@ -50,18 +50,23 @@ while true; do
     RESTART_COUNT=$((RESTART_COUNT + 1))
     log_event "Starting server (attempt #$RESTART_COUNT)..."
 
+    # Kill ALL processes holding port 8080 so we don't get [Errno 48]
+    # uvicorn --reload spawns a parent reloader + worker child; both may hold the port.
+    _old_pids=$(lsof -ti:8080 2>/dev/null)
+    if [ -n "$_old_pids" ]; then
+        log_event "Port 8080 occupied by PID(s) $(echo $_old_pids | tr '\n' ' ')— killing..."
+        echo "$_old_pids" | xargs kill 2>/dev/null || true
+        sleep 2
+        echo "$_old_pids" | xargs kill -9 2>/dev/null || true
+        sleep 1
+    fi
+
     # Start server, append stdout+stderr to server.log
     (
         cd "$SCRIPT_DIR"
         source .venv/bin/activate 2>/dev/null || true
         exec python -m uvicorn dashboard.app:app \
-            --host 127.0.0.1 --port 8080 \
-            --reload \
-            --reload-dir dashboard \
-            --reload-dir applicator \
-            --reload-dir scraper \
-            --reload-dir database \
-            --reload-dir resume
+            --host 127.0.0.1 --port 8080
     ) >> "$SERVER_LOG" 2>&1 &
     SERVER_PID=$!
 

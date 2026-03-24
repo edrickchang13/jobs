@@ -461,18 +461,73 @@ async def handle_greenhouse_apply(
     # ── Step 3: Upload resume ───────────────────────────────────────────────
     if resume_path and os.path.exists(resume_path):
         resume_uploaded = False
-        for file_sel in ['input[type="file"]#resume', 'input[type="file"][name="resume"]',
-                         'input[type="file"][id*="resume"]', 'input[type="file"]']:
+        resume_basename = os.path.basename(resume_path)
+
+        # Strategy A: set_input_files directly on hidden file input
+        # Note: 'input[type="file"]#resume' is invalid CSS; use '#resume' or proper selectors
+        for file_sel in [
+            '#resume',                                    # Greenhouse well-known ID
+            'input[type="file"][name="resume"]',
+            'input[type="file"][id*="resume"]',
+            'input[type="file"][accept*="pdf"]',
+            'input[type="file"]',
+        ]:
             try:
                 file_input = ctx.locator(file_sel).first
-                if await file_input.is_visible(timeout=1500) or await file_input.count() > 0:
-                    await file_input.set_input_files(resume_path)
-                    await asyncio.sleep(1.5)
+                if await file_input.count() == 0:
+                    continue
+                # Unhide if needed, then set files
+                try:
+                    await ctx.evaluate(f"""() => {{
+                        const el = document.querySelector('{file_sel}');
+                        if (el) {{ el.style.display = 'block'; el.style.opacity = '1'; }}
+                    }}""")
+                except Exception:
+                    pass
+                await file_input.set_input_files(resume_path)
+                await asyncio.sleep(1.5)
+                # Verify the file actually registered (check .files property or page text)
+                try:
+                    verified = await ctx.evaluate(f"""() => {{
+                        const fi = document.querySelector('{file_sel}');
+                        if (fi && fi.files && fi.files.length > 0) return true;
+                        return document.body.innerText.includes('{resume_basename}');
+                    }}""")
+                except Exception:
+                    verified = True  # assume success if we can't verify
+                if verified:
                     resume_uploaded = True
-                    await ev("Greenhouse", "success", f"Resume uploaded: {os.path.basename(resume_path)}")
+                    await ev("Greenhouse", "success", f"Resume uploaded (direct): {resume_basename}")
                     break
+                else:
+                    await ev("Greenhouse", "info",
+                             "Strategy A: file set but not registered — trying Strategy B")
             except Exception:
                 continue
+
+        # Strategy B: intercept the file-chooser dialog via button click
+        if not resume_uploaded:
+            for btn_sel in [
+                'button:has-text("Upload")', 'a:has-text("Upload")',
+                'button:has-text("Attach")', 'a:has-text("Attach")',
+                '[class*="resume"]', '[data-qa*="resume"]',
+            ]:
+                try:
+                    btn = ctx.locator(btn_sel).first
+                    if await btn.count() == 0:
+                        continue
+                    async with page.expect_file_chooser(timeout=4000) as fc_info:
+                        await btn.click(timeout=3000)
+                    fc = await fc_info.value
+                    await fc.set_files(resume_path)
+                    await asyncio.sleep(1.5)
+                    resume_uploaded = True
+                    await ev("Greenhouse", "success",
+                             f"Resume uploaded (file-chooser): {resume_basename}")
+                    break
+                except Exception:
+                    continue
+
         if not resume_uploaded:
             await ev("Greenhouse", "warning", "Could not upload resume — file input not found")
             errors.append("Resume upload failed")
@@ -840,7 +895,7 @@ async def _fill_eeoc_section(ctx, known: dict, ev):
 
     # keyword groups → desired value
     eeoc_patterns = [
-        (["gender", " sex"],                        known["gender"]),
+        (["gender", "sex"],                         known["gender"]),
         (["race", "ethnic", "national origin"],     known["race"]),
         (["veteran", "military", "protected vet"],  known["veteran_status"]),
         (["disability", "disabled", "accommodat"],  known["disability_status"]),

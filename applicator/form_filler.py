@@ -204,8 +204,18 @@ async def fill_with_browser_agent(
     from browser_use import Agent, Browser
     from browser_use.llm import ChatOpenAI
 
-    def _make_bu_llm():
-        """Build browser-use LLM with provider fallback priority."""
+    def _make_bu_llm(provider: str = "auto"):
+        """Build browser-use LLM with provider fallback priority.
+        Gemini removed — key expired and it rejects frequency_penalty parameter.
+        Priority: ollama > cerebras > groq.
+        """
+        if provider == "groq" or (provider == "auto" and not os.getenv("CEREBRAS_API_KEY") and os.getenv("GROQ_API_KEY")):
+            return ChatOpenAI(
+                model="llama-3.3-70b-versatile",
+                base_url="https://api.groq.com/openai/v1",
+                api_key=os.getenv("GROQ_API_KEY"),
+                dont_force_structured_output=True,
+            ), "groq"
         if os.getenv("OLLAMA_MODEL"):
             return ChatOpenAI(
                 model=os.getenv("OLLAMA_MODEL", "qwen2.5:72b"),
@@ -213,26 +223,25 @@ async def fill_with_browser_agent(
                 api_key="ollama",
                 dont_force_structured_output=True,
                 timeout=120,
-            )
-        if os.getenv("GEMINI_API_KEY"):
+            ), "ollama"
+        if os.getenv("CEREBRAS_API_KEY"):
             return ChatOpenAI(
-                model="gemini-2.0-flash",
-                base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
-                api_key=os.getenv("GEMINI_API_KEY"),
+                model="qwen-3-235b-a22b-instruct-2507",
+                base_url="https://api.cerebras.ai/v1",
+                api_key=os.getenv("CEREBRAS_API_KEY"),
+                frequency_penalty=None,
                 dont_force_structured_output=True,
-            )
-        # Fallback: Cerebras
+            ), "cerebras"
+        # Last resort: Groq
         return ChatOpenAI(
-            model="qwen-3-235b-a22b-instruct-2507",
-            base_url="https://api.cerebras.ai/v1",
-            api_key=os.getenv("CEREBRAS_API_KEY"),
-            frequency_penalty=None,
+            model="llama-3.3-70b-versatile",
+            base_url="https://api.groq.com/openai/v1",
+            api_key=os.getenv("GROQ_API_KEY"),
             dont_force_structured_output=True,
-        )
+        ), "groq"
 
-    llm = _make_bu_llm()
+    llm, provider_used = _make_bu_llm()
     if event_callback:
-        provider_used = "ollama" if os.getenv("OLLAMA_MODEL") else ("gemini" if os.getenv("GEMINI_API_KEY") else "cerebras")
         await event_callback("Navigate", "info", f"Browser-use LLM: {provider_used}")
 
     _headless = os.getenv("HEADLESS", "false").lower() == "true"
@@ -249,7 +258,7 @@ YOUR TASK IS LIMITED — do ONLY these steps, then STOP:
 
 1. Navigate to the URL above
 2. Click "Apply" or "Apply Now" button. On Workday sites the button may be a link with text "Apply" inside an element with data-uxi-element-id="Apply_adventureButton".
-3. If you see a "Start Your Application" dialog with options like "Apply Manually", "Autofill with Resume", or "Use My Last Application": click "Autofill with Resume" (preferred). If not available, click "Apply Manually". Do NOT click "Use My Last Application" (it causes errors).
+3. If you see a "Start Your Application" dialog with options: ONLY click "Autofill with Resume" or "Apply Manually". NEVER click "Use My Last Application" — it breaks the application flow and redirects to an account creation page.
 4. If you see a cookie consent banner, click "Accept" or "Accept All"
 
 STOP CONDITIONS — stop immediately when you see ANY of these:
@@ -259,7 +268,8 @@ STOP CONDITIONS — stop immediately when you see ANY of these:
 - "Already applied" or "Position has been filled" message
 - A CAPTCHA
 
-DO NOT DO ANY OF THESE:
+DO NOT DO ANY OF THESE — CRITICAL:
+- Do NOT click "Use My Last Application" — this always causes an error
 - Do NOT fill in any form fields (name, email, etc.)
 - Do NOT sign in or create an account
 - Do NOT click any Sign In or Create Account buttons
@@ -273,6 +283,14 @@ Report what page you're on when you stop."""
     if transcript_path:
         file_paths.append(transcript_path)
 
+    # Build a fallback LLM for the agent so that per-step 429s auto-recover
+    # instead of triggering "no fallback_llm configured" warnings
+    _fallback_llm = None
+    if provider_used == "cerebras" and os.getenv("GROQ_API_KEY"):
+        _fallback_llm, _ = _make_bu_llm("groq")
+    elif provider_used == "groq" and os.getenv("CEREBRAS_API_KEY"):
+        _fallback_llm, _ = _make_bu_llm("cerebras")  # type: ignore[assignment]
+
     agent = Agent(
         task=task,
         llm=llm,
@@ -283,6 +301,7 @@ Report what page you're on when you stop."""
         loop_detection_enabled=True,
         loop_detection_window=5,
         available_file_paths=file_paths,
+        **({"fallback_llm": _fallback_llm} if _fallback_llm else {}),
     )
 
     steps = 0
@@ -343,9 +362,35 @@ Report what page you're on when you stop."""
         import traceback as _tb
         agent_error = f"{type(e).__name__}: {e}"
         tb_str = _tb.format_exc()
-        if event_callback:
-            await event_callback("Agent", "error", f"Agent error: {agent_error[:200]}")
-            await event_callback("Agent", "info", f"Traceback: {tb_str[:500]}")
+        # If Cerebras rate-limited (429), retry with Groq
+        if "429" in str(e) and provider_used == "cerebras" and os.getenv("GROQ_API_KEY"):
+            if event_callback:
+                await event_callback("Agent", "warning", "Cerebras 429 — retrying with Groq...")
+            try:
+                groq_llm, _ = _make_bu_llm("groq")
+                agent_groq = Agent(
+                    task=task,
+                    llm=groq_llm,
+                    browser=_bu_browser,
+                    use_vision=False,
+                    max_failures=5,
+                    max_actions_per_step=3,
+                    loop_detection_enabled=True,
+                    loop_detection_window=5,
+                    available_file_paths=file_paths,
+                )
+                history = await agent_groq.run(max_steps=15, on_step_end=on_step_end)
+                agent_error = None
+                if event_callback:
+                    await event_callback("Agent", "success", f"Groq agent completed after {steps} steps")
+            except Exception as e2:
+                agent_error = f"{type(e2).__name__}: {e2}"
+                if event_callback:
+                    await event_callback("Agent", "error", f"Groq agent also failed: {agent_error[:200]}")
+        else:
+            if event_callback:
+                await event_callback("Agent", "error", f"Agent error: {agent_error[:200]}")
+                await event_callback("Agent", "info", f"Traceback: {tb_str[:500]}")
 
     # Get page after agent stops — browser-use returns a CDP Page, but we need
     # a Playwright Page for form filling (locator, fill, click, frames, etc.)
@@ -1841,7 +1886,7 @@ def map_fields_to_profile(
     cover_letter_text: str = "",
 ) -> list[dict]:
     """Send extracted fields to LLM, get back field->value mappings."""
-    client = _get_llm_client()
+    # client is built inside the provider retry loop below (Cerebras → Groq)
 
     # Trim fields to reduce token usage - only send what the LLM needs
     slim_fields = []
@@ -1949,13 +1994,13 @@ REMEMBER: Fill EVERY actual form field. Only use "skip" for optional cover lette
     import time as _time
 
     # Build provider list. Ollama (local DGX) goes first if OLLAMA_MODEL is set.
+    # Gemini removed — key expired and the API rejects frequency_penalty parameter.
     providers = []
     if os.getenv("OLLAMA_MODEL"):
         providers.append(("ollama", _OLLAMA_MODEL, _get_llm_client("ollama")))
     providers += [
-        ("gemini",   _GEMINI_MODEL, _get_llm_client("gemini")),
-        ("cerebras", _LLM_MODEL,    _get_llm_client("cerebras")),
-        ("groq",     _GROQ_MODEL,   _get_llm_client("groq")),
+        ("cerebras", _LLM_MODEL, _get_llm_client("cerebras")),
+        ("groq",     _GROQ_MODEL, _get_llm_client("groq")),
     ]
     last_error = None
     for provider_name, model, llm_client in providers:

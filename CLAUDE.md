@@ -75,9 +75,29 @@ Automated job application pipeline that scrapes GitHub for internship postings, 
 - Sponsorship Needed: No
 - Pronouns: He/him
 
-## Test URL
+## Test URLs
+
+### Lever
 https://jobs.lever.co/aofl/4b91076d-8937-4dbc-a502-a7d6a66e2e19/apply?utm_source=Simplify&ref=Simplify
 (Age of Learning - Software Engineer Intern)
+
+### Greenhouse
+https://boards.greenhouse.io/optiverus/jobs/7973726002
+(Optiver - Software Engineer Intern Summer 2026, Chicago)
+https://boards.greenhouse.io/embed/job_app?token=8106513002
+(C3 AI - Software Engineer Intern Summer 2026, Redwood City CA)
+
+### Ashby
+https://jobs.ashbyhq.com/notion/23ac2477-0008-4bed-b1c1-81f90a32e9e6/application
+(Notion - Software Engineer Intern Summer 2026)
+https://jobs.ashbyhq.com/replit/12737078-74c7-4e63-98a7-5e8da1e9deb1/application
+(Replit - Software Engineering Intern Summer 2026)
+
+### SmartRecruiters
+https://jobs.smartrecruiters.com/LinkedIn3/744000085237793-software-engineer-intern-undergraduate-summer-2026-mountain-view-ca-
+(LinkedIn - Software Engineer Intern Undergraduate Summer 2026, Mountain View CA)
+https://jobs.smartrecruiters.com/Visa/744000109722936-software-engineer-intern-summer-2026-foster-city
+(Visa - Software Engineer Intern Summer 2026, Foster City CA)
 
 ## Known Issues / Risks
 1. Browser agent has not yet successfully filled a form end-to-end

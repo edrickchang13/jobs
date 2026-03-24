@@ -3210,6 +3210,18 @@ async def _run_application(url: str, company: str, role: str):
                 from applicator.form_filler import JS_EXTRACT_FIELDS, map_fields_to_profile, fill_form
                 fields = await page.evaluate(JS_EXTRACT_FIELDS)
                 if fields:
+                    # Strip ALL checkboxes from the fallback filler.
+                    # ATS-specific handlers (Lever, Greenhouse, Ashby…) already handle every
+                    # checkbox type: pronouns, EEO, agree/acknowledge, etc.
+                    # fill_form uses action="click" which TOGGLES — re-clicking an already-checked
+                    # box unchecks it, and clicking any wrong pronoun/ethnicity box corrupts the
+                    # answers set by the dedicated handler.
+                    before_len = len(fields)
+                    fields = [f for f in fields if f.get("type") != "checkbox"]
+                    skipped_n = before_len - len(fields)
+                    if skipped_n:
+                        add_event("Fallback Filler", "info",
+                                  f"Skipped {skipped_n} checkbox field(s) — handled by ATS handler")
                     mappings = await asyncio.to_thread(map_fields_to_profile, fields, jd, company, role)
                     mappings = [m for m in mappings if isinstance(m, dict)]
                     async def fallback_evt(s, st, d=""):

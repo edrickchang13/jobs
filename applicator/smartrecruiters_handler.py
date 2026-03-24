@@ -189,43 +189,85 @@ async def handle_smartrecruiters_apply(
     # ── Step 2: Resume upload ───────────────────────────────────────────────
     if resume_path and os.path.exists(resume_path):
         resume_uploaded = False
-        file_sels = [
+        resume_basename = os.path.basename(resume_path)
+
+        # Strategy A: set_input_files directly on hidden file input
+        for sel in [
             'input[type="file"][name*="resume"]',
             'input[type="file"][data-testid*="resume"]',
             'input[type="file"][accept*="pdf"]',
             'input[type="file"]',
-        ]
-        for sel in file_sels:
+        ]:
             try:
                 fis = page.locator(sel)
                 count = await fis.count()
-                if count > 0:
-                    for i in range(count):
-                        fi = fis.nth(i)
-                        parent_text = await page.evaluate(f"""() => {{
+                if count == 0:
+                    continue
+                for i in range(count):
+                    fi = fis.nth(i)
+                    parent_text = await page.evaluate(f"""() => {{
+                        const fis = document.querySelectorAll('{sel}');
+                        const fi = fis[{i}];
+                        if (!fi) return '';
+                        let el = fi;
+                        for (let j = 0; j < 5; j++) {{
+                            el = el.parentElement;
+                            if (!el) break;
+                            const t = (el.innerText || '').toLowerCase();
+                            if (t.length > 2 && t.length < 200) return t;
+                        }}
+                        return '';
+                    }}""")
+                    if "cover" in parent_text and "resume" not in parent_text:
+                        continue
+                    await fi.set_input_files(resume_path)
+                    await asyncio.sleep(2.0)
+                    # Verify file actually registered
+                    try:
+                        verified = await page.evaluate(f"""() => {{
                             const fis = document.querySelectorAll('{sel}');
-                            const fi = fis[{i}];
-                            if (!fi) return '';
-                            let el = fi;
-                            for (let j = 0; j < 5; j++) {{
-                                el = el.parentElement;
-                                if (!el) break;
-                                const t = (el.innerText || '').toLowerCase();
-                                if (t.length > 2 && t.length < 200) return t;
-                            }}
-                            return '';
+                            const f = fis[{i}];
+                            if (f && f.files && f.files.length > 0) return true;
+                            return document.body.innerText.includes('{resume_basename}');
                         }}""")
-                        if "cover" in parent_text and "resume" not in parent_text:
-                            continue
-                        await fi.set_input_files(resume_path)
-                        await asyncio.sleep(2.0)
+                    except Exception:
+                        verified = True
+                    if verified:
                         resume_uploaded = True
-                        await ev("SmartRecruit", "success", f"Resume uploaded")
+                        await ev("SmartRecruit", "success",
+                                 f"Resume uploaded (direct): {resume_basename}")
                         break
-                    if resume_uploaded:
-                        break
+                    else:
+                        await ev("SmartRecruit", "info",
+                                 "Strategy A: file set but not registered — trying Strategy B")
+                if resume_uploaded:
+                    break
             except Exception:
                 continue
+
+        # Strategy B: intercept the file-chooser dialog via upload button
+        if not resume_uploaded:
+            for btn_sel in [
+                'button:has-text("Upload")', 'a:has-text("Upload")',
+                'button:has-text("Choose")', 'a:has-text("Choose File")',
+                'button:has-text("Attach")', '[data-testid*="upload"]',
+                '[class*="resume"]', '[class*="upload"]',
+            ]:
+                try:
+                    btn = page.locator(btn_sel).first
+                    if await btn.count() == 0:
+                        continue
+                    async with page.expect_file_chooser(timeout=4000) as fc_info:
+                        await btn.click(timeout=3000)
+                    fc = await fc_info.value
+                    await fc.set_files(resume_path)
+                    await asyncio.sleep(2.0)
+                    resume_uploaded = True
+                    await ev("SmartRecruit", "success",
+                             f"Resume uploaded (file-chooser): {resume_basename}")
+                    break
+                except Exception:
+                    continue
 
         if not resume_uploaded:
             await ev("SmartRecruit", "warning", "Resume upload failed")
