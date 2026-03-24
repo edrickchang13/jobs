@@ -7,7 +7,7 @@
 #   scp -r ~/getjobs2026 user@dgx-spark:~/getjobs2026
 #   ssh user@dgx-spark "cd ~/getjobs2026 && bash setup_dgx.sh"
 # ============================================================
-set -e
+set -eo pipefail 2>/dev/null || true  # non-fatal if shell doesn't support pipefail
 cd "$(dirname "$0")"
 
 echo ""
@@ -15,17 +15,18 @@ echo "=== getjobs2026 DGX Spark Setup ==="
 echo ""
 
 # ── 1. System packages ──────────────────────────────────────
-echo "[1/6] Installing system packages..."
-sudo apt-get update -qq
-sudo apt-get install -y \
-    python3 python3-pip python3-venv python3-dev \
-    xvfb x11-utils dbus-x11 \
-    libglib2.0-0 libnss3 libnspr4 libdbus-1-3 \
-    libatk1.0-0 libatk-bridge2.0-0 libcups2 \
-    libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 \
-    libxfixes3 libxrandr2 libgbm1 libasound2 \
-    fonts-liberation libappindicator3-1 \
-    wget curl git unzip 2>/dev/null || true
+echo "[1/6] Checking system packages (skipping sudo — DGX Spark has these pre-installed)..."
+# Try sudo if available, otherwise skip gracefully
+if command -v sudo &>/dev/null && sudo -n true 2>/dev/null; then
+    sudo apt-get update -qq 2>/dev/null || true
+    sudo apt-get install -y xvfb x11-utils python3-venv python3-dev \
+        libglib2.0-0 libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 \
+        libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxrandr2 libgbm1 \
+        2>/dev/null || true
+    echo "  System packages installed."
+else
+    echo "  No sudo access — skipping system package install (DGX Spark has these pre-installed)."
+fi
 
 # ── 2. Python virtual environment ───────────────────────────
 echo "[2/6] Creating Python virtual environment..."
