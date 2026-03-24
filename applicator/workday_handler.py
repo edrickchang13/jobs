@@ -109,9 +109,17 @@ async def fill_workday_info_hardcoded(page: Page, event_callback=None) -> dict:
                 const dataid = c.getAttribute('data-automation-id') || '';
                 // Skip nav/menu elements
                 if (dataid.includes('navigation') || dataid.includes('search') || dataid.includes('menu')) continue;
-                // Find label
-                const label = c.querySelector('label');
-                const labelText = label ? label.innerText.trim() : '';
+                // Find label — Strategy 1: formLabel-<uuid> is a SIBLING (Workday pattern)
+                let labelText = '';
+                if (dataid.startsWith('formField-')) {
+                    const uuid = dataid.replace('formField-', '');
+                    const sibLabel = document.querySelector('[data-automation-id="formLabel-' + uuid + '"]');
+                    if (sibLabel) labelText = sibLabel.innerText.trim();
+                }
+                if (!labelText) {
+                    const label = c.querySelector('label');
+                    if (label) labelText = label.innerText.trim();
+                }
                 // Find input — build a CSS selector we can use with Playwright locator
                 const inp = c.querySelector('input[type="text"], input[type="tel"], input[type="email"], input[type="number"], input:not([type])');
                 if (inp && inp.offsetParent !== null) {
@@ -572,8 +580,23 @@ async def fill_workday_questions_hardcoded(page: Page, company: str = "", role: 
 
                 // Try multiple label sources (Workday uses various label patterns)
                 let label = '';
+                // Strategy 1 (PRIMARY): formLabel-<uuid> is a SIBLING of formField-<uuid>
+                const dataidForLabel = c.getAttribute('data-automation-id') || '';
+                if (!label && dataidForLabel.startsWith('formField-')) {
+                    const uuid = dataidForLabel.replace('formField-', '');
+                    const formLabel = document.querySelector('[data-automation-id="formLabel-' + uuid + '"]');
+                    if (formLabel) label = formLabel.innerText.trim();
+                }
+                if (!label) {
+                    // Try parent element for sibling labels
+                    const parent = c.parentElement;
+                    if (parent) {
+                        const siblingLabel = parent.querySelector('[data-automation-id*="formLabel"], [data-automation-id*="label-"]');
+                        if (siblingLabel && !c.contains(siblingLabel)) label = siblingLabel.innerText.trim();
+                    }
+                }
                 const lbl = c.querySelector('label');
-                if (lbl) label = lbl.innerText.trim();
+                if (!label && lbl) label = lbl.innerText.trim();
                 if (!label) {
                     // Try data-automation-id based label elements
                     const autoLabel = c.querySelector('[data-automation-id*="label"], [data-automation-id*="Label"], [data-automation-id*="prompt"]');
@@ -602,11 +625,10 @@ async def fill_workday_questions_hardcoded(page: Page, company: str = "", role: 
                     const lines = allText.split('\\n').map(l => l.trim()).filter(l => l.length > 5 && !l.toLowerCase().includes('select one') && l !== dropText);
                     if (lines.length > 0) label = lines[0];
                 }
-                const dataid = c.getAttribute('data-automation-id') || '';
                 const rect = dropEl.getBoundingClientRect();
                 const isNativeSelect = !!sel;
                 results.push({
-                    label, dataid, isNativeSelect, currentText: dropText,
+                    label, dataid: dataidForLabel, isNativeSelect, currentText: dropText,
                     x: rect.x + rect.width / 2, y: rect.y + rect.height / 2,
                 });
             }
