@@ -206,17 +206,25 @@ async def fill_with_browser_agent(
 
     def _make_bu_llm(provider: str = "auto"):
         """Build browser-use LLM with provider fallback priority.
-        Gemini removed — key expired and it rejects frequency_penalty parameter.
-        Priority: ollama > cerebras > groq.
+        Priority: OpenRouter (1M ctx, free) > Ollama (local) > Cerebras (8K ctx) > Groq.
+        OpenRouter uses Gemini 2.0 Flash — 1M token context, free tier, vision-capable.
         """
-        if provider == "groq" or (provider == "auto" and not os.getenv("CEREBRAS_API_KEY") and os.getenv("GROQ_API_KEY")):
+        # OpenRouter — largest context window, free tier, best reasoning
+        # Using Llama 3.3 70B: stable free tier, 128K context, strong instruction following.
+        # (google/gemini-2.0-flash-exp:free was removed by Google — returns 404)
+        if os.getenv("OPENROUTER_API_KEY") and provider in ("auto", "openrouter"):
+            _or_model = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
             return ChatOpenAI(
-                model="llama-3.3-70b-versatile",
-                base_url="https://api.groq.com/openai/v1",
-                api_key=os.getenv("GROQ_API_KEY"),
+                model=_or_model,
+                base_url="https://openrouter.ai/api/v1",
+                api_key=os.getenv("OPENROUTER_API_KEY"),
                 dont_force_structured_output=True,
-            ), "groq"
-        if os.getenv("OLLAMA_MODEL"):
+                default_headers={
+                    "HTTP-Referer": "https://github.com/edrickchang/getjobs2026",
+                    "X-Title": "getjobs2026",
+                },
+            ), f"openrouter/{_or_model.split('/')[-1]}"
+        if os.getenv("OLLAMA_MODEL") and provider in ("auto", "ollama"):
             return ChatOpenAI(
                 model=os.getenv("OLLAMA_MODEL", "qwen2.5:72b"),
                 base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1"),
@@ -224,7 +232,7 @@ async def fill_with_browser_agent(
                 dont_force_structured_output=True,
                 timeout=120,
             ), "ollama"
-        if os.getenv("CEREBRAS_API_KEY"):
+        if os.getenv("CEREBRAS_API_KEY") and provider in ("auto", "cerebras"):
             return ChatOpenAI(
                 model="qwen-3-235b-a22b-instruct-2507",
                 base_url="https://api.cerebras.ai/v1",
@@ -1059,6 +1067,17 @@ Report what page you're on when you stop."""
                 if event_callback:
                     await event_callback("Pre-Fill", "info", f"Pre-fill error: {pre_e}")
 
+            # ── Custom dropdown filler (ARIA comboboxes / React-based dropdowns) ──
+            # Handles portals that don't use native <select> elements.
+            try:
+                dd_filled = await fill_custom_dropdowns(page, event_callback=event_callback)
+                if dd_filled and event_callback:
+                    await event_callback("Custom Dropdown", "success",
+                        f"Filled {dd_filled} custom dropdown(s)")
+            except Exception as _dd_e:
+                if event_callback:
+                    await event_callback("Custom Dropdown", "info", f"Custom dropdown pass skipped: {_dd_e}")
+
             for page_num in range(max_pages):
               try:
                   # Scroll down to load lazy content (Greenhouse loads sections on scroll)
@@ -1372,6 +1391,300 @@ Report what page you're on when you stop."""
             "final_result": history.final_result() if history else None,
         },
     }
+
+
+async def fill_custom_dropdowns(page, event_callback=None):
+    """Fill ARIA comboboxes and custom div-based dropdowns on non-standard portals.
+
+    Many modern career sites (Pinterest, Notion, etc.) use React-based custom dropdowns
+    instead of native <select> elements. This function detects them by ARIA role and
+    fills them using rule-based keyword matching against Edrick's candidate profile.
+
+    Returns the number of dropdowns successfully filled.
+    """
+    pi = _load_personal_info()
+
+    # Each rule: (label keywords, preferred option keywords, fallback value to pick)
+    # The "fallback value" is used for best-fuzzy-match if keyword matching fails.
+    _RULES: list[tuple[list[str], list[str], str]] = [
+        # Work authorization
+        (["authorized to work", "authorized.*work", "work authorization",
+          "eligible to work", "work in the u.s", "legally authorized",
+          "authorized.*united states"],
+         ["yes", "i am authorized", "authorized", "citizen", "permanent"],
+         "Yes"),
+        # Sponsorship
+        (["sponsorship", "visa sponsorship", "require.*sponsor",
+          "will you require", "require assistance"],
+         ["no", "i will not", "not require", "do not require"],
+         "No"),
+        # Open to learning / new skill
+        (["open to learning", "learn a new skill", "willing to learn",
+          "open to.*new skill"],
+         ["yes", "absolutely", "i am open"],
+         "Yes"),
+        # 12-month / long-term commitment
+        (["12 month", "12+ month", "continued employment", "long.term",
+          "commitment.*month", "available.*month"],
+         ["yes", "i am available", "confirm"],
+         "Yes"),
+        # Type of engineer
+        (["type of engineer", "engineering discipline", "engineering role",
+          "what type.*engineer"],
+         ["software", "backend", "full stack", "full-stack", "computer"],
+         "Software Engineer"),
+        # Years of full-time experience (student = none / <1yr)
+        (["full-time", "worked full-time", "full time experience",
+          "years.*experience", "experience.*years",
+          "how long have you worked", "professional experience"],
+         ["less than", "0-1", "0 year", "none", "no experience", "< 1"],
+         "Less than 1 year"),
+        # Education level
+        (["education", "degree", "highest level", "highest.*education",
+          "level of education"],
+         ["bachelor", "undergraduate", "college", "in progress",
+          "currently pursuing", "pursuing"],
+         "Bachelor's Degree"),
+        # Hybrid / onsite availability
+        (["work on-site", "work onsite", "on site", "hybrid",
+          "work.*office", "in.*office"],
+         ["yes", "i can", "willing", "available"],
+         "Yes"),
+        # Willingness to relocate
+        (["relocate", "willing to relocate", "able to relocate"],
+         ["yes", "i am willing", "open to"],
+         "Yes"),
+        # Gender
+        (["gender", "gender identity"],
+         ["male", "man", "he/him"],
+         "Male"),
+        # Race / ethnicity
+        (["race", "ethnicity", "racial"],
+         ["asian", "asian american", "east asian"],
+         "Asian"),
+        # Veteran status
+        (["veteran", "military service", "armed forces"],
+         ["not a veteran", "i am not", "no", "not a protected veteran"],
+         "I am not a veteran"),
+        # Disability
+        (["disability", "disabled", "accommodation"],
+         ["no", "i do not have", "not disabled", "prefer not"],
+         "No, I do not have a disability"),
+        # Internship / co-op experience
+        (["previous internship", "prior internship", "internship experience",
+          "had an internship"],
+         ["yes", "i have", "i have had"],
+         "Yes"),
+    ]
+
+    # JS: scan page for custom dropdown elements (ARIA comboboxes, listbox triggers)
+    _JS_FIND_DROPDOWNS = """() => {
+        const results = [];
+        const seen = new Set();
+
+        function getLabel(el) {
+            // 1. aria-labelledby
+            const lbId = el.getAttribute('aria-labelledby');
+            if (lbId) {
+                const lbEl = document.getElementById(lbId);
+                if (lbEl) return lbEl.innerText.trim();
+            }
+            // 2. aria-label
+            if (el.getAttribute('aria-label')) return el.getAttribute('aria-label').trim();
+            // 3. Closest field/question container's label
+            const container = el.closest(
+                '[class*="field"], [class*="form-group"], [class*="question"],' +
+                ' [class*="input-wrap"], li, fieldset, .row'
+            );
+            if (container) {
+                const lbl = container.querySelector(
+                    'label, [class*="label"], [class*="question-text"],' +
+                    ' legend, [class*="heading"]'
+                );
+                if (lbl && lbl !== el && lbl.innerText.trim()) return lbl.innerText.trim();
+            }
+            // 4. Look backwards through siblings
+            let prev = el.previousElementSibling;
+            while (prev) {
+                const t = prev.innerText ? prev.innerText.trim() : '';
+                if (t && t.length > 3 && t.length < 250) return t;
+                prev = prev.previousElementSibling;
+            }
+            // 5. Parent's preceding sibling
+            if (el.parentElement) {
+                let pp = el.parentElement.previousElementSibling;
+                if (pp && pp.innerText) return pp.innerText.trim();
+            }
+            return '';
+        }
+
+        const candidates = [
+            ...document.querySelectorAll('[role="combobox"]'),
+            ...document.querySelectorAll('[aria-haspopup="listbox"]'),
+            ...document.querySelectorAll('button[aria-haspopup="true"]'),
+            ...document.querySelectorAll('[class*="select"][class*="control"]'),
+            ...document.querySelectorAll('[class*="dropdown"][class*="toggle"]'),
+        ];
+
+        for (const el of candidates) {
+            if (el.offsetParent === null) continue;
+            const r = el.getBoundingClientRect();
+            if (r.width < 10 || r.height < 6) continue;
+            // Deduplicate by bounding box position
+            const key = Math.round(r.x) + ',' + Math.round(r.y);
+            if (seen.has(key)) continue;
+            seen.add(key);
+            // Current value (check if already filled)
+            const currentText = (el.getAttribute('aria-label') || el.innerText || el.textContent || '').trim();
+            const isEmpty = !currentText || currentText === 'Select...' || currentText === 'Select'
+                || currentText.startsWith('Select...') || currentText === '' || currentText === '–';
+            const label = getLabel(el);
+            results.push({
+                label,
+                currentText,
+                isEmpty,
+                x: r.x + r.width / 2,
+                y: r.y + r.height / 2,
+            });
+        }
+        return results;
+    }"""
+
+    _JS_FIND_OPTIONS = """() => {
+        const opts = [];
+        // Check ARIA listbox (appears after click opens dropdown)
+        const listboxes = document.querySelectorAll('[role="listbox"]:not([aria-hidden="true"])');
+        let optEls = [];
+        for (const lb of listboxes) {
+            if (lb.offsetParent === null) continue;
+            const children = lb.querySelectorAll('[role="option"]');
+            if (children.length) { optEls = [...children]; break; }
+        }
+        // Fall back to visible option roles
+        if (!optEls.length) {
+            optEls = [...document.querySelectorAll('[role="option"]:not([aria-hidden="true"])')];
+        }
+        // Fall back to common menu list items
+        if (!optEls.length) {
+            for (const sel of [
+                'ul[class*="menu"] li', 'ul[class*="option"] li',
+                '[class*="dropdown-menu"] li', '[class*="option-list"] li',
+                '[class*="select-menu"] li', '[class*="choices"] li',
+            ]) {
+                const items = [...document.querySelectorAll(sel)];
+                if (items.some(el => el.offsetParent !== null)) { optEls = items; break; }
+            }
+        }
+        for (const o of optEls) {
+            if (o.offsetParent === null) continue;
+            const r = o.getBoundingClientRect();
+            if (r.width === 0 && r.height === 0) continue;
+            const txt = (o.innerText || o.textContent || '').trim();
+            if (!txt) continue;
+            opts.push({ text: txt, x: r.x + r.width / 2, y: r.y + r.height / 2 });
+        }
+        return opts;
+    }"""
+
+    try:
+        dropdowns = await page.evaluate(_JS_FIND_DROPDOWNS)
+    except Exception as e:
+        if event_callback:
+            await event_callback("Custom Dropdown", "info", f"Dropdown scan failed: {e}")
+        return 0
+
+    if not dropdowns:
+        return 0
+
+    if event_callback:
+        unfilled = [d for d in dropdowns if d.get("isEmpty")]
+        if unfilled:
+            await event_callback("Custom Dropdown", "info",
+                f"Found {len(unfilled)} unfilled custom dropdown(s): "
+                f"{[d.get('label', '?')[:30] for d in unfilled[:4]]}")
+
+    filled_count = 0
+    for dd in dropdowns:
+        if not dd.get("isEmpty", True):
+            continue  # already has a value
+        label_raw = dd.get("label", "")
+        label_lc = label_raw.lower()
+        if not label_lc:
+            continue
+
+        # Match against rules
+        target_value: str | None = None
+        for (label_kws, _option_kws, default_val) in _RULES:
+            if any(kw in label_lc for kw in label_kws):
+                target_value = default_val
+                break
+
+        if target_value is None:
+            # Unknown dropdown — skip (don't guess randomly)
+            if event_callback:
+                await event_callback("Custom Dropdown", "info",
+                    f"No rule matched '{label_raw[:50]}' — skipping")
+            continue
+
+        # Click to open the dropdown
+        try:
+            await page.mouse.click(dd["x"], dd["y"])
+            await asyncio.sleep(1.2)
+
+            options = await page.evaluate(_JS_FIND_OPTIONS)
+
+            if not options:
+                await page.keyboard.press("Escape")
+                if event_callback:
+                    await event_callback("Custom Dropdown", "info",
+                        f"'{label_raw[:40]}' — no options appeared after click")
+                continue
+
+            # Find best-matching option (prefer exact, then highest word overlap)
+            target_lc = target_value.lower()
+            best_opt = None
+            best_score = -1
+            for opt in options:
+                opt_lc = opt["text"].lower()
+                if opt_lc == target_lc:
+                    best_opt = opt
+                    best_score = 999
+                    break
+                # Count shared words
+                t_words = set(target_lc.split())
+                o_words = set(opt_lc.split())
+                score = len(t_words & o_words)
+                # Bonus if target_lc is a substring
+                if target_lc in opt_lc or opt_lc in target_lc:
+                    score += 3
+                if score > best_score:
+                    best_score = score
+                    best_opt = opt
+
+            if best_opt and best_score >= 0:
+                await page.mouse.click(best_opt["x"], best_opt["y"])
+                await asyncio.sleep(0.6)
+                filled_count += 1
+                if event_callback:
+                    await event_callback("Custom Dropdown", "info",
+                        f"'{label_raw[:40]}' → '{best_opt['text']}'")
+            else:
+                await page.keyboard.press("Escape")
+                if event_callback:
+                    await event_callback("Custom Dropdown", "info",
+                        f"'{label_raw[:40]}' — couldn't match '{target_value}' in options: "
+                        f"{[o['text'] for o in options[:4]]}")
+
+        except Exception as e:
+            if event_callback:
+                await event_callback("Custom Dropdown", "info",
+                    f"Dropdown '{label_raw[:30]}' error: {e}")
+            try:
+                await page.keyboard.press("Escape")
+            except Exception:
+                pass
+
+    return filled_count
 
 
 async def close_browser_agent():

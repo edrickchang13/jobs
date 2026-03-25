@@ -14,7 +14,7 @@ from pathlib import Path
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
-from fastapi import FastAPI, Request, UploadFile, File
+from fastapi import FastAPI, Request, UploadFile, File, BackgroundTasks
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 
 from dotenv import load_dotenv
@@ -93,16 +93,24 @@ async def _reconnect_via_cdp(event_label="Reconnect") -> "Page | None":
 # File uploads directory
 UPLOADS_DIR = Path(__file__).parent.parent / "uploads"
 UPLOADS_DIR.mkdir(exist_ok=True)
-uploaded_resume: str = ""  # path to uploaded resume
-uploaded_transcript: str = ""  # path to uploaded transcript
+uploaded_resume: str = ""       # path to uploaded resume PDF
+uploaded_resume_tex: str = ""   # path to uploaded resume LaTeX source
+uploaded_transcript: str = ""   # path to uploaded transcript
 
 # Check for existing files on startup
 _default_resume = UPLOADS_DIR / "EdrickChang_Resume.pdf"
 _default_transcript = UPLOADS_DIR / "Transcript.pdf"
+# LaTeX resume — stored as "Resume" (no extension) or "Resume.tex"
+_default_resume_tex = UPLOADS_DIR / "Resume"
+_default_resume_tex2 = UPLOADS_DIR / "Resume.tex"
 if _default_resume.exists():
     uploaded_resume = str(_default_resume)
 if _default_transcript.exists():
     uploaded_transcript = str(_default_transcript)
+if _default_resume_tex.exists():
+    uploaded_resume_tex = str(_default_resume_tex)
+elif _default_resume_tex2.exists():
+    uploaded_resume_tex = str(_default_resume_tex2)
 
 
 def add_event(step: str, status: str, detail: str = ""):
@@ -255,6 +263,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             cursor: pointer; font-weight: 500;
         }
         .apply-btn:hover { background: #15803d; }
+        .star-btn {
+            background: transparent; border: none; cursor: pointer;
+            font-size: 16px; color: #555; padding: 2px 4px;
+            transition: color 0.15s, transform 0.1s;
+            vertical-align: middle;
+        }
+        .star-btn:hover { color: #f59e0b; transform: scale(1.2); }
+        .star-btn.starred { color: #f59e0b; }
+        .starred-row { background: rgba(245, 158, 11, 0.05) !important; }
+        .starred-row td { border-left: 2px solid #f59e0b; }
         .bay-area-badge {
             display: inline-block; padding: 1px 6px; border-radius: 3px;
             font-size: 10px; background: #1a2a3a; color: #60a5fa;
@@ -625,6 +643,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <script>
         let allJobs = [];
         let appliedUrls = new Set();
+        let starredUrls = new Set();
         let eventSource = null;
         let seenEventIds = new Set();  // dedup SSE events on reconnect
 
@@ -657,9 +676,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             const isRefresh = !!forceRefresh;
             document.getElementById('jobsBody').innerHTML = '<tr><td colspan="6" class="loading-msg">' + (isRefresh ? 'Refreshing from GitHub...' : 'Loading jobs...') + '</td></tr>';
             document.getElementById('jobsCount').textContent = 'Loading...';
-            fetch('/api/applied').then(r => r.json()).then(data => {
-                appliedUrls = new Set(data.urls || []);
-            }).catch(() => {}).finally(() => {
+            Promise.all([
+                fetch('/api/applied').then(r => r.json()).then(d => { appliedUrls = new Set(d.urls || []); }).catch(() => {}),
+                fetch('/api/starred').then(r => r.json()).then(d => { starredUrls = new Set(d.urls || []); }).catch(() => {})
+            ]).finally(() => {
                 const url = isRefresh ? '/api/jobs?refresh=true' : '/api/jobs';
                 fetch(url).then(r => r.json()).then(data => {
                     allJobs = data.jobs || [];
@@ -740,22 +760,24 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             tbody.innerHTML = jobs.map((job, i) => {
                 const locBadge = isBayArea(job.location) ? '<span class="bay-area-badge">Bay Area</span>' : '';
                 const isApplied = appliedUrls.has(job.url);
+                const isStarred = starredUrls.has(job.url);
                 const appliedBadge = isApplied ? ' <span class="applied-badge">Applied</span>' : '';
-                const rowClass = isApplied ? 'applied-row' : '';
+                const rowClass = (isApplied ? 'applied-row' : '') + (isStarred ? ' starred-row' : '');
                 const escapedUrl = job.url.replace(/'/g, "\\\\'");
                 const escapedCompany = job.company.replace(/'/g, "\\\\'");
                 const escapedRole = job.role.replace(/'/g, "\\\\'");
-                const actionBtn = '<button class="apply-btn" onclick="selectJob(\\'' + escapedUrl + '\\', \\'' + escapedCompany + '\\', \\'' + escapedRole + '\\')">Apply</button>';
+                const applyBtn = '<button class="apply-btn" onclick="selectJob(\\'' + escapedUrl + '\\', \\'' + escapedCompany + '\\', \\'' + escapedRole + '\\')">Apply</button>';
+                const starBtn = '<button class="star-btn' + (isStarred ? ' starred' : '') + '" title="' + (isStarred ? 'Unstar' : 'Star — generates tailored resume') + '" onclick="toggleStar(\\'' + escapedUrl + '\\', \\'' + escapedCompany + '\\', \\'' + escapedRole + '\\', this)">' + (isStarred ? '★' : '☆') + '</button>';
                 const ats = job.ats || 'unknown';
                 const atsClass = {'workday':'ats-workday','lever':'ats-lever','greenhouse':'ats-greenhouse','icims':'ats-icims','ashby':'ats-ashby'}[ats] || 'ats-unknown';
                 const atsBadge = '<span class="ats-badge ' + atsClass + '">' + ats + '</span>';
-                return '<tr class="' + rowClass + '">' +
+                return '<tr class="' + rowClass.trim() + '">' +
                     '<td class="company-name">' + job.company + appliedBadge + '</td>' +
                     '<td class="role-name">' + job.role + '</td>' +
                     '<td class="location">' + job.location + locBadge + '</td>' +
                     '<td>' + atsBadge + '</td>' +
                     '<td class="age">' + job.date + '</td>' +
-                    '<td style="text-align:center">' + actionBtn + '</td>' +
+                    '<td style="text-align:center;white-space:nowrap">' + starBtn + ' ' + applyBtn + '</td>' +
                     '</tr>';
             }).join('');
         }
@@ -765,6 +787,39 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             document.getElementById('company').value = company;
             document.getElementById('role').value = role;
             switchTab('apply');
+        }
+
+        function toggleStar(url, company, role, btn) {
+            const wasStarred = starredUrls.has(url);
+            // Optimistic UI update
+            if (wasStarred) {
+                starredUrls.delete(url);
+                btn.textContent = '☆';
+                btn.classList.remove('starred');
+                btn.title = 'Star — generates tailored resume';
+                btn.closest('tr').classList.remove('starred-row');
+            } else {
+                starredUrls.add(url);
+                btn.textContent = '★';
+                btn.classList.add('starred');
+                btn.title = 'Unstar';
+                btn.closest('tr').classList.add('starred-row');
+                btn.textContent = '⏳'; // show generating state
+            }
+            fetch('/api/star', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({url, company, role})
+            }).then(r => r.json()).then(data => {
+                if (data.status === 'starred') {
+                    btn.textContent = '★';
+                    // Listen for resume-done event in the event log (SSE)
+                } else {
+                    btn.textContent = '☆';
+                }
+            }).catch(() => {
+                btn.textContent = wasStarred ? '★' : '☆';
+            });
         }
 
         function resetFilters() {
@@ -1208,6 +1263,86 @@ async def mark_as_not_applied(request: Request):
     return JSONResponse({"status": "ok"})
 
 
+# ── Starred jobs ─────────────────────────────────────────────────────────────
+_STARRED_RESUMES_DIR = Path.home() / "getjobs2026" / "starred_resumes"
+
+
+@app.get("/api/starred")
+async def get_starred():
+    from database.tracker import get_starred_urls
+    return JSONResponse({"urls": list(get_starred_urls())})
+
+
+@app.get("/api/starred/jobs")
+async def get_starred_jobs_list():
+    from database.tracker import get_starred_jobs
+    return JSONResponse({"jobs": get_starred_jobs()})
+
+
+@app.post("/api/star")
+async def toggle_star(request: Request, background_tasks: BackgroundTasks):
+    from database.tracker import star_job, unstar_job, get_starred_urls
+    data = await request.json()
+    url = data.get("url", "")
+    company = data.get("company", "")
+    role = data.get("role", "")
+    if not url:
+        return JSONResponse({"status": "error", "detail": "url required"}, status_code=400)
+
+    starred = get_starred_urls()
+    if url in starred:
+        unstar_job(url)
+        return JSONResponse({"status": "unstarred"})
+    else:
+        star_job(url, company, role)
+        # Kick off resume generation in background
+        background_tasks.add_task(_generate_starred_resume, url, company, role)
+        return JSONResponse({"status": "starred"})
+
+
+async def _generate_starred_resume(url: str, company: str, role: str):
+    """Background task: extract JD, generate tailored resume, save PDF to starred_resumes/."""
+    from database.tracker import update_star_resume
+    try:
+        _STARRED_RESUMES_DIR.mkdir(parents=True, exist_ok=True)
+
+        # 1. Extract job description
+        pipeline_events.append({"step": "Star", "status": "info",
+                                 "detail": f"Generating resume for {company} — {role}...", "id": len(pipeline_events)})
+        from scraper.job_description import extract_job_description
+        jd = await asyncio.to_thread(extract_job_description, url)
+        if not jd:
+            jd = f"{company} {role} internship"
+
+        # 2. Generate LaTeX resume — prefer .tex source, fall back to PDF
+        from resume.generator import generate_resume
+        resume_tex = uploaded_resume_tex or ""
+        resume_pdf = uploaded_resume or ""
+        latex = await asyncio.to_thread(generate_resume, company, role, jd,
+                                        resume_pdf_path=resume_pdf,
+                                        resume_tex_path=resume_tex)
+
+        # 3. Compile to PDF with tectonic
+        from resume.compiler import compile_resume_to_pdf
+        import tempfile, shutil
+        safe_company = "".join(c for c in company if c.isalnum() or c in "_ -").strip()
+        safe_role = "".join(c for c in role if c.isalnum() or c in "_ -").strip()
+        out_path = str(_STARRED_RESUMES_DIR / f"{safe_company}_{safe_role}.pdf")
+
+        # compile_resume_to_pdf saves to RESUMES_DIR; also copy to starred_resumes/
+        pdf_path = await asyncio.to_thread(compile_resume_to_pdf, latex, company, role)
+        shutil.copy2(pdf_path, out_path)
+
+        update_star_resume(url, out_path, "done")
+        pipeline_events.append({"step": "Star", "status": "success",
+                                 "detail": f"Resume saved: starred_resumes/{safe_company}_{safe_role}.pdf", "id": len(pipeline_events)})
+    except Exception as e:
+        from database.tracker import update_star_resume
+        update_star_resume(url, None, "error")
+        pipeline_events.append({"step": "Star", "status": "error",
+                                 "detail": f"Resume gen failed for {company}: {e}", "id": len(pipeline_events)})
+
+
 @app.get("/api/uploads")
 async def get_uploads():
     """Return current upload status. Re-check disk for files that appeared after startup."""
@@ -1226,8 +1361,8 @@ async def get_uploads():
 
 @app.post("/api/upload/{doc_type}")
 async def upload_document(doc_type: str, file: UploadFile = File(...)):
-    """Upload resume or transcript PDF."""
-    global uploaded_resume, uploaded_transcript
+    """Upload resume (PDF or .tex) or transcript PDF."""
+    global uploaded_resume, uploaded_resume_tex, uploaded_transcript
 
     if doc_type not in ("resume", "transcript"):
         return JSONResponse({"error": "Invalid doc type"}, status_code=400)
@@ -1238,7 +1373,14 @@ async def upload_document(doc_type: str, file: UploadFile = File(...)):
     save_path.write_bytes(content)
 
     if doc_type == "resume":
-        uploaded_resume = str(save_path)
+        ext = Path(filename).suffix.lower()
+        if ext in (".tex", ".latex") or (not ext and b"\\documentclass" in content[:200]):
+            # Treat as LaTeX source — save as "Resume" (no extension)
+            tex_path = UPLOADS_DIR / "Resume"
+            tex_path.write_bytes(content)
+            uploaded_resume_tex = str(tex_path)
+        else:
+            uploaded_resume = str(save_path)
     else:
         uploaded_transcript = str(save_path)
 
@@ -1316,8 +1458,8 @@ async def test_llm_providers():
     ollama_model = _os.getenv("OLLAMA_MODEL", "")
     ollama_base  = _os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
     providers = [
+        ("openrouter",      "https://openrouter.ai/api/v1",                                _os.getenv("OPENROUTER_API_KEY"), _os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free")),
         ("ollama (local)",  ollama_base,                                                   "ollama",                         ollama_model or "qwen2.5:72b"),
-        ("gemini",          "https://generativelanguage.googleapis.com/v1beta/openai/",    _os.getenv("GEMINI_API_KEY"),     "gemini-2.0-flash"),
         ("cerebras",        "https://api.cerebras.ai/v1",                                  _os.getenv("CEREBRAS_API_KEY"),   "qwen-3-235b-a22b-instruct-2507"),
         ("groq",            "https://api.groq.com/openai/v1",                              _os.getenv("GROQ_API_KEY"),       "llama-3.3-70b-versatile"),
     ]
