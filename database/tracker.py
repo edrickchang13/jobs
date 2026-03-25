@@ -135,3 +135,80 @@ def get_applied_urls() -> set:
     urls = {row[0] for row in c.fetchall()}
     conn.close()
     return urls
+
+
+# ── Starred jobs ────────────────────────────────────────────────────────────
+
+def _ensure_starred_table(c):
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS starred_jobs (
+            url TEXT PRIMARY KEY,
+            company TEXT,
+            role TEXT,
+            starred_at TEXT NOT NULL,
+            resume_path TEXT DEFAULT NULL,
+            resume_status TEXT DEFAULT 'pending'
+        )
+    """)
+
+
+def star_job(url: str, company: str, role: str):
+    """Add a job to the starred list."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    _ensure_starred_table(c)
+    c.execute(
+        "INSERT OR IGNORE INTO starred_jobs (url, company, role, starred_at) VALUES (?, ?, ?, ?)",
+        (url, company, role, datetime.now().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def unstar_job(url: str):
+    """Remove a job from the starred list."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    _ensure_starred_table(c)
+    c.execute("DELETE FROM starred_jobs WHERE url = ?", (url,))
+    conn.commit()
+    conn.close()
+
+
+def get_starred_urls() -> set:
+    """Return set of all starred job URLs."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    _ensure_starred_table(c)
+    c.execute("SELECT url FROM starred_jobs")
+    urls = {row[0] for row in c.fetchall()}
+    conn.close()
+    return urls
+
+
+def update_star_resume(url: str, resume_path: str, status: str = "done"):
+    """Record the generated resume path for a starred job."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    _ensure_starred_table(c)
+    c.execute(
+        "UPDATE starred_jobs SET resume_path = ?, resume_status = ? WHERE url = ?",
+        (resume_path, status, url),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_starred_jobs() -> list:
+    """Return list of all starred jobs with their resume status."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    _ensure_starred_table(c)
+    c.execute("SELECT url, company, role, starred_at, resume_path, resume_status FROM starred_jobs ORDER BY starred_at DESC")
+    rows = c.fetchall()
+    conn.close()
+    return [
+        {"url": r[0], "company": r[1], "role": r[2],
+         "starred_at": r[3], "resume_path": r[4], "resume_status": r[5]}
+        for r in rows
+    ]
