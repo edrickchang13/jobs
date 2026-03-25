@@ -15,7 +15,7 @@ if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 from fastapi import FastAPI, Request, UploadFile, File, BackgroundTasks
-from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
+from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse, FileResponse, Response
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -589,14 +589,52 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                     <input type="text" id="company" value="">
                     <label>Role</label>
                     <input type="text" id="role" value="">
-                    <div style="display:flex;gap:6px;">
-                        <button id="startBtn" onclick="startApplication()" style="flex:1">Start Application</button>
-                        <button id="stopBtn" onclick="stopApplication()" style="flex:0 0 70px;background:#dc2626;display:none">Stop</button>
+
+                    <!-- ── Claude-mode: open tab + show prompt ── -->
+                    <button id="openWithClaudeBtn" onclick="openWithClaude()"
+                        style="width:100%;background:#7c3aed;color:#fff;border:none;padding:9px;
+                               border-radius:6px;cursor:pointer;font-size:13px;font-weight:600;
+                               margin-bottom:6px;">
+                        ✦ Open in Chrome
+                    </button>
+
+                    <!-- Claude prompt panel (shown after open) -->
+                    <div id="claudePromptPanel" style="display:none;background:#1a1a2e;border:1px solid #7c3aed;
+                         border-radius:6px;padding:10px;margin-bottom:8px;">
+                        <div style="font-size:10px;color:#a78bfa;font-weight:600;margin-bottom:6px;
+                                    text-transform:uppercase;letter-spacing:.05em;">
+                            Tell Claude in Cowork:
+                        </div>
+                        <div id="claudePromptText" style="font-size:12px;color:#e0e0e0;
+                             background:#0d0d1a;padding:8px;border-radius:4px;
+                             font-family:monospace;line-height:1.5;word-break:break-word;"></div>
+                        <button onclick="copyClaudePrompt()"
+                            style="margin-top:7px;width:100%;background:#4c1d95;color:#e0e0e0;
+                                   border:none;padding:5px;border-radius:4px;cursor:pointer;font-size:11px;">
+                            Copy prompt
+                        </button>
+                        <div style="font-size:10px;color:#666;margin-top:8px;line-height:1.5;">
+                            After Claude fills the form, say:<br>
+                            <span style="color:#a78bfa;font-family:monospace;">inject resume</span>
+                            — to upload your PDF automatically.
+                        </div>
                     </div>
-                    <div style="display:flex;gap:6px;margin-top:4px;">
-                        <button id="continueBtn" onclick="continueApplication()" style="flex:1;background:#7c3aed;display:none;padding:8px;border:none;color:#fff;border-radius:6px;cursor:pointer;font-size:13px;">Continue</button>
-                        <button id="emailVerifyBtn" onclick="triggerEmailVerify()" style="flex:1;background:#d97706;display:none;padding:8px;border:none;color:#fff;border-radius:6px;cursor:pointer;font-size:13px;">Get Email Code</button>
-                    </div>
+
+                    <!-- Pipeline mode (collapsed by default) -->
+                    <details style="margin-bottom:6px;">
+                        <summary style="font-size:11px;color:#555;cursor:pointer;user-select:none;">
+                            ▶ Pipeline mode (browser-use agent)
+                        </summary>
+                        <div style="padding-top:6px;display:flex;gap:6px;">
+                            <button id="startBtn" onclick="startApplication()" style="flex:1">Start Agent</button>
+                            <button id="stopBtn" onclick="stopApplication()" style="flex:0 0 70px;background:#dc2626;display:none">Stop</button>
+                        </div>
+                        <div style="display:flex;gap:6px;margin-top:4px;">
+                            <button id="continueBtn" onclick="continueApplication()" style="flex:1;background:#7c3aed;display:none;padding:8px;border:none;color:#fff;border-radius:6px;cursor:pointer;font-size:13px;">Continue</button>
+                            <button id="emailVerifyBtn" onclick="triggerEmailVerify()" style="flex:1;background:#d97706;display:none;padding:8px;border:none;color:#fff;border-radius:6px;cursor:pointer;font-size:13px;">Get Email Code</button>
+                        </div>
+                    </details>
+
                     <div class="applied-btns">
                         <button class="mark-applied-btn" onclick="markAsApplied()">Applied</button>
                         <button class="mark-not-applied-btn" onclick="markNotApplied()">Not Applied</button>
@@ -787,6 +825,37 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             document.getElementById('company').value = company;
             document.getElementById('role').value = role;
             switchTab('apply');
+            // Auto-open when clicking Apply from the jobs table
+            openWithClaude();
+        }
+
+        // ── Claude-mode helpers ─────────────────────────────────────────────
+        function openWithClaude() {
+            const url = document.getElementById('jobUrl').value.trim();
+            const company = document.getElementById('company').value.trim();
+            const role = document.getElementById('role').value.trim();
+            if (!url) { alert('Enter or select a job URL first.'); return; }
+
+            // Open the job application in a new Chrome tab
+            window.open(url, '_blank');
+
+            // Build the Claude prompt
+            const isStarred = starredUrls.has(url);
+            const prompt = isStarred
+                ? `Apply to ${company} — ${role}. Use the tailored resume for ${company}.`
+                : `Apply to ${company} — ${role}.`;
+
+            document.getElementById('claudePromptText').textContent = prompt;
+            document.getElementById('claudePromptPanel').style.display = 'block';
+        }
+
+        function copyClaudePrompt() {
+            const text = document.getElementById('claudePromptText').textContent;
+            navigator.clipboard.writeText(text).then(() => {
+                const btn = event.target;
+                btn.textContent = '✓ Copied!';
+                setTimeout(() => { btn.textContent = 'Copy prompt'; }, 1500);
+            });
         }
 
         function toggleStar(url, company, role, btn) {
@@ -1261,6 +1330,62 @@ async def mark_as_not_applied(request: Request):
     data = await request.json()
     unmark_applied(data.get("url", ""))
     return JSONResponse({"status": "ok"})
+
+
+# ── Resume serving (for in-browser JS file injection) ────────────────────────
+# Claude can't upload files from the VM via the Chrome extension (security restriction).
+# Instead, the form page fetches the PDF from this local endpoint and injects it
+# into the file input via DataTransfer — works on any portal without browser access.
+
+_RESUME_SEARCH_PATHS = [
+    Path(__file__).parent.parent / "uploads" / "EdrickChang_Resume.pdf",
+    Path.home() / "Downloads" / "EdrickChang_Resume.pdf",
+    Path.home() / "getjobs2026" / "uploads" / "EdrickChang_Resume.pdf",
+]
+
+
+def _find_resume_pdf() -> Path | None:
+    for p in _RESUME_SEARCH_PATHS:
+        if p.exists():
+            return p
+    return None
+
+
+@app.get("/api/resume")
+async def serve_resume(starred_company: str = "", starred_role: str = ""):
+    """Serve resume PDF with CORS so the application page can fetch and inject it.
+
+    If starred_company+starred_role are provided and a tailored resume exists in
+    starred_resumes/, that version is served. Falls back to the base resume.
+    """
+    _CORS = {"Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET"}
+    # Tailored resume takes priority
+    if starred_company and starred_role:
+        safe_c = "".join(c if c.isalnum() or c in "-_" else "_" for c in starred_company)[:40]
+        safe_r = "".join(c if c.isalnum() or c in "-_" else "_" for c in starred_role)[:40]
+        tailored = _STARRED_RESUMES_DIR / f"{safe_c}_{safe_r}.pdf"
+        if tailored.exists():
+            return FileResponse(str(tailored), media_type="application/pdf",
+                                filename="EdrickChang_Resume.pdf", headers=_CORS)
+    # Base resume
+    resume = _find_resume_pdf()
+    if not resume:
+        return Response(content=b"", status_code=404,
+                        headers={**_CORS, "X-Error": "No resume PDF found"})
+    return FileResponse(str(resume), media_type="application/pdf",
+                        filename="EdrickChang_Resume.pdf", headers=_CORS)
+
+
+@app.get("/api/resume/status")
+async def resume_status():
+    """Quick check — tells the frontend which resume is available."""
+    resume = _find_resume_pdf()
+    starred_dir = _STARRED_RESUMES_DIR
+    tailored = sorted(starred_dir.glob("*.pdf")) if starred_dir.exists() else []
+    return JSONResponse({
+        "base_resume": str(resume) if resume else None,
+        "tailored": [p.name for p in tailored],
+    })
 
 
 # ── Starred jobs ─────────────────────────────────────────────────────────────
