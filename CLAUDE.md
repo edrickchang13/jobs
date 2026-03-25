@@ -3,11 +3,33 @@
 ## Project Summary
 Automated job application pipeline that scrapes GitHub for internship postings, generates tailored answers, and uses browser-use (AI browser agent) to fill out application forms.
 
-## Current State (March 20, 2026)
+## Current State (March 24, 2026)
 - Dashboard working at http://127.0.0.1:8080
-- All pre-flight checks pass (API, resume, JD extractor, LLM, browser-use)
-- Ready for first real test of browser agent filling a Lever form
-- NOT YET TESTED: the browser agent actually filling form fields end-to-end
+- Primary workflow switched to **Claude-in-Chrome** (Claude in Cowork fills forms directly via MCP tools)
+- browser-use pipeline kept as fallback (collapsed in Apply tab UI)
+- Apply button now opens job URL in Chrome + shows a ready-to-paste Claude prompt
+- Dashboard serves resume PDF at `/api/resume` with CORS for JS injection
+- Custom ARIA dropdown filler added (handles React div-based dropdowns like Pinterest)
+- OpenRouter model fixed: switched from deleted `google/gemini-2.0-flash-exp:free` to `meta-llama/llama-3.3-70b-instruct:free`
+
+### Claude-in-Chrome Workflow (primary)
+1. On dashboard Apply tab, click **✦ Open in Chrome** — opens the job URL in a new tab
+2. Dashboard shows a prompt: copy it and paste to Claude in Cowork
+3. Claude reads the DOM, fills every field using `form_input` + `javascript_tool`
+4. For resume upload, say **"inject resume"** — Claude runs JS to fetch from `/api/resume` and inject via DataTransfer:
+```javascript
+fetch('http://127.0.0.1:8080/api/resume')
+  .then(r => r.blob())
+  .then(blob => {
+    const f = new File([blob], 'EdrickChang_Resume.pdf', {type:'application/pdf'});
+    const dt = new DataTransfer();
+    dt.items.add(f);
+    const inp = document.querySelector('input[type=file]');
+    inp.files = dt.files;
+    inp.dispatchEvent(new Event('change', {bubbles:true}));
+    return 'injected: ' + f.name;
+  });
+```
 
 ## Tech Stack
 - Python 3.14 (causes pydantic/langchain compatibility issues - need `object.__setattr__` for setting attributes on LangChain models)
@@ -100,19 +122,18 @@ https://jobs.smartrecruiters.com/Visa/744000109722936-software-engineer-intern-s
 (Visa - Software Engineer Intern Summer 2026, Foster City CA)
 
 ## Known Issues / Risks
-1. Browser agent has not yet successfully filled a form end-to-end
-2. Agent might click "Apply with LinkedIn" despite instructions not to (added explicit warnings)
-3. Cerebras 8K context limit on free tier may be tight for browser-use (lots of DOM content)
-4. File upload via browser-use agent is untested
-5. The dashboard keeps browser open after completion for manual review/submit
+1. Chrome extension `file_upload` tool returns "Not allowed" for VM filesystem paths — use JS DataTransfer injection instead (see workflow above)
+2. browser-use agent pipeline not yet tested end-to-end (kept as fallback)
+3. Cerebras 8K context limit on free tier may be tight for browser-use
+4. OpenRouter free model may have rate limits during peak hours
 
 ## Next Steps
-1. Test browser agent filling the Lever form end-to-end
-2. If Cerebras context is too small, switch to OpenRouter (free, 65K+ context)
-3. Add Simplify Chrome extension integration
-4. Implement resume auto-generation with LaTeX template
-5. Connect full pipeline (scraper -> resume gen -> apply -> notify)
-6. Add scheduling (APScheduler or cron loop)
+1. Test Claude-in-Chrome on Greenhouse, SmartRecruiters, and Lever portals
+2. Add Simplify Chrome extension integration for one-click apply
+3. Implement resume auto-generation with LaTeX template
+4. Connect full pipeline (scraper -> resume gen -> apply -> notify)
+5. Add scheduling (APScheduler or cron loop)
+6. Telegram notifications on new postings and application confirmations
 
 ## How to Run
 ```bash
